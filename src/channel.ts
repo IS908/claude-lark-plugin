@@ -236,13 +236,23 @@ export class LarkChannel {
 
     const parts: string[] = [];
 
-    // 1. User profile (hot injection)
+    // Build search query — enhance short messages with recent buffer context
+    let searchQuery = msg.text;
+    if (msg.text.length < 15 && this.conversationBuffer) {
+      const recent = this.conversationBuffer.getMessages(msg.chatId).slice(-3);
+      const context = recent.map(m => m.text).join(' ');
+      if (context.length > 0) {
+        searchQuery = `${context} ${msg.text}`;
+      }
+    }
+
+    // 1. User profile (hot injection — always loaded)
     const profile = await this.memoryProvider.getProfile(msg.senderId).catch(() => null);
     if (profile) {
       parts.push(`[User Profile]\n${profile}`);
     }
 
-    // 2. Mentioned user profiles
+    // 2. Mentioned user profiles (hot injection)
     if (msg.mentions?.length) {
       for (const mention of msg.mentions) {
         if (mention.id && mention.id !== msg.senderId) {
@@ -254,28 +264,37 @@ export class LarkChannel {
       }
     }
 
-    // 3. Thread episodes (if in a thread)
+    // 3. Thread episodes (cold injection — semantic search with score filtering)
     if (msg.threadId) {
       const threadEps = await this.memoryProvider
-        .searchEpisodes(msg.text, { chatId: msg.chatId, threadId: msg.threadId })
+        .searchEpisodes(searchQuery, { chatId: msg.chatId, threadId: msg.threadId })
         .catch(() => []);
-      for (const ep of threadEps) {
-        parts.push(`[Thread Context ${ep.timestamp}]\n${ep.content}`);
+      const filtered = threadEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
+      for (const ep of filtered) {
+        const scoreTag = ep.score !== undefined ? ` · score:${ep.score.toFixed(2)}` : '';
+        const dateTag = ep.timestamp.slice(0, 10);
+        parts.push(`[Thread Context${scoreTag} · ${dateTag}]\n${ep.content}`);
       }
     }
 
-    // 4. Chat episodes (cold injection)
+    // 4. Chat episodes (cold injection — semantic search with score filtering)
     const chatEps = await this.memoryProvider
-      .searchEpisodes(msg.text, { chatId: msg.chatId })
+      .searchEpisodes(searchQuery, { chatId: msg.chatId })
       .catch(() => []);
-    for (const ep of chatEps) {
-      parts.push(`[Past Context ${ep.timestamp}]\n${ep.content}`);
+    const filteredChat = chatEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
+    for (const ep of filteredChat) {
+      const scoreTag = ep.score !== undefined ? ` · score:${ep.score.toFixed(2)}` : '';
+      const dateTag = ep.timestamp.slice(0, 10);
+      parts.push(`[Chat Context${scoreTag} · ${dateTag}]\n${ep.content}`);
     }
 
-    // 5. Skills (cold injection, if relevant)
-    const skills = await this.memoryProvider.searchSkills(msg.text).catch(() => []);
-    for (const skill of skills) {
-      parts.push(`[Skill: ${skill.name}]\n${skill.content}`);
+    // 5. Skills (cold injection — inject name + description + path only, not full content)
+    const skills = await this.memoryProvider.searchSkills(searchQuery).catch(() => []);
+    const filteredSkills = skills.filter(s => s.score === undefined || s.score >= appConfig.minSearchScore);
+    for (const skill of filteredSkills) {
+      const scoreTag = skill.score !== undefined ? ` · score:${skill.score.toFixed(2)}` : '';
+      const skillPath = `${appConfig.memoriesDir}/skills/${skill.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.md`;
+      parts.push(`[Skill: ${skill.name}${scoreTag}]\n${skill.description}\n→ ${skillPath}`);
     }
 
     // Assemble
