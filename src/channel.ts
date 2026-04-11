@@ -9,6 +9,8 @@ export interface LarkMessage {
   chatId: string;
   chatType: string; // 'p2p' | 'group'
   senderId: string;
+  senderName?: string;
+  chatName?: string;
   text: string;
   messageType: string;
   parentId?: string;
@@ -23,6 +25,7 @@ type MessageHandler = (message: LarkMessage) => Promise<void>;
 
 export class LarkChannel {
   private client: Lark.Client;
+  private nameCache = new Map<string, string>(); // open_id/chat_id → display name
   private wsClient: Lark.WSClient | null = null;
   private queue = new MessageQueue();
   private messageHandler: MessageHandler | null = null;
@@ -30,11 +33,20 @@ export class LarkChannel {
   private conversationBuffer: ConversationBuffer | null = null;
 
   constructor() {
+    // Custom logger to redirect all SDK output to stderr (stdout is reserved for MCP JSON-RPC)
+    const sdkLogger = {
+      info: (...args: any[]) => console.error('[lark-sdk]', ...args),
+      warn: (...args: any[]) => console.error('[lark-sdk][warn]', ...args),
+      error: (...args: any[]) => console.error('[lark-sdk][error]', ...args),
+      debug: (...args: any[]) => console.error('[lark-sdk][debug]', ...args),
+      trace: (...args: any[]) => console.error('[lark-sdk][trace]', ...args),
+    };
     this.client = new Lark.Client({
       appId: appConfig.appId,
       appSecret: appConfig.appSecret,
       appType: Lark.AppType.SelfBuild,
       domain: Lark.Domain.Feishu,
+      logger: sdkLogger,
     });
   }
 
@@ -69,6 +81,13 @@ export class LarkChannel {
       appId: appConfig.appId,
       appSecret: appConfig.appSecret,
       loggerLevel: Lark.LoggerLevel.info,
+      logger: {
+        info: (...args: any[]) => console.error('[lark-ws]', ...args),
+        warn: (...args: any[]) => console.error('[lark-ws][warn]', ...args),
+        error: (...args: any[]) => console.error('[lark-ws][error]', ...args),
+        debug: (...args: any[]) => console.error('[lark-ws][debug]', ...args),
+        trace: (...args: any[]) => console.error('[lark-ws][trace]', ...args),
+      },
     });
 
     this.wsClient.start({ eventDispatcher });
@@ -89,6 +108,9 @@ export class LarkChannel {
     } = message;
 
     const senderId = sender?.sender_id?.open_id ?? '';
+
+    // Resolve sender display name (from event data or cache)
+    const senderName = await this.resolveUserName(senderId, sender);
 
     // Whitelist filtering
     if (appConfig.allowedUserIds.length > 0 && !appConfig.allowedUserIds.includes(senderId)) {
@@ -124,12 +146,17 @@ export class LarkChannel {
     // Parse attachments
     const attachments = this.extractAttachments(message);
 
+    // Resolve chat name for group chats
+    const chatName = chatType === 'group' ? await this.resolveChatName(chatId) : '';
+
     // Build message object
     const larkMessage: LarkMessage = {
       messageId,
       chatId,
       chatType,
       senderId,
+      senderName: senderName || undefined,
+      chatName: chatName || undefined,
       text,
       messageType,
       parentId,
@@ -234,6 +261,70 @@ export class LarkChannel {
       : '';
 
     return `[Memory Context]\n${memoryContext}\n${parentContext}\n[Current Message]\nFrom: ${msg.senderId} in ${msg.chatId}\n${msg.text}`;
+  }
+
+  /**
+   * Resolve a user's display name. Tries event data first, then API, then cache.
+   * Falls back to a truncated open_id if all else fails.
+   */
+  private async resolveUserName(openId: string, sender?: any): Promise<string> {
+    if (!openId) return '';
+
+    // Check cache
+    const cached = this.nameCache.get(openId);
+    if (cached) return cached;
+
+    // Try event sender data (some SDK versions include name)
+    const eventName = sender?.sender_id?.name || sender?.tenant_key;
+    if (eventName) {
+      this.nameCache.set(openId, eventName);
+      return eventName;
+    }
+
+    // Try contact API (requires contact:contact.base:readonly permission)
+    try {
+      const resp = await this.client.contact.v3.user.get({
+        path: { user_id: openId },
+        params: { user_id_type: 'open_id' },
+      });
+      const name = (resp?.data as any)?.user?.name;
+      if (name) {
+        this.nameCache.set(openId, name);
+        return name;
+      }
+    } catch {
+      // Permission not granted or API failed; fall through
+    }
+
+    // Fallback: truncated open_id
+    const short = openId.length > 12 ? openId.slice(0, 6) + '..' + openId.slice(-4) : openId;
+    this.nameCache.set(openId, short);
+    return short;
+  }
+
+  /**
+   * Resolve a chat's display name. Caches the result.
+   */
+  private async resolveChatName(chatId: string): Promise<string> {
+    if (!chatId) return '';
+
+    const cached = this.nameCache.get(chatId);
+    if (cached) return cached;
+
+    try {
+      const resp = await this.client.im.v1.chat.get({
+        path: { chat_id: chatId },
+      });
+      const name = (resp?.data as any)?.name;
+      if (name) {
+        this.nameCache.set(chatId, name);
+        return name;
+      }
+    } catch {
+      // Chat name fetch failed; continue without it
+    }
+
+    return '';
   }
 
   private extractText(rawContent: string, messageType: string): string {

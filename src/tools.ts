@@ -41,24 +41,34 @@ export function registerTools(
       const chunks = chunkText(text, appConfig.textChunkLimit);
 
       for (let i = 0; i < chunks.length; i++) {
-        if (reply_to && i === 0) {
-          // First chunk as a quoted reply
-          await client.im.v1.message.reply({
-            path: { message_id: reply_to },
-            data: {
-              content: JSON.stringify({ text: chunks[i] }),
-              msg_type: 'text',
-            },
-          });
-        } else {
-          await client.im.v1.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: {
-              receive_id: chat_id,
-              content: JSON.stringify({ text: chunks[i] }),
-              msg_type: 'text',
-            },
-          });
+        try {
+          if (reply_to && i === 0) {
+            // First chunk as a quoted reply
+            await client.im.v1.message.reply({
+              path: { message_id: reply_to },
+              data: {
+                content: JSON.stringify({ text: chunks[i] }),
+                msg_type: 'text',
+              },
+            });
+          } else {
+            await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chat_id,
+                content: JSON.stringify({ text: chunks[i] }),
+                msg_type: 'text',
+              },
+            });
+          }
+        } catch (err: any) {
+          const apiError = err?.response?.data ?? err?.data;
+          if (apiError?.code && apiError?.msg) {
+            console.error(`[tools] Feishu API error [${apiError.code}]: ${apiError.msg}`);
+            throw new Error(`Feishu API [${apiError.code}]: ${apiError.msg}`);
+          }
+          console.error(`[tools] send message failed:`, err?.message ?? String(err));
+          throw err;
         }
       }
 
@@ -124,7 +134,7 @@ export function registerTools(
       });
 
       return {
-        content: [{ type: 'text' as const, text: `Sent ${chunks.length} message(s) to ${chat_id}` }],
+        content: [{ type: 'text' as const, text: `Sent ${chunks.length} message(s)` }],
       };
     }
   );
