@@ -131,10 +131,9 @@ EOF
 
 ### 4. Start
 
-```bash
-# If installed via plugin marketplace, use the launcher script:
-bash scripts/start.sh
+If installed via the plugin marketplace, the plugin starts automatically when Claude Code launches — dependencies are installed on first run, no manual steps needed.
 
+```bash
 # If installed from source:
 claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
 ```
@@ -153,7 +152,6 @@ claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
 ```bash
 cd claude-lark-plugin
 git pull
-npm install
 ```
 
 Configuration in `~/.claude/channels/lark/.env` is preserved across updates. Restart the session or reload plugins to apply changes.
