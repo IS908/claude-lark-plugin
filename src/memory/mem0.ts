@@ -18,6 +18,8 @@ export class Mem0MemoryProvider implements MemoryProvider {
     console.error(`[mem0] mem0 adapter initialized — NOT YET IMPLEMENTED`);
   }
 
+  async healthCheck(): Promise<boolean> { return false; }
+
   async getProfile(userId: string): Promise<string | null> {
     throw new Error('mem0 adapter not yet implemented — use MEMORY_PROVIDER=file');
   }

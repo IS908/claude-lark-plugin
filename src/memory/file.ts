@@ -14,6 +14,8 @@ export class FileMemoryProvider implements MemoryProvider {
     this.baseDir = baseDir ?? appConfig.memoriesDir;
   }
 
+  async healthCheck(): Promise<boolean> { return true; }
+
   // ── User Profile ──
 
   async getProfile(userId: string): Promise<string | null> {
@@ -87,7 +89,10 @@ export class FileMemoryProvider implements MemoryProvider {
 
       // Sort by score descending, return top N
       scored.sort((a, b) => b.score - a.score);
-      return scored.slice(0, appConfig.maxSearchResults).map(s => s.episode);
+      return scored.slice(0, appConfig.maxSearchResults).map(s => ({
+        ...s.episode,
+        score: s.score,
+      }));
     } catch {
       return [];
     }
@@ -176,7 +181,10 @@ export class FileMemoryProvider implements MemoryProvider {
       }
 
       results.sort((a, b) => b.score - a.score);
-      return results.slice(0, appConfig.maxSearchResults).map(r => r.skill);
+      return results.slice(0, appConfig.maxSearchResults).map(r => ({
+        ...r.skill,
+        score: r.score,
+      }));
     } catch {
       return [];
     }
