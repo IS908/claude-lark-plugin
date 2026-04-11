@@ -49,3 +49,20 @@ src/memory/
 Required env vars: `LARK_APP_ID`, `LARK_APP_SECRET` (in `~/.claude/channels/lark/.env`).
 
 The `/lark:configure` skill (in `skills/configure/SKILL.md`) provides interactive setup within Claude Code.
+
+## Important Conventions
+
+- **Stdout is sacred**: MCP uses stdio for JSON-RPC. All logging must go to `console.error`, never `console.log`. The Lark SDK uses custom loggers to redirect to stderr.
+- **`.mcp.json` must use `--silent`**: Prevents npm script lifecycle output from corrupting MCP transport.
+- **Channel protocol**: Messages are forwarded to Claude via `notifications/claude/channel` (not `sendLoggingMessage`). Requires `experimental: { 'claude/channel': {} }` capability.
+- **User display names**: Resolved via contact API → cached. Falls back to stable aliases (`user_` + last 7 chars of open_id). Memory keys always use raw open_id/chat_id.
+- **Group chat filtering**: Only messages with @mentions are processed. P2P messages are always processed.
+
+## Debugging
+
+Debug logs are written to `~/.claude/channels/lark/debug.log`. Contains raw event data (sender, mentions, chatType) for diagnosing message flow issues.
+
+Plugin code runs from three locations — all must stay in sync during development:
+- `workspace` (source of truth)
+- `~/.claude/plugins/marketplaces/claude-lark-plugin/` (marketplace clone)
+- `~/.claude/plugins/cache/claude-lark-plugin/lark/<version>/` (Claude Code runtime cache)
