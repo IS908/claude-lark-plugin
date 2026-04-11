@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import fs from 'node:fs/promises';
+import { unlinkSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
@@ -33,7 +34,7 @@ async function acquireLock(): Promise<void> {
     }
   }
   // Clean up lock on exit
-  const cleanup = () => { try { require('fs').unlinkSync(LOCK_FILE); } catch {} };
+  const cleanup = () => { try { unlinkSync(LOCK_FILE); } catch {} };
   process.on('exit', cleanup);
   process.on('SIGINT', () => { cleanup(); process.exit(0); });
   process.on('SIGTERM', () => { cleanup(); process.exit(0); });
@@ -47,7 +48,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '0.1.0' },
+    { name: 'claude-lark-plugin', version: '0.2.0' },
     {
       capabilities: { logging: {} },
       instructions:
