@@ -79,7 +79,21 @@ npm install
 
 ### 3. Configure Credentials
 
-Create the environment file at `~/.claude/channels/lark/.env`:
+**Interactive setup (recommended):**
+
+```text
+/lark:configure setup
+```
+
+This walks you through all configuration options step by step -- credentials, memory provider, filtering, and tuning.
+
+**Quick setup:**
+
+```text
+/lark:configure <app_id> <app_secret>
+```
+
+**Manual setup:**
 
 ```bash
 mkdir -p ~/.claude/channels/lark
@@ -161,6 +175,44 @@ On every incoming message, the plugin injects relevant memory context in this or
 | `OPENVIKING_API_KEY` | (empty) | OpenViking API key |
 | `MEM0_URL` | (empty) | mem0 server URL |
 | `MEM0_API_KEY` | (empty) | mem0 API key |
+
+---
+
+## Interactive Configuration
+
+The plugin includes an interactive setup command accessible within Claude Code:
+
+| Command | Description |
+|---|---|
+| `/lark:configure` | Show current configuration status (secrets are masked) |
+| `/lark:configure <app_id> <app_secret>` | Quick credential setup |
+| `/lark:configure setup` | Full interactive walkthrough |
+| `/lark:configure clear` | Remove all configuration |
+
+### `/lark:configure setup` Flow
+
+The interactive setup walks through 5 steps, each with the option to skip or use defaults:
+
+```
+Step 1: Credentials
+  -> LARK_APP_ID and LARK_APP_SECRET (shows masked current values if already set)
+
+Step 2: Memory Provider
+  -> file (default, zero deps) / openviking (vector search) / mem0 (managed memory)
+
+Step 3: Backend Config (conditional)
+  -> If openviking: OPENVIKING_URL, OPENVIKING_API_KEY
+  -> If mem0: MEM0_URL, MEM0_API_KEY
+  -> If file: skipped
+
+Step 4: Filtering (optional)
+  -> LARK_ALLOWED_USER_IDS, LARK_ALLOWED_CHAT_IDS
+
+Step 5: Memory Tuning (optional)
+  -> LARK_INACTIVITY_HOURS, LARK_MAX_SEARCH_RESULTS, LARK_MIN_SEARCH_SCORE, LARK_TEXT_CHUNK_LIMIT
+```
+
+All values are written to `~/.claude/channels/lark/.env`. Changes require a session restart or plugin reload to take effect.
 
 ---
 

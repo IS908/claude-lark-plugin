@@ -75,8 +75,28 @@ npx skills add larksuite/cli -y -g
 
 ### 第 3 步：配置凭据
 
-```bash
+**交互式配置（推荐）：**
+
+```text
+/lark:configure setup
+```
+
+引导式完成所有配置 -- 凭据、记忆后端、访问过滤、参数调优。
+
+**快速配置：**
+
+```text
 /lark:configure <app_id> <app_secret>
+```
+
+**手动配置：**
+
+```bash
+mkdir -p ~/.claude/channels/lark
+cat > ~/.claude/channels/lark/.env << 'EOF'
+LARK_APP_ID=cli_your_app_id
+LARK_APP_SECRET=your_app_secret
+EOF
 ```
 
 ### 第 4 步：启动
@@ -148,6 +168,44 @@ claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
 | `OPENVIKING_API_KEY` | （空） | OpenViking API 密钥 |
 | `MEM0_URL` | （空） | mem0 服务地址 |
 | `MEM0_API_KEY` | （空） | mem0 API 密钥 |
+
+---
+
+## 交互式配置
+
+插件内置交互式配置命令，可在 Claude Code 中直接使用：
+
+| 命令 | 说明 |
+|------|------|
+| `/lark:configure` | 查看当前配置状态（敏感信息脱敏显示） |
+| `/lark:configure <app_id> <app_secret>` | 快速配置凭据 |
+| `/lark:configure setup` | 完整交互式引导配置 |
+| `/lark:configure clear` | 清除所有配置 |
+
+### `/lark:configure setup` 流程
+
+交互式引导分 5 步，每步可选择跳过或使用默认值：
+
+```
+第 1 步：凭据
+  -> LARK_APP_ID 和 LARK_APP_SECRET（已有配置时显示脱敏值，可选保留/更新）
+
+第 2 步：记忆后端
+  -> file（默认，零依赖）/ openviking（向量语义搜索）/ mem0（智能记忆管理）
+
+第 3 步：后端配置（按选择分支）
+  -> openviking: OPENVIKING_URL、OPENVIKING_API_KEY
+  -> mem0: MEM0_URL、MEM0_API_KEY
+  -> file: 跳过
+
+第 4 步：访问过滤（可选）
+  -> LARK_ALLOWED_USER_IDS、LARK_ALLOWED_CHAT_IDS
+
+第 5 步：记忆参数调优（可选）
+  -> LARK_INACTIVITY_HOURS、LARK_MAX_SEARCH_RESULTS、LARK_MIN_SEARCH_SCORE、LARK_TEXT_CHUNK_LIMIT
+```
+
+所有配置写入 `~/.claude/channels/lark/.env`。修改后需重启 session 或 reload 插件生效。
 
 ---
 
