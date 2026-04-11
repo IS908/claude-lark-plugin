@@ -44,11 +44,11 @@ async function main() {
   const isDryRun = process.argv.includes('--dry-run');
 
   // 1. Create memory provider
-  const memoryProvider = createMemoryProvider();
+  const memoryProvider = await createMemoryProvider();
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '0.3.0' },
+    { name: 'claude-lark-plugin', version: '0.4.0' },
     {
       capabilities: {
         logging: {},
@@ -57,15 +57,10 @@ async function main() {
         },
       },
       instructions: [
-        'Users read Feishu, not this transcript — your transcript output never reaches their chat. Use reply to respond; edit_message for updating bot\'s own messages; react for lightweight acknowledgements.',
-        '',
-        'Messages arrive as <channel source="lark" chat_id="..." message_id="..." user="..." ts="...">. P2P and @bot group messages share the same Claude transcript. Use chat_id and chat_type in metadata to distinguish chats and avoid mixing contexts.',
-        '',
-        'Always pass reply_to=message_id when calling the reply tool so your response is threaded under the original message in Feishu.',
-        '',
-        'If metadata has attachment_kind and attachment_file_id, call download_attachment with message_id and file_key to fetch the file, then Read the returned path.',
-        '',
-        'Use save_memory to persist important user preferences, decisions, or facts for cross-session recall.',
+        'Users see Feishu, not this transcript. Use reply to respond; edit_message to update; react for acknowledgements.',
+        'Always pass reply_to=message_id so replies thread correctly in Feishu.',
+        'If metadata has attachment_file_id, call download_attachment to fetch the file, then Read the path.',
+        'Use save_memory for important facts; save_skill for reusable procedures.',
       ].join('\n'),
     }
   );
