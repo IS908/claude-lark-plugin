@@ -107,6 +107,31 @@ bash scripts/start.sh
 claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
 ```
 
+### 更新插件
+
+拉取最新代码并重新安装依赖：
+
+```bash
+cd claude-lark-plugin
+git pull
+npm install
+```
+
+如果通过插件市场安装：
+
+```text
+/plugin update lark@claude-lark-plugin
+/reload-plugins
+```
+
+更新不会影响 `~/.claude/channels/lark/.env` 中的配置。更新后需重启 session 或 reload 插件生效。
+
+查看当前版本：
+
+```bash
+node -e "console.log(require('./package.json').version)"
+```
+
 ---
 
 ## 记忆系统

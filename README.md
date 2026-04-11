@@ -113,6 +113,31 @@ npm start
 bash scripts/start.sh
 ```
 
+### Updating
+
+Pull the latest code and reinstall dependencies:
+
+```bash
+cd claude-lark-plugin
+git pull
+npm install
+```
+
+If you installed via the plugin marketplace:
+
+```text
+/plugin update lark@claude-lark-plugin
+/reload-plugins
+```
+
+Configuration in `~/.claude/channels/lark/.env` is preserved across updates. After updating, restart the session or reload plugins to apply changes.
+
+To check the current version:
+
+```bash
+node -e "console.log(require('./package.json').version)"
+```
+
 ---
 
 ## Memory System
