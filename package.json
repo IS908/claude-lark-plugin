@@ -5,6 +5,7 @@
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
+    "prestart": "npm install --prefer-offline --silent",
     "start": "tsx src/index.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit"
