@@ -1,12 +1,13 @@
 /**
  * Memory provider interface — the pluggable abstraction layer.
- * Implementations: FileMemoryProvider (complete), OpenVikingMemoryProvider (stub), Mem0MemoryProvider (stub)
+ * Implementations: FileMemoryProvider (complete), OpenVikingMemoryProvider (complete), Mem0MemoryProvider (stub)
  */
 
 export interface Episode {
   id: string;
   content: string;
   timestamp: string;
+  score?: number;
   chatId?: string;
   threadId?: string;
 }
@@ -21,9 +22,13 @@ export interface Skill {
   name: string;
   description: string;
   content: string;
+  score?: number;
 }
 
 export interface MemoryProvider {
+  /** Check if the backend is reachable. File adapter always returns true. */
+  healthCheck(): Promise<boolean>;
+
   // Layer 3 — Semantic Memory (user-isolated)
   getProfile(userId: string): Promise<string | null>;
   saveProfile(userId: string, content: string): Promise<void>;
