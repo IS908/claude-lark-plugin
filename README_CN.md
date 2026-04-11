@@ -62,15 +62,35 @@
 
 ### 第 2 步：安装插件
 
-```bash
-# 安装 lark-cli 以获取完整飞书 API 能力
-npm install -g @larksuite/cli
-npx skills add larksuite/cli -y -g
+**通过插件市场安装（推荐）：**
 
-# 安装本插件
+在 Claude Code 中执行以下命令：
+
+```text
 /plugin marketplace add https://github.com/IS908/claude-lark-plugin.git
 /plugin install lark@claude-lark-plugin
 /reload-plugins
+```
+
+**从源码安装（开发用）：**
+
+```bash
+git clone https://github.com/IS908/claude-lark-plugin.git
+cd claude-lark-plugin
+npm install
+```
+
+然后启动 Claude Code 时手动加载插件：
+
+```bash
+claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
+```
+
+可选：安装 [lark-cli](https://github.com/larksuite/cli) 以获取完整飞书 API 能力（日历、文档、表格、任务、通讯录等）：
+
+```bash
+npm install -g @larksuite/cli
+npx skills add larksuite/cli -y -g
 ```
 
 ### 第 3 步：配置凭据
@@ -102,14 +122,23 @@ EOF
 ### 第 4 步：启动
 
 ```bash
+# 通过插件市场安装的，使用启动脚本：
 bash scripts/start.sh
-# 或者直接运行：
+
+# 从源码安装的：
 claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
 ```
 
 ### 更新插件
 
-拉取最新代码并重新安装依赖：
+**插件市场：**
+
+```text
+/plugin update lark@claude-lark-plugin
+/reload-plugins
+```
+
+**从源码：**
 
 ```bash
 cd claude-lark-plugin
@@ -117,14 +146,7 @@ git pull
 npm install
 ```
 
-如果通过插件市场安装：
-
-```text
-/plugin update lark@claude-lark-plugin
-/reload-plugins
-```
-
-更新不会影响 `~/.claude/channels/lark/.env` 中的配置。更新后需重启 session 或 reload 插件生效。
+`~/.claude/channels/lark/.env` 中的配置不受更新影响。更新后需重启 session 或 reload 插件生效。
 
 查看当前版本：
 

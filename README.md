@@ -72,9 +72,35 @@ Enable the WebSocket mode under **Event Subscriptions** and subscribe to the `im
 
 ### 2. Install the Plugin
 
+**Via plugin marketplace (recommended):**
+
+Run the following commands inside Claude Code:
+
+```text
+/plugin marketplace add https://github.com/IS908/claude-lark-plugin.git
+/plugin install lark@claude-lark-plugin
+/reload-plugins
+```
+
+**From source (for development):**
+
 ```bash
+git clone https://github.com/IS908/claude-lark-plugin.git
 cd claude-lark-plugin
 npm install
+```
+
+Then load the plugin manually when starting Claude Code:
+
+```bash
+claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
+```
+
+Optionally, install [lark-cli](https://github.com/larksuite/cli) for full Feishu API access (calendar, docs, sheets, tasks, contacts, etc.):
+
+```bash
+npm install -g @larksuite/cli
+npx skills add larksuite/cli -y -g
 ```
 
 ### 3. Configure Credentials
@@ -106,16 +132,23 @@ EOF
 ### 4. Start
 
 ```bash
-# Direct start
-npm start
-
-# Or use the launcher script (loads skills automatically)
+# If installed via plugin marketplace, use the launcher script:
 bash scripts/start.sh
+
+# If installed from source:
+claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
 ```
 
 ### Updating
 
-Pull the latest code and reinstall dependencies:
+**Plugin marketplace:**
+
+```text
+/plugin update lark@claude-lark-plugin
+/reload-plugins
+```
+
+**From source:**
 
 ```bash
 cd claude-lark-plugin
@@ -123,16 +156,9 @@ git pull
 npm install
 ```
 
-If you installed via the plugin marketplace:
+Configuration in `~/.claude/channels/lark/.env` is preserved across updates. Restart the session or reload plugins to apply changes.
 
-```text
-/plugin update lark@claude-lark-plugin
-/reload-plugins
-```
-
-Configuration in `~/.claude/channels/lark/.env` is preserved across updates. After updating, restart the session or reload plugins to apply changes.
-
-To check the current version:
+Check current version:
 
 ```bash
 node -e "console.log(require('./package.json').version)"
