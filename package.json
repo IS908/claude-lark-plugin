@@ -1,6 +1,6 @@
 {
   "name": "claude-lark-plugin",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Claude Code channel plugin for Feishu/Lark — chat with Claude through Feishu with pluggable memory",
   "type": "module",
   "main": "src/index.ts",
@@ -11,15 +11,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.39.0",
+    "@larksuiteoapi/node-sdk": "^1.60.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "dotenv": "^16.4.7",
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0",
-    "@types/node": "^22.0.0"
+    "typescript": "^5.7.0"
   },
   "engines": {
     "node": ">=20.0.0"
