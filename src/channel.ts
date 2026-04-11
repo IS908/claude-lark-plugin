@@ -36,6 +36,7 @@ type MessageHandler = (message: LarkMessage) => Promise<void>;
 export class LarkChannel {
   private client: Lark.Client;
   private nameCache = new Map<string, string>(); // open_id/chat_id → display name
+  private botOpenId: string = '';
   private wsClient: Lark.WSClient | null = null;
   private queue = new MessageQueue();
   private messageHandler: MessageHandler | null = null;
@@ -77,6 +78,9 @@ export class LarkChannel {
   }
 
   async start(): Promise<void> {
+    // Fetch bot's own open_id for filtering group @mentions
+    await this.fetchBotOpenId();
+
     debugLog('[channel] Registering event dispatcher...');
     const eventDispatcher = new Lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data: any) => {
@@ -137,15 +141,23 @@ export class LarkChannel {
       return;
     }
 
-    // In group chats, only process messages that @mention someone
-    // (the bot receives all group messages if added to the group,
-    // but should only respond when explicitly mentioned)
+    // In group chats, only process messages that @mention the bot
     if (chatType === 'group') {
       if (!mentions || mentions.length === 0) {
-        debugLog(`[channel] Ignoring group message without @mention`);
+        debugLog(`[channel] Ignoring group message: no mentions`);
         return;
       }
-      debugLog(`[channel] Group message with ${mentions.length} mention(s)`);
+      // If we know the bot's open_id, match precisely; otherwise accept any mention
+      if (this.botOpenId) {
+        const botMentioned = mentions.some(
+          (m: any) => (m.id?.open_id ?? m.id?.union_id) === this.botOpenId
+        );
+        if (!botMentioned) {
+          debugLog(`[channel] Ignoring group message: bot not @mentioned`);
+          return;
+        }
+      }
+      debugLog(`[channel] Group message with @mention, processing`);
     }
 
     // Parse message text
@@ -275,6 +287,28 @@ export class LarkChannel {
       : '';
 
     return `[Memory Context]\n${memoryContext}\n${parentContext}\n[Current Message]\nFrom: ${msg.senderId} in ${msg.chatId}\n${msg.text}`;
+  }
+
+  /**
+   * Fetch the bot's own open_id via the bot info API.
+   * Used to filter group messages — only process those that @mention this bot.
+   */
+  private async fetchBotOpenId(): Promise<void> {
+    try {
+      const resp = await this.client.request({
+        method: 'GET',
+        url: 'https://open.feishu.cn/open-apis/bot/v3/info',
+      });
+      const openId = (resp as any)?.bot?.open_id;
+      if (openId) {
+        this.botOpenId = openId;
+        debugLog(`[channel] Bot open_id resolved: ${openId}`);
+      } else {
+        console.error('[channel] Warning: could not resolve bot open_id from /bot/v3/info');
+      }
+    } catch (err) {
+      console.error('[channel] Warning: failed to fetch bot info:', err);
+    }
   }
 
   /**
