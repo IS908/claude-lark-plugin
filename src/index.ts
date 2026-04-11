@@ -57,11 +57,15 @@ async function main() {
         },
       },
       instructions: [
-        'You are connected to Feishu (Lark) via this plugin. Users send messages through Feishu and you respond using the reply tool.',
+        'Users read Feishu, not this transcript — your transcript output never reaches their chat. Use reply to respond; edit_message for updating bot\'s own messages; react for lightweight acknowledgements.',
         '',
-        'Messages from Feishu arrive as <channel source="lark" chat_id="..." message_id="..." user="..." ts="...">. Always pass reply_to=message_id when calling the reply tool so your response is threaded under the original message in Feishu.',
+        'Messages arrive as <channel source="lark" chat_id="..." message_id="..." user="..." ts="...">. P2P and @bot group messages share the same Claude transcript. Use chat_id and chat_type in metadata to distinguish chats and avoid mixing contexts.',
         '',
-        'You can also edit messages, add emoji reactions, download attachments, and save memories for cross-session recall.',
+        'Always pass reply_to=message_id when calling the reply tool so your response is threaded under the original message in Feishu.',
+        '',
+        'If metadata has attachment_kind and attachment_file_id, call download_attachment with message_id and file_key to fetch the file, then Read the returned path.',
+        '',
+        'Use save_memory to persist important user preferences, decisions, or facts for cross-session recall.',
       ].join('\n'),
     }
   );
@@ -97,12 +101,12 @@ async function main() {
 
   // 6. Set message handler — forwards Feishu messages to Claude via MCP
   channel.setMessageHandler(async (message) => {
-    // Build friendly display name: {chat_type}:{user_name}:{chat_name}:{thread_id}
+    // Build friendly display: user_xxx or user_xxx · chat_xxx · thread_xxx
     const displayUser = message.senderName || message.senderId;
-    const displayParts = [message.chatType, displayUser];
+    const displayParts = [displayUser];
     if (message.chatName) displayParts.push(message.chatName);
-    if (message.threadId) displayParts.push(message.threadId);
-    const displayLabel = displayParts.join(':');
+    if (message.threadId) displayParts.push(`thread_${message.threadId.slice(-7)}`);
+    const displayLabel = displayParts.join(' · ');
 
     console.error(`[channel] ${displayLabel}: ${message.text.slice(0, 100)}...`);
 
@@ -114,7 +118,8 @@ async function main() {
           meta: {
             chat_id: message.chatId,
             message_id: message.messageId,
-            user: displayUser,
+            user: displayLabel,
+            user_id: message.senderId,
             user_id: message.senderId,
             chat_type: message.chatType,
             ...(message.chatName ? { chat_name: message.chatName } : {}),

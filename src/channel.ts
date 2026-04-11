@@ -1,8 +1,18 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { appendFileSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import { appConfig } from './config.js';
 import { MessageQueue } from './queue.js';
 import type { MemoryProvider } from './memory/interface.js';
 import type { ConversationBuffer } from './memory/buffer.js';
+
+const DEBUG_LOG = path.join(os.homedir(), '.claude', 'channels', 'lark', 'debug.log');
+function debugLog(msg: string) {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  try { appendFileSync(DEBUG_LOG, line); } catch {}
+  console.error(msg);
+}
 
 export interface LarkMessage {
   messageId: string;
@@ -67,8 +77,10 @@ export class LarkChannel {
   }
 
   async start(): Promise<void> {
+    debugLog('[channel] Registering event dispatcher...');
     const eventDispatcher = new Lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data: any) => {
+        debugLog(`[channel] Event received: im.message.receive_v1`);
         try {
           await this.handleMessageEvent(data);
         } catch (err) {
@@ -91,7 +103,7 @@ export class LarkChannel {
     });
 
     this.wsClient.start({ eventDispatcher });
-    console.error('[channel] lark channel: connected to Feishu via WebSocket');
+    debugLog('[channel] lark channel: connected to Feishu via WebSocket');
   }
 
   private async handleMessageEvent(data: any): Promise<void> {
@@ -109,6 +121,11 @@ export class LarkChannel {
 
     const senderId = sender?.sender_id?.open_id ?? '';
 
+    // Debug: log raw event structure to understand sender/mentions shape
+    debugLog(`[channel][debug] sender: ${JSON.stringify(sender)}`);
+    debugLog(`[channel][debug] chatType=${chatType} chatId=${chatId} messageType=${messageType}`);
+    if (mentions) debugLog(`[channel][debug] mentions: ${JSON.stringify(mentions)}`);
+
     // Resolve sender display name (from event data or cache)
     const senderName = await this.resolveUserName(senderId, sender);
 
@@ -120,18 +137,15 @@ export class LarkChannel {
       return;
     }
 
-    // In group chats, only respond to @bot messages
-    // Feishu marks bot mentions with id.open_id matching the bot's open_id,
-    // or with mention_type === 'at_bot'. We also accept @_all.
+    // In group chats, only process messages that @mention someone
+    // (the bot receives all group messages if added to the group,
+    // but should only respond when explicitly mentioned)
     if (chatType === 'group') {
-      if (!mentions || mentions.length === 0) return;
-      const hasBotMention = mentions.some(
-        (m: any) =>
-          m.key === '@_all' ||
-          m.id?.open_id === '' || // fallback: empty open_id indicates bot in some SDK versions
-          m.name === '' // bot mentions sometimes have empty name
-      );
-      if (!hasBotMention) return;
+      if (!mentions || mentions.length === 0) {
+        debugLog(`[channel] Ignoring group message without @mention`);
+        return;
+      }
+      debugLog(`[channel] Group message with ${mentions.length} mention(s)`);
     }
 
     // Parse message text
@@ -267,19 +281,12 @@ export class LarkChannel {
    * Resolve a user's display name. Tries event data first, then API, then cache.
    * Falls back to a truncated open_id if all else fails.
    */
-  private async resolveUserName(openId: string, sender?: any): Promise<string> {
+  private async resolveUserName(openId: string, _sender?: any): Promise<string> {
     if (!openId) return '';
 
     // Check cache
     const cached = this.nameCache.get(openId);
     if (cached) return cached;
-
-    // Try event sender data (some SDK versions include name)
-    const eventName = sender?.sender_id?.name || sender?.tenant_key;
-    if (eventName) {
-      this.nameCache.set(openId, eventName);
-      return eventName;
-    }
 
     // Try contact API (requires contact:contact.base:readonly permission)
     try {
@@ -296,10 +303,19 @@ export class LarkChannel {
       // Permission not granted or API failed; fall through
     }
 
-    // Fallback: truncated open_id
-    const short = openId.length > 12 ? openId.slice(0, 6) + '..' + openId.slice(-4) : openId;
-    this.nameCache.set(openId, short);
-    return short;
+    // Fallback: generate a stable short alias from the open_id
+    const alias = this.generateAlias(openId);
+    this.nameCache.set(openId, alias);
+    return alias;
+  }
+
+  /**
+   * Generate a stable alias like "user_e4338bc" from an ID string.
+   * Uses the last 7 chars of the ID which are unique per user.
+   */
+  private generateAlias(id: string): string {
+    const suffix = id.slice(-7);
+    return `user_${suffix}`;
   }
 
   /**
@@ -321,10 +337,13 @@ export class LarkChannel {
         return name;
       }
     } catch {
-      // Chat name fetch failed; continue without it
+      // Chat name fetch failed; fall through to alias
     }
 
-    return '';
+    // Fallback: chat_xxx alias
+    const alias = `chat_${chatId.slice(-7)}`;
+    this.nameCache.set(chatId, alias);
+    return alias;
   }
 
   private extractText(rawContent: string, messageType: string): string {

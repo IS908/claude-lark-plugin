@@ -2,7 +2,7 @@
   "mcpServers": {
     "lark": {
       "command": "npm",
-      "args": ["run", "--prefix", "${CLAUDE_PLUGIN_ROOT}", "start"]
+      "args": ["run", "--silent", "--prefix", "${CLAUDE_PLUGIN_ROOT}", "start"]
     }
   }
 }
