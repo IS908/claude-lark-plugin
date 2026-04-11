@@ -18,6 +18,7 @@ type FlushHandler = (chatId: string, messages: BufferedMessage[]) => Promise<voi
 export class ConversationBuffer {
   private buffers = new Map<string, BufferedMessage[]>();
   private timers = new Map<string, NodeJS.Timeout>();
+  private flushing = new Set<string>(); // guard against re-entry during flush
   private flushHandler: FlushHandler | null = null;
 
   setFlushHandler(handler: FlushHandler): void {
@@ -25,6 +26,9 @@ export class ConversationBuffer {
   }
 
   record(chatId: string, message: BufferedMessage): void {
+    // Don't record or reset timer during an active flush (prevents re-entry loops)
+    if (this.flushing.has(chatId)) return;
+
     if (!this.buffers.has(chatId)) {
       this.buffers.set(chatId, []);
     }
@@ -106,15 +110,19 @@ export class ConversationBuffer {
   private async triggerFlush(chatId: string): Promise<void> {
     const messages = this.buffers.get(chatId);
     if (!messages || messages.length === 0) return;
+    if (this.flushing.has(chatId)) return; // already flushing
 
     console.error(`[buffer] Auto-flush triggered for chat ${chatId} (${messages.length} messages)`);
 
-    if (this.flushHandler) {
-      try {
+    this.flushing.add(chatId);
+    try {
+      if (this.flushHandler) {
         await this.flushHandler(chatId, [...messages]);
-      } catch (err) {
-        console.error(`[buffer] Flush failed for chat ${chatId}:`, err);
       }
+    } catch (err) {
+      console.error(`[buffer] Flush failed for chat ${chatId}:`, err);
+    } finally {
+      this.flushing.delete(chatId);
     }
 
     this.buffers.delete(chatId);
