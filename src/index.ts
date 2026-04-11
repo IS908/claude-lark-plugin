@@ -48,7 +48,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '0.2.1' },
+    { name: 'claude-lark-plugin', version: '0.2.2' },
     {
       capabilities: {
         logging: {},
@@ -56,8 +56,13 @@ async function main() {
           'claude/channel': {},
         },
       },
-      instructions:
-        'You are connected to Feishu (Lark) via this plugin. Users send messages through Feishu and you respond using the reply tool. You can also edit messages, add emoji reactions, download attachments, and save memories for cross-session recall.',
+      instructions: [
+        'You are connected to Feishu (Lark) via this plugin. Users send messages through Feishu and you respond using the reply tool.',
+        '',
+        'Messages from Feishu arrive as <channel source="lark" chat_id="..." message_id="..." user="..." ts="...">. Always pass reply_to=message_id when calling the reply tool so your response is threaded under the original message in Feishu.',
+        '',
+        'You can also edit messages, add emoji reactions, download attachments, and save memories for cross-session recall.',
+      ].join('\n'),
     }
   );
 
@@ -92,15 +97,15 @@ async function main() {
 
   // 6. Set message handler — forwards Feishu messages to Claude via MCP
   channel.setMessageHandler(async (message) => {
-    // Log the incoming message for debugging
-    console.error(
-      `[channel] Message from ${message.senderId} in ${message.chatId}: ${message.text.slice(0, 100)}...`
-    );
+    // Build friendly display name: {chat_type}:{user_name}:{chat_name}:{thread_id}
+    const displayUser = message.senderName || message.senderId;
+    const displayParts = [message.chatType, displayUser];
+    if (message.chatName) displayParts.push(message.chatName);
+    if (message.threadId) displayParts.push(message.threadId);
+    const displayLabel = displayParts.join(':');
 
-    // Record assistant responses in buffer when Claude replies
-    // (The actual forwarding to Claude happens via the MCP server's tool calls)
-    // In the channel plugin model, Claude Code reads messages from the MCP server
-    // and calls tools to respond. The message is made available via server notification.
+    console.error(`[channel] ${displayLabel}: ${message.text.slice(0, 100)}...`);
+
     try {
       await server.server.notification({
         method: 'notifications/claude/channel',
@@ -109,8 +114,11 @@ async function main() {
           meta: {
             chat_id: message.chatId,
             message_id: message.messageId,
-            user: message.senderId,
+            user: displayUser,
+            user_id: message.senderId,
             chat_type: message.chatType,
+            ...(message.chatName ? { chat_name: message.chatName } : {}),
+            ...(message.threadId ? { thread_id: message.threadId } : {}),
             ts: new Date().toISOString(),
             ...(message.parentContent ? { parent_content: message.parentContent } : {}),
             ...(message.attachments?.length
