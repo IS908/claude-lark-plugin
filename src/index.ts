@@ -48,9 +48,14 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '0.2.0' },
+    { name: 'claude-lark-plugin', version: '0.2.1' },
     {
-      capabilities: { logging: {} },
+      capabilities: {
+        logging: {},
+        experimental: {
+          'claude/channel': {},
+        },
+      },
       instructions:
         'You are connected to Feishu (Lark) via this plugin. Users send messages through Feishu and you respond using the reply tool. You can also edit messages, add emoji reactions, download attachments, and save memories for cross-session recall.',
     }
@@ -97,22 +102,29 @@ async function main() {
     // In the channel plugin model, Claude Code reads messages from the MCP server
     // and calls tools to respond. The message is made available via server notification.
     try {
-      await server.server.sendLoggingMessage({
-        level: 'info',
-        logger: 'lark-channel',
-        data: {
-          type: 'incoming_message',
-          chatId: message.chatId,
-          senderId: message.senderId,
-          text: message.text,
-          messageId: message.messageId,
-          chatType: message.chatType,
-          parentContent: message.parentContent,
-          attachments: message.attachments,
+      await server.server.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content: message.text,
+          meta: {
+            chat_id: message.chatId,
+            message_id: message.messageId,
+            user: message.senderId,
+            chat_type: message.chatType,
+            ts: new Date().toISOString(),
+            ...(message.parentContent ? { parent_content: message.parentContent } : {}),
+            ...(message.attachments?.length
+              ? {
+                  attachment_file_id: message.attachments[0].fileKey,
+                  attachment_name: message.attachments[0].fileName,
+                  attachment_kind: message.attachments[0].fileType,
+                }
+              : {}),
+          },
         },
       });
     } catch (err) {
-      console.error('[channel] Failed to send logging message:', err);
+      console.error('[channel] Failed to deliver inbound to Claude:', err);
     }
   });
 
