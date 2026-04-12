@@ -34,6 +34,7 @@ export const appConfig = {
   allowedUserIds: optionalList('LARK_ALLOWED_USER_IDS'),
   allowedChatIds: optionalList('LARK_ALLOWED_CHAT_IDS'),
   textChunkLimit: optionalNumber('LARK_TEXT_CHUNK_LIMIT', 4000),
+  ackEmoji: optional('LARK_ACK_EMOJI', 'MeMeMe'),
 
   // Memory
   memoryProvider: optional('MEMORY_PROVIDER', 'file') as 'file' | 'openviking' | 'mem0',

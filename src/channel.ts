@@ -1,5 +1,5 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
@@ -29,9 +29,31 @@ export interface LarkMessage {
   mentions?: Array<{ id: string; name: string }>;
   attachments?: Array<{ fileKey: string; fileName: string; fileType: string }>;
   rawContent: string;
+  imagePath?: string;
+  imagePaths?: string[];
 }
 
 type MessageHandler = (message: LarkMessage) => Promise<void>;
+
+export class BotMessageTracker {
+  private ids: string[] = [];
+  private set = new Set<string>();
+  private readonly maxSize = 300;
+
+  add(messageId: string): void {
+    if (this.set.has(messageId)) return;
+    this.set.add(messageId);
+    this.ids.push(messageId);
+    while (this.ids.length > this.maxSize) {
+      const oldest = this.ids.shift()!;
+      this.set.delete(oldest);
+    }
+  }
+
+  has(messageId: string): boolean {
+    return this.set.has(messageId);
+  }
+}
 
 export class LarkChannel {
   private client: Lark.Client;
@@ -42,6 +64,8 @@ export class LarkChannel {
   private messageHandler: MessageHandler | null = null;
   private memoryProvider: MemoryProvider | null = null;
   private conversationBuffer: ConversationBuffer | null = null;
+  private ackReactions = new Map<string, string>(); // messageId → reactionId
+  private botMessageTracker = new BotMessageTracker();
 
   constructor() {
     // Custom logger to redirect all SDK output to stderr (stdout is reserved for MCP JSON-RPC)
@@ -77,6 +101,14 @@ export class LarkChannel {
     return this.client;
   }
 
+  getAckReactions(): Map<string, string> {
+    return this.ackReactions;
+  }
+
+  getBotMessageTracker(): BotMessageTracker {
+    return this.botMessageTracker;
+  }
+
   async start(): Promise<void> {
     // Fetch bot's own open_id for filtering group @mentions
     await this.fetchBotOpenId();
@@ -89,6 +121,15 @@ export class LarkChannel {
           await this.handleMessageEvent(data);
         } catch (err) {
           console.error('[channel] Error handling message event:', err);
+        }
+      },
+    }).register({
+      'im.message.reaction.created_v1': async (data: any) => {
+        debugLog(`[channel] Event received: im.message.reaction.created_v1`);
+        try {
+          await this.handleReactionEvent(data);
+        } catch (err) {
+          console.error('[channel] Error handling reaction event:', err);
         }
       },
     });
@@ -160,6 +201,17 @@ export class LarkChannel {
       debugLog(`[channel] Group message with @mention, processing`);
     }
 
+    // Fire-and-forget ack reaction
+    if (appConfig.ackEmoji) {
+      this.client.im.v1.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: appConfig.ackEmoji } },
+      }).then((resp: any) => {
+        const reactionId = resp?.data?.reaction_id;
+        if (reactionId) this.ackReactions.set(messageId, reactionId);
+      }).catch(() => {});
+    }
+
     // Parse message text
     const text = this.extractText(rawContent, messageType);
 
@@ -171,6 +223,44 @@ export class LarkChannel {
 
     // Parse attachments
     const attachments = this.extractAttachments(message);
+
+    // Auto-download images
+    let imagePath: string | undefined;
+    let imagePaths: string[] | undefined;
+
+    if (messageType === 'image') {
+      try {
+        const parsed = JSON.parse(rawContent);
+        const imageKey = parsed.image_key;
+        if (imageKey) {
+          const downloaded = await this.downloadImage(imageKey, messageId);
+          if (downloaded) imagePath = downloaded;
+        }
+      } catch {
+        debugLog(`[channel] Failed to parse image content for auto-download`);
+      }
+    } else if (messageType === 'post') {
+      try {
+        const parsed = JSON.parse(rawContent);
+        const content = parsed.content ?? parsed.zh_cn?.content ?? parsed.en_us?.content ?? [];
+        const downloadedPaths: string[] = [];
+        for (const line of content) {
+          for (const node of line as any[]) {
+            if (node.tag === 'img' && node.image_key) {
+              const downloaded = await this.downloadImage(node.image_key, messageId);
+              if (downloaded) downloadedPaths.push(downloaded);
+            }
+          }
+        }
+        if (downloadedPaths.length === 1) {
+          imagePath = downloadedPaths[0];
+        } else if (downloadedPaths.length > 1) {
+          imagePaths = downloadedPaths;
+        }
+      } catch {
+        debugLog(`[channel] Failed to parse post content for image auto-download`);
+      }
+    }
 
     // Resolve chat name for group chats
     const chatName = chatType === 'group' ? await this.resolveChatName(chatId) : '';
@@ -190,6 +280,8 @@ export class LarkChannel {
       mentions: parsedMentions,
       attachments,
       rawContent,
+      imagePath,
+      imagePaths,
     };
 
     // Fetch parent message content if this is a quoted reply
@@ -306,6 +398,85 @@ export class LarkChannel {
       : '';
 
     return `[Memory Context]\n${memoryContext}\n${parentContext}\n[Current Message]\nFrom: ${msg.senderId} in ${msg.chatId}\n${msg.text}`;
+  }
+
+  /**
+   * Download an image by image_key and save to inboxDir.
+   * Returns the absolute path to the saved file, or undefined on failure.
+   */
+  private async downloadImage(imageKey: string, messageId: string): Promise<string | undefined> {
+    try {
+      mkdirSync(appConfig.inboxDir, { recursive: true });
+      const resp = await this.client.im.v1.image.get({
+        path: { image_key: imageKey },
+      } as any);
+      if (resp) {
+        const filename = `${Date.now()}-${imageKey}.png`;
+        const filePath = path.join(appConfig.inboxDir, filename);
+        // The SDK returns a readable stream or buffer
+        const data = resp as any;
+        if (Buffer.isBuffer(data)) {
+          writeFileSync(filePath, data);
+        } else if (data?.writeFile) {
+          await data.writeFile(filePath);
+        } else if (typeof data?.pipe === 'function') {
+          // Readable stream — collect into buffer
+          const chunks: Buffer[] = [];
+          for await (const chunk of data) {
+            chunks.push(Buffer.from(chunk));
+          }
+          writeFileSync(filePath, Buffer.concat(chunks));
+        } else {
+          debugLog(`[channel] Unexpected image response type for ${imageKey}`);
+          return undefined;
+        }
+        debugLog(`[channel] Downloaded image ${imageKey} → ${filePath}`);
+        return filePath;
+      }
+    } catch (err) {
+      debugLog(`[channel] Failed to download image ${imageKey}: ${err}`);
+    }
+    return undefined;
+  }
+
+  /**
+   * Handle reaction events on bot messages.
+   * Forwards emoji reactions to Claude as a special message type.
+   */
+  private async handleReactionEvent(data: any): Promise<void> {
+    const messageId = data?.message_id ?? data?.event?.message_id;
+    const operatorId = data?.operator_id?.open_id ?? data?.event?.operator_id?.open_id ?? data?.user_id?.open_id ?? '';
+    const emojiType = data?.reaction_type?.emoji_type ?? data?.event?.reaction_type?.emoji_type ?? '';
+    const chatId = data?.chat_id ?? data?.event?.chat_id ?? '';
+
+    debugLog(`[channel][debug] reaction event: messageId=${messageId} operatorId=${operatorId} emoji=${emojiType} chatId=${chatId}`);
+
+    // Ignore bot's own reactions
+    if (operatorId === this.botOpenId) return;
+
+    // Only process reactions on messages the bot sent
+    if (!this.botMessageTracker.has(messageId)) return;
+
+    // Whitelist filtering
+    if (appConfig.allowedUserIds.length > 0 && !appConfig.allowedUserIds.includes(operatorId)) return;
+    if (appConfig.allowedChatIds.length > 0 && chatId && !appConfig.allowedChatIds.includes(chatId)) return;
+
+    const senderName = await this.resolveUserName(operatorId);
+
+    const larkMessage: LarkMessage = {
+      messageId,
+      chatId,
+      chatType: 'reaction',
+      senderId: operatorId,
+      senderName: senderName || undefined,
+      text: `(reacted with ${emojiType} to message ${messageId})`,
+      messageType: 'reaction',
+      rawContent: JSON.stringify(data),
+    };
+
+    if (this.messageHandler) {
+      await this.messageHandler(larkMessage);
+    }
   }
 
   /**

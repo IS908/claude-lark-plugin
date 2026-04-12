@@ -6,6 +6,7 @@ import { appConfig } from './config.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { MemoryProvider } from './memory/interface.js';
 import type { ConversationBuffer } from './memory/buffer.js';
+import type { BotMessageTracker } from './channel.js';
 
 /**
  * Register all 6 MCP tools on the server.
@@ -14,7 +15,9 @@ export function registerTools(
   server: McpServer,
   client: Lark.Client,
   memoryProvider: MemoryProvider,
-  conversationBuffer?: ConversationBuffer
+  conversationBuffer?: ConversationBuffer,
+  ackReactions?: Map<string, string>,
+  botMessageTracker?: BotMessageTracker
 ): void {
   // ── 1. reply ──
   server.registerTool(
@@ -42,9 +45,10 @@ export function registerTools(
 
       for (let i = 0; i < chunks.length; i++) {
         try {
+          let resp: any;
           if (reply_to && i === 0) {
             // First chunk as a quoted reply
-            await client.im.v1.message.reply({
+            resp = await client.im.v1.message.reply({
               path: { message_id: reply_to },
               data: {
                 content: JSON.stringify({ text: chunks[i] }),
@@ -52,7 +56,7 @@ export function registerTools(
               },
             });
           } else {
-            await client.im.v1.message.create({
+            resp = await client.im.v1.message.create({
               params: { receive_id_type: 'chat_id' },
               data: {
                 receive_id: chat_id,
@@ -61,6 +65,8 @@ export function registerTools(
               },
             });
           }
+          const sentId = resp?.data?.message_id;
+          if (sentId && botMessageTracker) botMessageTracker.add(sentId);
         } catch (err: any) {
           const apiError = err?.response?.data ?? err?.data;
           if (apiError?.code && apiError?.msg) {
@@ -132,6 +138,17 @@ export function registerTools(
         text: text.slice(0, 500), // truncate for buffer efficiency
         timestamp: new Date().toISOString(),
       });
+
+      // Revoke ack reaction now that we've replied
+      if (reply_to && ackReactions) {
+        const reactionId = ackReactions.get(reply_to);
+        if (reactionId) {
+          ackReactions.delete(reply_to);
+          client.im.v1.messageReaction.delete({
+            path: { message_id: reply_to, reaction_id: reactionId },
+          }).catch(() => {});
+        }
+      }
 
       return {
         content: [{ type: 'text' as const, text: `Sent ${chunks.length} message(s)` }],
@@ -216,25 +233,32 @@ export function registerTools(
     async ({ message_id, file_key }) => {
       const inboxDir = appConfig.inboxDir;
       await fs.mkdir(inboxDir, { recursive: true });
-
-      const resp = await client.im.v1.messageResource.get({
-        path: { message_id, file_key },
-        params: { type: 'file' },
-      });
-
-      if (resp) {
-        const filePath = path.join(inboxDir, file_key);
-        // The SDK returns the file data; write it to disk
-        await fs.writeFile(filePath, resp as any);
-        return {
-          content: [{ type: 'text' as const, text: `Downloaded to ${filePath}` }],
-        };
+      try {
+        let data: any;
+        if (file_key.startsWith('img_')) {
+          data = await client.im.v1.image.get({
+            path: { image_key: file_key },
+          });
+        } else {
+          data = await client.im.v1.messageResource.get({
+            path: { message_id, file_key },
+            params: { type: 'file' },
+          });
+        }
+        if (data) {
+          const filePath = path.join(inboxDir, file_key);
+          await fs.writeFile(filePath, data as any);
+          return { content: [{ type: 'text' as const, text: `Downloaded to ${filePath}` }] };
+        }
+      } catch (err: any) {
+        const apiError = err?.response?.data ?? err?.data;
+        if (apiError?.code && apiError?.msg) {
+          console.error(`[tools] download failed [${apiError.code}]: ${apiError.msg}`);
+          return { content: [{ type: 'text' as const, text: `Feishu API [${apiError.code}]: ${apiError.msg}` }], isError: true };
+        }
+        console.error(`[tools] download failed:`, err?.message ?? String(err));
       }
-
-      return {
-        content: [{ type: 'text' as const, text: 'Failed to download attachment' }],
-        isError: true,
-      };
+      return { content: [{ type: 'text' as const, text: 'Failed to download attachment' }], isError: true };
     }
   );
 
