@@ -139,14 +139,24 @@ export function registerTools(
         timestamp: new Date().toISOString(),
       });
 
-      // Revoke ack reaction now that we've replied
-      if (reply_to && ackReactions) {
-        const reactionId = ackReactions.get(reply_to);
+      // Revoke ack reaction — try reply_to first, then scan all pending acks
+      if (ackReactions && ackReactions.size > 0) {
+        const msgId = reply_to || '';
+        const reactionId = msgId ? ackReactions.get(msgId) : undefined;
         if (reactionId) {
-          ackReactions.delete(reply_to);
+          // Exact match on reply_to
+          ackReactions.delete(msgId);
           client.im.v1.messageReaction.delete({
-            path: { message_id: reply_to, reaction_id: reactionId },
+            path: { message_id: msgId, reaction_id: reactionId },
           }).catch(() => {});
+        } else {
+          // Fallback: revoke all pending acks (handles case where Claude didn't pass reply_to)
+          for (const [mid, rid] of ackReactions.entries()) {
+            ackReactions.delete(mid);
+            client.im.v1.messageReaction.delete({
+              path: { message_id: mid, reaction_id: rid },
+            }).catch(() => {});
+          }
         }
       }
 
