@@ -166,11 +166,6 @@ export class LarkChannel {
 
     const senderId = sender?.sender_id?.open_id ?? '';
 
-    // Debug: log raw event structure to understand sender/mentions shape
-    debugLog(`[channel][debug] sender: ${JSON.stringify(sender)}`);
-    debugLog(`[channel][debug] chatType=${chatType} chatId=${chatId} messageType=${messageType}`);
-    if (mentions) debugLog(`[channel][debug] mentions: ${JSON.stringify(mentions)}`);
-
     // Resolve sender display name (from event data or cache)
     const senderName = await this.resolveUserName(senderId, sender);
 
@@ -201,11 +196,12 @@ export class LarkChannel {
       debugLog(`[channel] Group message with @mention, processing`);
     }
 
-    // Fire-and-forget ack reaction
-    if (appConfig.ackEmoji) {
+    // Fire-and-forget ack reaction (Typing for P2P, MeMeMe for group @bot)
+    const ackEmoji = chatType === 'p2p' ? 'Typing' : appConfig.ackEmoji;
+    if (ackEmoji) {
       this.client.im.v1.messageReaction.create({
         path: { message_id: messageId },
-        data: { reaction_type: { emoji_type: appConfig.ackEmoji } },
+        data: { reaction_type: { emoji_type: ackEmoji } },
       }).then((resp: any) => {
         const reactionId = resp?.data?.reaction_id;
         if (reactionId) this.ackReactions.set(messageId, reactionId);
@@ -444,28 +440,26 @@ export class LarkChannel {
    * Forwards emoji reactions to Claude as a special message type.
    */
   private async handleReactionEvent(data: any): Promise<void> {
-    const messageId = data?.message_id ?? data?.event?.message_id;
-    const operatorId = data?.operator_id?.open_id ?? data?.event?.operator_id?.open_id ?? data?.user_id?.open_id ?? '';
-    const emojiType = data?.reaction_type?.emoji_type ?? data?.event?.reaction_type?.emoji_type ?? '';
-    const chatId = data?.chat_id ?? data?.event?.chat_id ?? '';
+    const messageId = data?.message_id ?? '';
+    const emojiType = data?.reaction_type?.emoji_type ?? '';
+    const operatorType = data?.operator_type ?? '';
+    // app reactions: operator_type=app; user reactions: operator_type=user, user_id.open_id=ou_xxx
+    const operatorId = data?.user_id?.open_id ?? '';
 
-    debugLog(`[channel][debug] reaction event: messageId=${messageId} operatorId=${operatorId} emoji=${emojiType} chatId=${chatId}`);
-
-    // Ignore bot's own reactions
-    if (operatorId === this.botOpenId) return;
+    // Ignore bot's own reactions (operator_type=app means the bot itself)
+    if (operatorType === 'app') return;
 
     // Only process reactions on messages the bot sent
     if (!this.botMessageTracker.has(messageId)) return;
 
-    // Whitelist filtering
+    // Whitelist filtering (no chat_id in reaction events)
     if (appConfig.allowedUserIds.length > 0 && !appConfig.allowedUserIds.includes(operatorId)) return;
-    if (appConfig.allowedChatIds.length > 0 && chatId && !appConfig.allowedChatIds.includes(chatId)) return;
 
     const senderName = await this.resolveUserName(operatorId);
 
     const larkMessage: LarkMessage = {
       messageId,
-      chatId,
+      chatId: '',
       chatType: 'reaction',
       senderId: operatorId,
       senderName: senderName || undefined,
