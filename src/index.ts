@@ -48,7 +48,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '0.4.0' },
+    { name: 'claude-lark-plugin', version: '0.5.0' },
     {
       capabilities: {
         logging: {},
@@ -59,7 +59,8 @@ async function main() {
       instructions: [
         'Users see Feishu, not this transcript. Use reply to respond; edit_message to update; react for acknowledgements.',
         'Always pass reply_to=message_id so replies thread correctly in Feishu.',
-        'If metadata has attachment_file_id, call download_attachment to fetch the file, then Read the path.',
+        'If metadata has image_path, Read that file to see the image.',
+        'If metadata has attachment_file_id, call download_attachment with message_id and file_key, then Read the path.',
         'Use save_memory for important facts; save_skill for reusable procedures.',
       ].join('\n'),
     }
@@ -92,7 +93,7 @@ async function main() {
   channel.setConversationBuffer(buffer);
 
   // 5. Register MCP tools (pass buffer so reply records assistant messages)
-  registerTools(server, channel.getClient(), memoryProvider, buffer);
+  registerTools(server, channel.getClient(), memoryProvider, buffer, channel.getAckReactions(), channel.getBotMessageTracker());
 
   // 6. Set message handler — forwards Feishu messages to Claude via MCP
   channel.setMessageHandler(async (message) => {
@@ -120,13 +121,17 @@ async function main() {
             ...(message.threadId ? { thread_id: message.threadId } : {}),
             ts: new Date().toISOString(),
             ...(message.parentContent ? { parent_content: message.parentContent } : {}),
-            ...(message.attachments?.length
+            ...(message.imagePath ? { image_path: message.imagePath } : {}),
+            ...(message.imagePaths?.length ? { image_paths: message.imagePaths.join(',') } : {}),
+            ...(message.attachments?.length === 1
               ? {
+                  attachment_kind: message.attachments[0].fileType,
                   attachment_file_id: message.attachments[0].fileKey,
                   attachment_name: message.attachments[0].fileName,
-                  attachment_kind: message.attachments[0].fileType,
                 }
-              : {}),
+              : message.attachments && message.attachments.length > 1
+                ? { attachments: JSON.stringify(message.attachments) }
+                : {}),
           },
         },
       });

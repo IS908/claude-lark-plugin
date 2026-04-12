@@ -26,12 +26,15 @@ The plugin connects to Feishu via the Lark SDK WebSocket client, receives messag
 
 - Direct messages (P2P) and group chats (responds to @bot mentions)
 - Rich message types: text, post (rich text), image, file, audio, video, interactive cards
+- **Image auto-download**: images are downloaded to a local inbox so Claude can see them directly
 - Quoted reply support with automatic parent message fetching
-- Attachment extraction (image, file, audio, video)
+- Attachment extraction (image, file, audio, video) with type-aware download
+- **Reaction events**: user emoji reactions on bot messages are forwarded to Claude
 
 ### Responding
 
 - Text replies with automatic chunking for long messages (configurable limit)
+- **Ack reaction**: bot automatically reacts with an emoji (default: MeMeMe) on receive, removes it after replying
 - Image and file uploads (images up to 10 MB, files up to 30 MB)
 - Message editing (plain text and card markdown)
 - Emoji reactions on any message
@@ -67,8 +70,11 @@ Create a custom app at [Feishu Open Platform](https://open.feishu.cn/app) and en
 | `im:message:send_as_bot` | Send messages as the bot |
 | `im:resource` | Download attachments |
 | `im:message.reactions:write` | Add emoji reactions |
+| `im:message.reactions:read` | Receive reaction events |
 
-Enable the WebSocket mode under **Event Subscriptions** and subscribe to the `im.message.receive_v1` event.
+Enable the WebSocket mode under **Event Subscriptions** and subscribe to these events:
+- `im.message.receive_v1` -- receive messages
+- `im.message.reaction.created_v1` -- receive emoji reactions on bot messages
 
 ### 2. Install the Plugin
 
@@ -210,6 +216,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 | `LARK_ALLOWED_USER_IDS` | (empty) | Comma-separated list of allowed user open_ids. Empty means all users allowed. |
 | `LARK_ALLOWED_CHAT_IDS` | (empty) | Comma-separated list of allowed chat IDs. Empty means all chats allowed. |
 | `LARK_TEXT_CHUNK_LIMIT` | `4000` | Maximum characters per message chunk |
+| `LARK_ACK_EMOJI` | `MeMeMe` | Emoji reaction on message receive. Set to empty string to disable. |
 | `LARK_ENABLED_SKILLS` | `lark-im,lark-contact,lark-doc,lark-calendar,lark-task` | Comma-separated skills to load alongside the plugin |
 
 ### Optional -- Memory
