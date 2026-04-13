@@ -1,11 +1,11 @@
 # Claude Lark Plugin
 
-![Node.js 20+](https://img.shields.io/badge/Node.js-20%2B-339933?logo=node.js&logoColor=white)
-![License Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
+[![docs](https://img.shields.io/badge/docs-English-blue)](README.md)
+[![version](https://img.shields.io/badge/version-0.5.3-blue)](https://github.com/IS908/claude-lark-plugin/releases)
+[![node](https://img.shields.io/badge/node-%3E%3D20.0.0-339933?logo=node.js&logoColor=white)](package.json)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 通过飞书（Lark）与 Claude Code 实时聊天。支持可插拔记忆系统，内置文件存储后端，可扩展 OpenViking 和 mem0。
-
-> [English](README.md)
 
 ---
 
