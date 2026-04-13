@@ -38,7 +38,11 @@ type MessageHandler = (message: LarkMessage) => Promise<void>;
 export class BotMessageTracker {
   private ids: string[] = [];
   private set = new Set<string>();
-  private readonly maxSize = 300;
+  private readonly maxSize: number;
+
+  constructor(maxSize = 500) {
+    this.maxSize = maxSize;
+  }
 
   add(messageId: string): void {
     if (this.set.has(messageId)) return;
@@ -65,7 +69,7 @@ export class LarkChannel {
   private memoryProvider: MemoryProvider | null = null;
   private conversationBuffer: ConversationBuffer | null = null;
   private ackReactions = new Map<string, string>(); // messageId → reactionId
-  private botMessageTracker = new BotMessageTracker();
+  private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
 
   constructor() {
     // Custom logger to redirect all SDK output to stderr (stdout is reserved for MCP JSON-RPC)

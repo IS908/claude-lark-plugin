@@ -26,7 +26,7 @@ src/tools.ts        – Registers 6 MCP tools: reply, edit_message, react, downl
 src/queue.ts        – Per-chat sequential message queue
 src/memory/
   interface.ts      – MemoryProvider interface (Episodes, Profiles, Skills)
-  factory.ts        – Provider factory (file | openviking | mem0)
+  factory.ts        – Provider factory (file | openviking | mem0 stub)
   file.ts           – File-based provider (default, stores in ~/.claude/channels/lark/memories/)
   openviking.ts     – OpenViking vector search provider (stub)
   mem0.ts           – mem0 managed memory provider (stub)
@@ -47,7 +47,7 @@ src/memory/
 - **Memory is pluggable**: `MemoryProvider` interface with three backends; `file` and `openviking` are implemented (mem0 is a stub).
 - **Image auto-download**: Images are downloaded to `~/.claude/channels/lark/inbox/` on receive. Claude reads local paths via `image_path` in notification meta.
 - **Ack reaction**: Configurable emoji (`LARK_ACK_EMOJI`, default `MeMeMe`) sent on receive, auto-revoked after reply. Fire-and-forget, won't block message processing.
-- **Bot message tracking**: `BotMessageTracker` (capped 300, FIFO) tracks bot-sent message IDs. Used to filter reaction events — only reactions on bot messages are forwarded to Claude.
+- **Bot message tracking**: `BotMessageTracker` (default 500, FIFO, configurable via `LARK_BOT_MESSAGE_TRACKER_SIZE`) tracks bot-sent message IDs. Used to filter reaction events — only reactions on bot messages are forwarded to Claude.
 
 ## Configuration
 

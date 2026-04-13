@@ -1,11 +1,10 @@
 # Claude Lark Plugin
 
 [![docs](https://img.shields.io/badge/docs-中文-blue)](README_CN.md)
-[![version](https://img.shields.io/badge/version-0.5.3-blue)](https://github.com/IS908/claude-lark-plugin/releases)
 [![node](https://img.shields.io/badge/node-%3E%3D20.0.0-339933?logo=node.js&logoColor=white)](package.json)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-Chat with Claude Code in real time through Feishu (Lark). Pluggable memory with file-based, OpenViking, and mem0 backends.
+Chat with Claude Code in real time through Feishu (Lark). Pluggable memory with file-based and OpenViking backends.
 
 ---
 
@@ -44,7 +43,7 @@ The plugin connects to Feishu via the Lark SDK WebSocket client, receives messag
 
 - Three-layer architecture: Buffer, Episodic, and Semantic memory
 - Auto-flush distillation from conversation buffer to episodic memory
-- Pluggable backends: file-based (default), OpenViking (vector search), mem0
+- Pluggable backends: file-based (default), OpenViking (vector search), mem0 (planned)
 - User profiles, chat episodes, thread episodes, and global skills
 - Memory-enriched context injection on every incoming message
 
@@ -177,8 +176,8 @@ node -e "console.log(require('./package.json').version)"
 | Layer | Name | Scope | Injection | Storage |
 |---|---|---|---|---|
 | 1 | Buffer | Per-chat | N/A (in-process) | In-memory ring buffer |
-| 2 | Episodic | Per-chat / per-thread | Cold (search-based) | File / OpenViking / mem0 |
-| 3 | Semantic | Per-user (profile) or global (skills) | Hot (always loaded) | File / OpenViking / mem0 |
+| 2 | Episodic | Per-chat / per-thread | Cold (search-based) | File / OpenViking / mem0 (planned) |
+| 3 | Semantic | Per-user (profile) or global (skills) | Hot (always loaded) | File / OpenViking / mem0 (planned) |
 
 ### Memory Enrichment Pipeline
 
@@ -223,14 +222,14 @@ On every incoming message, the plugin injects relevant memory context in this or
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_PROVIDER` | `file` | Memory backend: `file`, `openviking`, or `mem0` |
+| `MEMORY_PROVIDER` | `file` | Memory backend: `file`, `openviking`, or `mem0` (planned) |
 | `LARK_MIN_SEARCH_SCORE` | `0.3` | Minimum similarity score for memory search results |
 | `LARK_MAX_SEARCH_RESULTS` | `2` | Maximum number of memory search results to inject |
 | `LARK_INACTIVITY_HOURS` | `3` | Hours of inactivity before buffer flush to episodic memory |
 | `OPENVIKING_URL` | `http://localhost:1933` | OpenViking server URL |
 | `OPENVIKING_API_KEY` | (empty) | OpenViking API key |
-| `MEM0_URL` | (empty) | mem0 server URL |
-| `MEM0_API_KEY` | (empty) | mem0 API key |
+| `MEM0_URL` | (empty) | mem0 server URL (planned) |
+| `MEM0_API_KEY` | (empty) | mem0 API key (planned) |
 
 ---
 
@@ -254,11 +253,11 @@ Step 1: Credentials
   -> LARK_APP_ID and LARK_APP_SECRET (shows masked current values if already set)
 
 Step 2: Memory Provider
-  -> file (default, zero deps) / openviking (vector search) / mem0 (managed memory)
+  -> file (default, zero deps) / openviking (vector search) / mem0 (planned)
 
 Step 3: Backend Config (conditional)
   -> If openviking: OPENVIKING_URL, OPENVIKING_API_KEY
-  -> If mem0: MEM0_URL, MEM0_API_KEY
+  -> If mem0 (planned): MEM0_URL, MEM0_API_KEY
   -> If file: skipped
 
 Step 4: Filtering (optional)
