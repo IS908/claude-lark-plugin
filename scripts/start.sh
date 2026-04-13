@@ -40,4 +40,4 @@ echo >&2 "  App ID: ${LARK_APP_ID:-<not set>}"
 echo >&2 "  Memory: ${MEMORY_PROVIDER:-file}"
 echo >&2 "  Skills: ${LARK_ENABLED_SKILLS}"
 
-exec claude --dangerously-load-development-channels "plugin:lark@claude-lark-plugin"
+exec claude --dangerously-load-development-channels "plugin:lark@claude-lark-plugin" --dangerously-skip-permissions
