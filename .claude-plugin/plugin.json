@@ -1,8 +1,12 @@
 {
   "name": "lark",
   "description": "Feishu/Lark channel plugin for Claude Code — receive messages via WebSocket, reply with text/images/files, manage cross-session memory",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "author": {
     "name": "IS908"
-  }
+  },
+  "repository": "https://github.com/IS908/claude-lark-plugin",
+  "homepage": "https://github.com/IS908/claude-lark-plugin",
+  "license": "Apache-2.0",
+  "keywords": ["feishu", "lark", "im", "bot", "chat", "lite-memory"]
 }

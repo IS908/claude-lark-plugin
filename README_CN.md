@@ -1,11 +1,10 @@
 # Claude Lark Plugin
 
 [![docs](https://img.shields.io/badge/docs-English-blue)](README.md)
-[![version](https://img.shields.io/badge/version-0.5.3-blue)](https://github.com/IS908/claude-lark-plugin/releases)
 [![node](https://img.shields.io/badge/node-%3E%3D20.0.0-339933?logo=node.js&logoColor=white)](package.json)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-通过飞书（Lark）与 Claude Code 实时聊天。支持可插拔记忆系统，内置文件存储后端，可扩展 OpenViking 和 mem0。
+通过飞书（Lark）与 Claude Code 实时聊天。支持可插拔记忆系统，内置文件存储和 OpenViking 后端。
 
 ---
 
@@ -40,7 +39,7 @@
 
 - 三层架构：Buffer（短期）/ 情景记忆（中期）/ 语义记忆（长期）
 - 自动蒸馏：对话静默超时后自动触发摘要
-- 可插拔后端：文件存储（内置）、OpenViking（向量搜索）、mem0（智能记忆管理）
+- 可插拔后端：文件存储（内置）、OpenViking（向量搜索）、mem0（计划中）
 
 ### 可靠性
 
@@ -207,14 +206,14 @@ node -e "console.log(require('./package.json').version)"
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `MEMORY_PROVIDER` | `file` | 记忆后端：`file`、`openviking` 或 `mem0` |
+| `MEMORY_PROVIDER` | `file` | 记忆后端：`file`、`openviking` 或 `mem0`（计划中） |
 | `LARK_MIN_SEARCH_SCORE` | `0.3` | 最低相关度分数（仅向量后端生效） |
 | `LARK_MAX_SEARCH_RESULTS` | `2` | 每次查询返回的最大情景数 |
 | `LARK_INACTIVITY_HOURS` | `3` | 自动蒸馏触发的静默时长（小时） |
 | `OPENVIKING_URL` | `http://localhost:1933` | OpenViking 服务地址 |
 | `OPENVIKING_API_KEY` | （空） | OpenViking API 密钥 |
-| `MEM0_URL` | （空） | mem0 服务地址 |
-| `MEM0_API_KEY` | （空） | mem0 API 密钥 |
+| `MEM0_URL` | （空） | mem0 服务地址（计划中） |
+| `MEM0_API_KEY` | （空） | mem0 API 密钥（计划中） |
 
 ---
 
@@ -238,11 +237,11 @@ node -e "console.log(require('./package.json').version)"
   -> LARK_APP_ID 和 LARK_APP_SECRET（已有配置时显示脱敏值，可选保留/更新）
 
 第 2 步：记忆后端
-  -> file（默认，零依赖）/ openviking（向量语义搜索）/ mem0（智能记忆管理）
+  -> file（默认，零依赖）/ openviking（向量语义搜索）/ mem0（计划中）
 
 第 3 步：后端配置（按选择分支）
   -> openviking: OPENVIKING_URL、OPENVIKING_API_KEY
-  -> mem0: MEM0_URL、MEM0_API_KEY
+  -> mem0（计划中）: MEM0_URL、MEM0_API_KEY
   -> file: 跳过
 
 第 4 步：访问过滤（可选）
