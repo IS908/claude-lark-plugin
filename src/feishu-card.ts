@@ -47,3 +47,72 @@ export function buildCards(
 ): object[] {
   throw new Error('buildCards not yet implemented');
 }
+
+// ─── Markdown Style Optimizer ─────────────────────────────────
+// Ported from happyclaw/src/feishu-markdown-style.ts (MIT).
+
+/** Strip `![alt](value)` where value is not a valid Feishu image key. */
+const IMAGE_RE = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
+function stripInvalidImageKeys(text: string): string {
+  if (!text.includes('![')) return text;
+  return text.replace(IMAGE_RE, (fullMatch, _alt, value) => {
+    if (value.startsWith('img_')) return fullMatch;
+    return '';
+  });
+}
+
+function _optimizeMarkdownStyle(text: string, cardVersion = 2): string {
+  // 1. Extract code blocks, protect with placeholders
+  const MARK = '___CB_';
+  const codeBlocks: string[] = [];
+  let r = text.replace(/```[\s\S]*?```/g, (m) => {
+    return `${MARK}${codeBlocks.push(m) - 1}___`;
+  });
+
+  // 2. Heading demotion (only if source has H1~H3)
+  const hasH1toH3 = /^#{1,3} /m.test(text);
+  if (hasH1toH3) {
+    r = r.replace(/^#{2,6} (.+)$/gm, '##### $1');
+    r = r.replace(/^# (.+)$/gm, '#### $1');
+  }
+
+  if (cardVersion >= 2) {
+    // 3. Consecutive heading spacing
+    r = r.replace(/^(#{4,5} .+)\n{1,2}(#{4,5} )/gm, '$1\n<br>\n$2');
+    // 4. Table spacing
+    r = r.replace(/^([^|\n].*)\n(\|.+\|)/gm, '$1\n\n$2');
+    r = r.replace(/\n\n((?:\|.+\|[^\S\n]*\n?)+)/g, '\n\n<br>\n\n$1');
+    r = r.replace(/((?:^\|.+\|[^\S\n]*\n?)+)/gm, '$1\n<br>\n');
+    r = r.replace(/^((?!#{4,5} )(?!\*\*).+)\n\n(<br>)\n\n(\|)/gm, '$1\n$2\n$3');
+    r = r.replace(/^(\*\*.+)\n\n(<br>)\n\n(\|)/gm, '$1\n$2\n\n$3');
+    r = r.replace(/(\|[^\n]*\n)\n(<br>\n)((?!#{4,5} )(?!\*\*))/gm, '$1$2$3');
+    // 5. Restore code blocks with <br> wrapping
+    codeBlocks.forEach((block, i) => {
+      r = r.replace(`${MARK}${i}___`, `\n<br>\n${block}\n<br>\n`);
+    });
+  } else {
+    // 5. Restore code blocks without <br>
+    codeBlocks.forEach((block, i) => {
+      r = r.replace(`${MARK}${i}___`, block);
+    });
+  }
+
+  // 6. Compress excessive blank lines (3+ → 2)
+  r = r.replace(/\n{3,}/g, '\n\n');
+
+  return r;
+}
+
+/**
+ * Optimize markdown for Feishu card rendering (Schema 2.0 by default).
+ * Wraps the internal implementation so a bad input silently returns the raw
+ * text instead of crashing the reply pipeline.
+ */
+function optimizeMarkdownStyle(text: string, cardVersion = 2): string {
+  try {
+    const r = _optimizeMarkdownStyle(text, cardVersion);
+    return stripInvalidImageKeys(r);
+  } catch {
+    return text;
+  }
+}
