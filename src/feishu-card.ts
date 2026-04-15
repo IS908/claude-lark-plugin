@@ -247,3 +247,60 @@ function splitCodeBlockSafe(text: string, maxLen: number): string[] {
   if (remaining) chunks.push(remaining);
   return chunks;
 }
+
+// ─── Card Content & Assembly ─────────────────────────────────
+
+type Element = Record<string, unknown>;
+
+interface CardContentResult {
+  title: string;
+  elements: Element[];
+}
+
+/**
+ * Build content elements for a single card:
+ * - Extracts title
+ * - Optimizes markdown
+ * - Splits into ≤ CARD_MD_LIMIT chunks (code-block-safe)
+ * - Returns at least one element
+ */
+function buildCardContent(text: string): CardContentResult {
+  const { title, body } = extractTitleAndBody(text);
+  const rawContent = body || text.trim();
+  const contentToRender = optimizeMarkdownStyle(rawContent, 2);
+  const elements: Element[] = [];
+
+  if (contentToRender.length > CARD_MD_LIMIT) {
+    for (const chunk of splitCodeBlockSafe(contentToRender, CARD_MD_LIMIT)) {
+      elements.push({ tag: 'markdown', content: chunk });
+    }
+  } else if (contentToRender) {
+    elements.push({ tag: 'markdown', content: contentToRender });
+  }
+
+  if (elements.length === 0) {
+    elements.push({ tag: 'markdown', content: text.trim() || '...' });
+  }
+
+  return { title, elements };
+}
+
+/**
+ * Assemble a Schema 2.0 (CardKit) card JSON object.
+ * Header uses fixed `wathet` template; title shown in both header and
+ * `config.summary` (drives the chat-list preview).
+ */
+function buildSchema2Card(elements: Element[], title: string): object {
+  return {
+    schema: '2.0',
+    config: {
+      wide_screen_mode: true,
+      summary: { content: title },
+    },
+    header: {
+      title: { tag: 'plain_text', content: title },
+      template: 'wathet',
+    },
+    body: { elements },
+  };
+}
