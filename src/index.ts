@@ -48,7 +48,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '0.6.0' },
+    { name: 'claude-lark-plugin', version: '0.6.1' },
     {
       capabilities: {
         logging: {},
@@ -58,7 +58,8 @@ async function main() {
       },
       instructions: [
         'Users see Feishu, not this transcript. Use reply to respond; edit_message to update; react for acknowledgements.',
-        'Always pass reply_to=message_id so replies thread correctly in Feishu.',
+        'Always pass reply_to=message_id so replies thread correctly in Feishu. When several <channel> notifications are in context, reply_to MUST be the message_id from the specific <channel> tag you are responding to — not any other.',
+        'If the triggering <channel> tag has thread_id, pass it to reply. The plugin uses thread_id to route the reply into the correct thread even if reply_to is omitted or ambiguous.',
         'If metadata has image_path, Read that file to see the image.',
         'If metadata has attachment_file_id, call download_attachment with message_id and file_key, then Read the path.',
         'Use save_memory for important facts; save_skill for reusable procedures.',
@@ -93,7 +94,15 @@ async function main() {
   channel.setConversationBuffer(buffer);
 
   // 5. Register MCP tools (pass buffer so reply records assistant messages)
-  registerTools(server, channel.getClient(), memoryProvider, buffer, channel.getAckReactions(), channel.getBotMessageTracker());
+  registerTools(
+    server,
+    channel.getClient(),
+    memoryProvider,
+    buffer,
+    channel.getAckReactions(),
+    channel.getBotMessageTracker(),
+    channel.getLatestMessageTracker()
+  );
 
   // 6. Set message handler — forwards Feishu messages to Claude via MCP
   channel.setMessageHandler(async (message) => {

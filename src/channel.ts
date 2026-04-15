@@ -59,6 +59,45 @@ export class BotMessageTracker {
   }
 }
 
+/**
+ * Records the latest inbound user message per (chatId, threadId) pair.
+ * Used by the reply tool to auto-correct reply_to when Claude omits it in
+ * concurrent thread scenarios.
+ */
+export interface TrackedMessage {
+  messageId: string;
+  threadId?: string;
+  timestamp: number;
+}
+
+export class LatestMessageTracker {
+  private map = new Map<string, TrackedMessage>();
+  private readonly ttlMs: number;
+
+  constructor(ttlMs = 10 * 60 * 1000) {
+    this.ttlMs = ttlMs;
+  }
+
+  private key(chatId: string, threadId?: string): string {
+    // Use || instead of ?? so empty strings also fall back to '_'
+    return `${chatId}::${threadId || '_'}`;
+  }
+
+  record(chatId: string, msg: TrackedMessage): void {
+    this.map.set(this.key(chatId, msg.threadId), msg);
+  }
+
+  getLatest(chatId: string, threadId?: string): TrackedMessage | undefined {
+    const m = this.map.get(this.key(chatId, threadId));
+    if (!m) return undefined;
+    if (Date.now() - m.timestamp > this.ttlMs) {
+      this.map.delete(this.key(chatId, threadId));
+      return undefined;
+    }
+    return m;
+  }
+}
+
 export class LarkChannel {
   private client: Lark.Client;
   private nameCache = new Map<string, string>(); // open_id/chat_id → display name
@@ -70,6 +109,7 @@ export class LarkChannel {
   private conversationBuffer: ConversationBuffer | null = null;
   private ackReactions = new Map<string, string>(); // messageId → reactionId
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
+  private latestMessageTracker = new LatestMessageTracker();
 
   constructor() {
     // Custom logger to redirect all SDK output to stderr (stdout is reserved for MCP JSON-RPC)
@@ -111,6 +151,10 @@ export class LarkChannel {
 
   getBotMessageTracker(): BotMessageTracker {
     return this.botMessageTracker;
+  }
+
+  getLatestMessageTracker(): LatestMessageTracker {
+    return this.latestMessageTracker;
   }
 
   async start(): Promise<void> {
@@ -199,6 +243,14 @@ export class LarkChannel {
       }
       debugLog(`[channel] Group message with @mention, processing`);
     }
+
+    // Record latest inbound message for this (chat, thread) — used by reply tool
+    // to auto-correct reply_to in concurrent thread scenarios.
+    this.latestMessageTracker.record(chatId, {
+      messageId,
+      threadId,
+      timestamp: Date.now(),
+    });
 
     // Fire-and-forget ack reaction (Typing for P2P, MeMeMe for group @bot)
     const ackEmoji = chatType === 'p2p' ? 'Typing' : appConfig.ackEmoji;
@@ -302,7 +354,7 @@ export class LarkChannel {
     }
 
     // Enqueue for sequential per-chat processing
-    this.queue.enqueue(chatId, async () => {
+    this.queue.enqueue(chatId, threadId, async () => {
       // Record in conversation buffer
       this.conversationBuffer?.record(chatId, {
         role: 'user',

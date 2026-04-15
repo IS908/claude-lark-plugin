@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.1] - 2026-04-14
+
+### Fixed
+- Thread-aware reply routing: replies no longer mix up when multiple threads in the same group are active concurrently. Plugin now tracks the latest inbound message per (chat, thread) and auto-corrects `reply_to` when Claude passes `thread_id` but omits `reply_to`.
+
+### Added
+- `thread_id` parameter to the `reply` tool — pass it so the plugin can auto-route into the correct thread
+- `LatestMessageTracker` with 10-minute TTL
+
+### Changed
+- `MessageQueue` now keys by `chatId:threadId` instead of `chatId` — different threads in the same group process in parallel
+- Instructions updated to emphasize strict message_id ↔ `<channel>` tag matching
+
 ## [0.6.0] - 2026-04-14
 
 ### Added
@@ -61,6 +74,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.6.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.1
 [0.6.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.0
 [0.5.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.5.3
 [0.5.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.5.2
