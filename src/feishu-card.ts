@@ -39,13 +39,67 @@ export function shouldUseCard(text: string): boolean {
 
 /**
  * Build one or more Schema 2.0 card JSON objects from raw markdown text.
- * Returns at least one card. Oversized content is split across multiple cards.
+ * Returns at least one card. Oversized content is split across multiple
+ * cards bounded by CARD_ELEMENT_LIMIT and CARD_SIZE_LIMIT.
  */
 export function buildCards(
-  _text: string,
-  _opts?: { footer?: string }
+  text: string,
+  opts?: { footer?: string }
 ): object[] {
-  throw new Error('buildCards not yet implemented');
+  const { title, elements } = buildCardContent(text);
+
+  // Append footer element if provided
+  if (opts?.footer) {
+    elements.push({
+      tag: 'markdown',
+      content: opts.footer,
+      text_size: 'notation',
+    });
+  }
+
+  // Pack elements into one or more cards, bounded by count and total size
+  const cards: object[] = [];
+  let batch: Element[] = [];
+  let batchSize = 0;
+
+  const flush = () => {
+    if (batch.length === 0) return;
+    cards.push(buildSchema2Card(batch, title));
+    batch = [];
+    batchSize = 0;
+  };
+
+  for (const el of elements) {
+    const elJson = JSON.stringify(el);
+    if (
+      batch.length > 0 &&
+      (batch.length >= CARD_ELEMENT_LIMIT ||
+        batchSize + elJson.length > CARD_SIZE_LIMIT)
+    ) {
+      flush();
+    }
+    // Hard-truncate a single oversized element to stay within size budget
+    if (elJson.length > CARD_SIZE_LIMIT) {
+      const content =
+        typeof el.content === 'string'
+          ? el.content.slice(0, CARD_SIZE_LIMIT - 200) + '\n...'
+          : '...';
+      batch.push({ ...el, content });
+      batchSize += CARD_SIZE_LIMIT - 200;
+    } else {
+      batch.push(el);
+      batchSize += elJson.length;
+    }
+  }
+  flush();
+
+  if (cards.length === 0) {
+    cards.push(
+      buildSchema2Card([{ tag: 'markdown', content: '...' }], title)
+    );
+  }
+
+  return cards;
 }
 
 // ─── Markdown Style Optimizer ─────────────────────────────────
