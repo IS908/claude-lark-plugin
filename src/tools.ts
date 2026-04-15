@@ -6,7 +6,7 @@ import { appConfig } from './config.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { MemoryProvider } from './memory/interface.js';
 import type { ConversationBuffer } from './memory/buffer.js';
-import type { BotMessageTracker } from './channel.js';
+import type { BotMessageTracker, LatestMessageTracker } from './channel.js';
 
 /**
  * Register all 6 MCP tools on the server.
@@ -17,7 +17,8 @@ export function registerTools(
   memoryProvider: MemoryProvider,
   conversationBuffer?: ConversationBuffer,
   ackReactions?: Map<string, string>,
-  botMessageTracker?: BotMessageTracker
+  botMessageTracker?: BotMessageTracker,
+  latestMessageTracker?: LatestMessageTracker
 ): void {
   // ── 1. reply ──
   server.registerTool(
@@ -29,6 +30,12 @@ export function registerTools(
         chat_id: z.string().describe('The chat ID to reply in'),
         text: z.string().describe('The text content to send'),
         reply_to: z.string().optional().describe('Message ID to reply to (quoted reply)'),
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            'Thread ID from the <channel> meta. Pass this when replying to a threaded message — the plugin will auto-fill reply_to if you omit it, ensuring the reply lands in the correct thread.'
+          ),
         files: z
           .array(
             z.object({
@@ -40,16 +47,29 @@ export function registerTools(
           .describe('Optional attachments'),
       }),
     },
-    async ({ chat_id, text, reply_to, files }) => {
+    async ({ chat_id, text, reply_to, thread_id, files }) => {
+      // Auto-correct reply_to from the plugin's per-thread tracker when Claude
+      // omits it but passes thread_id. Explicit reply_to from Claude always wins.
+      let effectiveReplyTo = reply_to;
+      if (!effectiveReplyTo && thread_id && latestMessageTracker) {
+        const latest = latestMessageTracker.getLatest(chat_id, thread_id);
+        if (latest) {
+          effectiveReplyTo = latest.messageId;
+          console.error(
+            `[tools] Auto-filled reply_to=${latest.messageId} for thread ${thread_id}`
+          );
+        }
+      }
+
       const chunks = chunkText(text, appConfig.textChunkLimit);
 
       for (let i = 0; i < chunks.length; i++) {
         try {
           let resp: any;
-          if (reply_to && i === 0) {
+          if (effectiveReplyTo && i === 0) {
             // First chunk as a quoted reply
             resp = await client.im.v1.message.reply({
-              path: { message_id: reply_to },
+              path: { message_id: effectiveReplyTo },
               data: {
                 content: JSON.stringify({ text: chunks[i] }),
                 msg_type: 'text',
@@ -139,9 +159,9 @@ export function registerTools(
         timestamp: new Date().toISOString(),
       });
 
-      // Revoke ack reaction — try reply_to first, then scan all pending acks
+      // Revoke ack reaction — try effective reply_to first, then scan all pending acks
       if (ackReactions && ackReactions.size > 0) {
-        const msgId = reply_to || '';
+        const msgId = effectiveReplyTo || '';
         const reactionId = msgId ? ackReactions.get(msgId) : undefined;
         if (reactionId) {
           // Exact match on reply_to
