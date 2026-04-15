@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] - 2026-04-15
+
+### Added
+- Design spec for Feishu reply card rendering (`docs/superpowers/specs/2026-04-15-feishu-reply-card-design.md`) — covers hybrid trigger, Schema 2.0 card format, markdown optimization, code-block-safe splitting, and multi-card overflow handling. Implementation to follow.
+
 ## [0.6.1] - 2026-04-15
 
 ### Fixed
@@ -74,6 +79,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.7.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.7.0
 [0.6.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.1
 [0.6.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.0
 [0.5.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.5.3

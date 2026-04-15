@@ -187,3 +187,4 @@ Long replies with headings, code blocks, or tables render as a Feishu card autom
    - Reply > 25 KB → multiple cards in sequence
    - Reply with `format: 'text'` on a markdown message → plain text (override works)
    - Reply with `footer: '...'` → footer appears at card bottom as small text
+5. **Dry-run issue-fix self-loop**: after each change, re-run `npm test` and fix anything that fails. Repeat the dry-run cycle until a clean pass with no issues (typecheck clean, stdout empty, no errors in stderr beyond expected startup logs) before considering the work done.
