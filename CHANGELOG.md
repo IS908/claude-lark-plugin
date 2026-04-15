@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] - 2026-04-15
+
+### Added
+- Feishu reply card rendering: long or markdown-rich replies (headings, code blocks, tables, lists, bold, or length > 500 chars) auto-render as Schema 2.0 (CardKit) cards with `wathet` header template and title extracted from first heading
+- `format: 'text' | 'card'` optional parameter on the `reply` tool — overrides the heuristic when Claude needs to force a specific format
+- `footer: string` optional parameter on the `reply` tool — renders as a small `text_size: 'notation'` footnote at the card bottom
+- Code-block-safe text splitting: long content is chunked at paragraph/line boundaries, never truncating inside a fenced code block without closing and reopening the fence with its language tag
+- Multi-card overflow: oversized replies split across multiple sequential cards, bounded by element count (≤45) and total size (≤25 KB)
+- Markdown optimization for Feishu rendering: heading demotion (H1→H4, H2~H6→H5), `<br>` padding around tables and consecutive headings, invalid image reference stripping, blank line compression
+- `scripts/card-smoke.ts` — 11 smoke assertions covering heuristic rules, card splitting, footer, title extraction, code-block-safe boundaries, unclosed fences, and empty-input fallback; runs as part of `npm test`
+
+### Changed
+- Reply tool description updated to mention card auto-rendering
+- MCP instructions updated to explain `format` and `footer` parameters
+
 ## [0.6.1] - 2026-04-15
 
 ### Fixed
@@ -74,6 +89,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.7.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.7.0
 [0.6.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.1
 [0.6.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.0
 [0.5.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.5.3

@@ -7,6 +7,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { MemoryProvider } from './memory/interface.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { BotMessageTracker, LatestMessageTracker } from './channel.js';
+import { buildCards, shouldUseCard } from './feishu-card.js';
 
 /**
  * Register all 6 MCP tools on the server.
@@ -25,7 +26,7 @@ export function registerTools(
     'reply',
     {
       description:
-        'Send a text reply to a Feishu chat. Supports optional images (≤10 MB) or files (≤30 MB). Long text is auto-chunked.',
+        'Send a reply to a Feishu chat. Plain text by default; long or markdown-rich content auto-renders as a Feishu card. Supports optional images (≤10 MB) or files (≤30 MB).',
       inputSchema: z.object({
         chat_id: z.string().describe('The chat ID to reply in'),
         text: z.string().describe('The text content to send'),
@@ -35,6 +36,18 @@ export function registerTools(
           .optional()
           .describe(
             'Thread ID from the <channel> meta. Pass this when replying to a threaded message — the plugin will auto-fill reply_to if you omit it, ensuring the reply lands in the correct thread.'
+          ),
+        format: z
+          .enum(['text', 'card'])
+          .optional()
+          .describe(
+            'Output format. Omit for heuristic auto-detection: text with markdown features (headings/code blocks/tables/lists/bold) or length > 500 chars renders as a Feishu card. Set to "text" or "card" to override.'
+          ),
+        footer: z
+          .string()
+          .optional()
+          .describe(
+            'Optional small footnote appended at the bottom of the card (e.g. token usage, duration). Ignored when sending as plain text.'
           ),
         files: z
           .array(
@@ -47,7 +60,7 @@ export function registerTools(
           .describe('Optional attachments'),
       }),
     },
-    async ({ chat_id, text, reply_to, thread_id, files }) => {
+    async ({ chat_id, text, reply_to, thread_id, format, footer, files }) => {
       // Auto-correct reply_to from the plugin's per-thread tracker when Claude
       // omits it but passes thread_id. Explicit reply_to from Claude always wins.
       let effectiveReplyTo = reply_to;
@@ -61,40 +74,96 @@ export function registerTools(
         }
       }
 
-      const chunks = chunkText(text, appConfig.textChunkLimit);
+      // Dispatch: card path vs plain-text path
+      const useCard =
+        format === 'card' || (format !== 'text' && shouldUseCard(text));
 
-      for (let i = 0; i < chunks.length; i++) {
-        try {
-          let resp: any;
-          if (effectiveReplyTo && i === 0) {
-            // First chunk as a quoted reply
-            resp = await client.im.v1.message.reply({
-              path: { message_id: effectiveReplyTo },
-              data: {
-                content: JSON.stringify({ text: chunks[i] }),
-                msg_type: 'text',
-              },
-            });
-          } else {
-            resp = await client.im.v1.message.create({
-              params: { receive_id_type: 'chat_id' },
-              data: {
-                receive_id: chat_id,
-                content: JSON.stringify({ text: chunks[i] }),
-                msg_type: 'text',
-              },
-            });
+      let sentCount = 0;
+
+      if (useCard) {
+        const cards = buildCards(text, { footer });
+        sentCount = cards.length;
+        for (let i = 0; i < cards.length; i++) {
+          const content = JSON.stringify(cards[i]);
+          try {
+            let resp: any;
+            if (i === 0 && effectiveReplyTo) {
+              resp = await client.im.v1.message.reply({
+                path: { message_id: effectiveReplyTo },
+                data: { content, msg_type: 'interactive' },
+              });
+            } else {
+              resp = await client.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: {
+                  receive_id: chat_id,
+                  content,
+                  msg_type: 'interactive',
+                },
+              });
+            }
+            const sentId = resp?.data?.message_id;
+            if (sentId && botMessageTracker) botMessageTracker.add(sentId);
+          } catch (err: any) {
+            const apiError = err?.response?.data ?? err?.data;
+            if (apiError?.code && apiError?.msg) {
+              console.error(
+                `[tools] Feishu API error [${apiError.code}]: ${apiError.msg}`
+              );
+              throw new Error(
+                `Feishu API [${apiError.code}]: ${apiError.msg}`
+              );
+            }
+            console.error(
+              `[tools] send card failed:`,
+              err?.message ?? String(err)
+            );
+            throw err;
           }
-          const sentId = resp?.data?.message_id;
-          if (sentId && botMessageTracker) botMessageTracker.add(sentId);
-        } catch (err: any) {
-          const apiError = err?.response?.data ?? err?.data;
-          if (apiError?.code && apiError?.msg) {
-            console.error(`[tools] Feishu API error [${apiError.code}]: ${apiError.msg}`);
-            throw new Error(`Feishu API [${apiError.code}]: ${apiError.msg}`);
+        }
+      } else {
+        // Plain-text path (existing behavior)
+        const chunks = chunkText(text, appConfig.textChunkLimit);
+        sentCount = chunks.length;
+        for (let i = 0; i < chunks.length; i++) {
+          try {
+            let resp: any;
+            if (effectiveReplyTo && i === 0) {
+              resp = await client.im.v1.message.reply({
+                path: { message_id: effectiveReplyTo },
+                data: {
+                  content: JSON.stringify({ text: chunks[i] }),
+                  msg_type: 'text',
+                },
+              });
+            } else {
+              resp = await client.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: {
+                  receive_id: chat_id,
+                  content: JSON.stringify({ text: chunks[i] }),
+                  msg_type: 'text',
+                },
+              });
+            }
+            const sentId = resp?.data?.message_id;
+            if (sentId && botMessageTracker) botMessageTracker.add(sentId);
+          } catch (err: any) {
+            const apiError = err?.response?.data ?? err?.data;
+            if (apiError?.code && apiError?.msg) {
+              console.error(
+                `[tools] Feishu API error [${apiError.code}]: ${apiError.msg}`
+              );
+              throw new Error(
+                `Feishu API [${apiError.code}]: ${apiError.msg}`
+              );
+            }
+            console.error(
+              `[tools] send message failed:`,
+              err?.message ?? String(err)
+            );
+            throw err;
           }
-          console.error(`[tools] send message failed:`, err?.message ?? String(err));
-          throw err;
         }
       }
 
@@ -181,7 +250,7 @@ export function registerTools(
       }
 
       return {
-        content: [{ type: 'text' as const, text: `Sent ${chunks.length} message(s)` }],
+        content: [{ type: 'text' as const, text: `Sent ${sentCount} message(s)` }],
       };
     }
   );

@@ -20,4 +20,8 @@ fi
 echo "PASS"
 
 echo ""
+echo "=== Card builder unit checks ==="
+npx tsx scripts/card-smoke.ts
+
+echo ""
 echo "All tests passed."
