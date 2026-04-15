@@ -62,6 +62,7 @@ async function main() {
         'If the triggering <channel> tag has thread_id, pass it to reply. The plugin uses thread_id to route the reply into the correct thread even if reply_to is omitted or ambiguous.',
         'If metadata has image_path, Read that file to see the image.',
         'If metadata has attachment_file_id, call download_attachment with message_id and file_key, then Read the path.',
+        'Long replies with headings, code blocks, or tables render as a Feishu card automatically. Pass format=\'card\' to force, format=\'text\' to force plain. Optionally pass footer for a small footnote at the card bottom.',
         'Use save_memory for important facts; save_skill for reusable procedures.',
       ].join('\n'),
     }
