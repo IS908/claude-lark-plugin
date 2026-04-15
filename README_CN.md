@@ -200,6 +200,8 @@ node -e "console.log(require('./package.json').version)"
 |------|--------|------|
 | `LARK_ALLOWED_USER_IDS` | （空） | 发送者 open_id 白名单，逗号分隔 |
 | `LARK_ALLOWED_CHAT_IDS` | （空） | 群聊 ID 白名单，逗号分隔 |
+
+> **白名单语义**：两个列表都设置时，发送者在 `LARK_ALLOWED_USER_IDS` 里**或**聊天在 `LARK_ALLOWED_CHAT_IDS` 里即允许（OR 关系）。只设置一个列表时，只用那个列表过滤。
 | `LARK_TEXT_CHUNK_LIMIT` | `4000` | 单条消息最大字符数 |
 | `LARK_ENABLED_SKILLS` | （空） | lark-cli 技能白名单，用于 start.sh |
 

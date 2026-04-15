@@ -215,6 +215,8 @@ On every incoming message, the plugin injects relevant memory context in this or
 |---|---|---|
 | `LARK_ALLOWED_USER_IDS` | (empty) | Comma-separated list of allowed user open_ids. Empty means all users allowed. |
 | `LARK_ALLOWED_CHAT_IDS` | (empty) | Comma-separated list of allowed chat IDs. Empty means all chats allowed. |
+
+> **Whitelist semantics:** when both lists are set, a message is accepted if **either** the sender is in `LARK_ALLOWED_USER_IDS` **or** the chat is in `LARK_ALLOWED_CHAT_IDS` (OR). Setting only one list gates on that list alone.
 | `LARK_TEXT_CHUNK_LIMIT` | `4000` | Maximum characters per message chunk |
 | `LARK_ACK_EMOJI` | `MeMeMe` | Emoji reaction on message receive. Set to empty string to disable. |
 | `LARK_ENABLED_SKILLS` | `lark-im,lark-contact,lark-doc,lark-calendar,lark-task` | Comma-separated skills to load alongside the plugin |

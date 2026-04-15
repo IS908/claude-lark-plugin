@@ -14,6 +14,22 @@ function debugLog(msg: string) {
   console.error(msg);
 }
 
+/**
+ * Whitelist check with OR semantics:
+ * - Neither list configured → allow all
+ * - Only user list → gate on user only
+ * - Only chat list → gate on chat only
+ * - Both lists → allow when user OR chat matches (either list whitelists the message)
+ */
+function passesWhitelist(senderId: string, chatId: string): boolean {
+  const userConfigured = appConfig.allowedUserIds.length > 0;
+  const chatConfigured = appConfig.allowedChatIds.length > 0;
+  if (!userConfigured && !chatConfigured) return true;
+  const userOk = userConfigured && appConfig.allowedUserIds.includes(senderId);
+  const chatOk = chatConfigured && appConfig.allowedChatIds.includes(chatId);
+  return userOk || chatOk;
+}
+
 export interface LarkMessage {
   messageId: string;
   chatId: string;
@@ -217,11 +233,9 @@ export class LarkChannel {
     // Resolve sender display name (from event data or cache)
     const senderName = await this.resolveUserName(senderId, sender);
 
-    // Whitelist filtering
-    if (appConfig.allowedUserIds.length > 0 && !appConfig.allowedUserIds.includes(senderId)) {
-      return;
-    }
-    if (appConfig.allowedChatIds.length > 0 && !appConfig.allowedChatIds.includes(chatId)) {
+    // Whitelist filtering (OR semantics when both lists are set)
+    if (!passesWhitelist(senderId, chatId)) {
+      debugLog(`[channel] Message from ${senderId} in ${chatId} rejected by whitelist`);
       return;
     }
 
@@ -508,8 +522,11 @@ export class LarkChannel {
     // Only process reactions on messages the bot sent
     if (!this.botMessageTracker.has(messageId)) return;
 
-    // Whitelist filtering (no chat_id in reaction events)
-    if (appConfig.allowedUserIds.length > 0 && !appConfig.allowedUserIds.includes(operatorId)) return;
+    // Whitelist filtering (reaction events carry no chat_id, so pass '')
+    if (!passesWhitelist(operatorId, '')) {
+      debugLog(`[channel] Reaction from ${operatorId} rejected by whitelist`);
+      return;
+    }
 
     const senderName = await this.resolveUserName(operatorId);
 
