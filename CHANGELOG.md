@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.1] - 2026-04-16
+
+### Fixed
+- Whitelist semantics: `LARK_ALLOWED_USER_IDS` and `LARK_ALLOWED_CHAT_IDS` now combine with **OR** when both are configured — a message is allowed if the sender matches the user list **or** the chat matches the chat list. Previously (AND) required both to match, which silently dropped valid traffic. Setting only one list still gates on that list alone.
+
 ## [0.7.0] - 2026-04-15
 
 ### Added
@@ -89,6 +94,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.7.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.7.1
 [0.7.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.7.0
 [0.6.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.1
 [0.6.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.0
