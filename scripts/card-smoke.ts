@@ -48,4 +48,31 @@ const c5: any = buildCards('just a line of text, no heading here');
 const t5 = c5[0].header.title.content;
 if (!t5 || t5.length === 0) fail('fallback title missing');
 
+// 9. Code-block-safe splitting: long text with fenced code block must produce
+// elements where fences stay balanced (close+reopen when split mid-block).
+const bigCode = '# Long\n\n```py\n' + 'x = 1\n'.repeat(3000) + '```';
+const c6: any = buildCards(bigCode);
+for (const card of c6) {
+  for (const el of card.body.elements) {
+    if (el.tag !== 'markdown' || typeof el.content !== 'string') continue;
+    const fenceCount = (el.content.match(/```/g) || []).length;
+    if (fenceCount % 2 !== 0) {
+      fail(`unbalanced fences in element: ${el.content.slice(0, 100)}...`);
+    }
+  }
+}
+
+// 10. Unclosed code block should not throw
+try {
+  buildCards('# x\n```js\nfoo');
+} catch (e) {
+  fail(`unclosed code block threw: ${e}`);
+}
+
+// 11. Empty text falls back to '...' placeholder
+const c7: any = buildCards('');
+if (!c7[0] || !c7[0].body || !Array.isArray(c7[0].body.elements)) {
+  fail('empty text produced invalid card');
+}
+
 console.log('PASS');

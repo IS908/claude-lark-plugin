@@ -26,7 +26,7 @@ export function registerTools(
     'reply',
     {
       description:
-        'Send a text reply to a Feishu chat. Supports optional images (≤10 MB) or files (≤30 MB). Long text is auto-chunked.',
+        'Send a reply to a Feishu chat. Plain text by default; long or markdown-rich content auto-renders as a Feishu card. Supports optional images (≤10 MB) or files (≤30 MB).',
       inputSchema: z.object({
         chat_id: z.string().describe('The chat ID to reply in'),
         text: z.string().describe('The text content to send'),
@@ -78,8 +78,11 @@ export function registerTools(
       const useCard =
         format === 'card' || (format !== 'text' && shouldUseCard(text));
 
+      let sentCount = 0;
+
       if (useCard) {
         const cards = buildCards(text, { footer });
+        sentCount = cards.length;
         for (let i = 0; i < cards.length; i++) {
           const content = JSON.stringify(cards[i]);
           try {
@@ -121,6 +124,7 @@ export function registerTools(
       } else {
         // Plain-text path (existing behavior)
         const chunks = chunkText(text, appConfig.textChunkLimit);
+        sentCount = chunks.length;
         for (let i = 0; i < chunks.length; i++) {
           try {
             let resp: any;
@@ -246,7 +250,7 @@ export function registerTools(
       }
 
       return {
-        content: [{ type: 'text' as const, text: `Sent message(s)` }],
+        content: [{ type: 'text' as const, text: `Sent ${sentCount} message(s)` }],
       };
     }
   );
