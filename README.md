@@ -33,6 +33,7 @@ The plugin connects to Feishu via the Lark SDK WebSocket client, receives messag
 ### Responding
 
 - Text replies with automatic chunking for long messages (configurable limit)
+- **Card rendering**: long or markdown-rich replies (headings, code blocks, tables, lists, bold, or > 500 chars) auto-render as Feishu cards. Pass `format='card'` to force card, `format='text'` to force plain. Optional `footer` footnote supported
 - **Ack reaction**: bot automatically reacts with an emoji (default: MeMeMe) on receive, removes it after replying
 - Image and file uploads (images up to 10 MB, files up to 30 MB)
 - Message editing (plain text and card markdown)
