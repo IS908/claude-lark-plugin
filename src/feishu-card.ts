@@ -116,3 +116,134 @@ function optimizeMarkdownStyle(text: string, cardVersion = 2): string {
     return text;
   }
 }
+
+// ─── Title Extraction ─────────────────────────────────────────
+
+/**
+ * Extract a card title from the first heading (H1/H2/H3) of `text`.
+ * If no heading is present, fall back to the first non-empty line,
+ * stripped of markdown punctuation and truncated to 40 chars.
+ */
+function extractTitleAndBody(text: string): { title: string; body: string } {
+  const lines = text.split('\n');
+  let title = '';
+  let bodyStartIdx = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    if (/^#{1,3}\s+/.test(lines[i])) {
+      title = lines[i].replace(/^#+\s*/, '').trim();
+      bodyStartIdx = i + 1;
+    }
+    break;
+  }
+
+  const body = lines.slice(bodyStartIdx).join('\n').trim();
+
+  if (!title) {
+    const firstLine = (lines.find((l) => l.trim()) || '')
+      .replace(/[*_`#\[\]]/g, '')
+      .trim();
+    title =
+      firstLine.length > 40
+        ? firstLine.slice(0, 37) + '...'
+        : firstLine || 'Reply';
+  }
+
+  return { title, body };
+}
+
+// ─── Code-Block-Safe Splitting ───────────────────────────────
+
+interface CodeBlockRange {
+  open: number;
+  close: number;
+  lang: string;
+}
+
+/** Scan text for fenced code block ranges (``` ... ```). */
+function findCodeBlockRanges(text: string): CodeBlockRange[] {
+  const ranges: CodeBlockRange[] = [];
+  const regex = /^```(\w*)\s*$/gm;
+  let match: RegExpExecArray | null;
+  let openMatch: RegExpExecArray | null = null;
+  let openLang = '';
+
+  while ((match = regex.exec(text)) !== null) {
+    if (!openMatch) {
+      openMatch = match;
+      openLang = match[1] || '';
+    } else {
+      ranges.push({
+        open: openMatch.index,
+        close: match.index + match[0].length,
+        lang: openLang,
+      });
+      openMatch = null;
+      openLang = '';
+    }
+  }
+
+  // Unclosed code block — treat from open to end of text
+  if (openMatch) {
+    ranges.push({
+      open: openMatch.index,
+      close: text.length,
+      lang: openLang,
+    });
+  }
+
+  return ranges;
+}
+
+function findContainingBlock(
+  pos: number,
+  ranges: CodeBlockRange[]
+): CodeBlockRange | null {
+  for (const r of ranges) {
+    if (pos > r.open && pos < r.close) return r;
+  }
+  return null;
+}
+
+/**
+ * Split text into chunks of at most `maxLen` characters, preferring
+ * paragraph/line boundaries and never truncating a fenced code block
+ * without properly closing/reopening it.
+ */
+function splitCodeBlockSafe(text: string, maxLen: number): string[] {
+  if (text.length <= maxLen) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > maxLen) {
+    const ranges = findCodeBlockRanges(remaining);
+
+    let idx = remaining.lastIndexOf('\n\n', maxLen);
+    if (idx < maxLen * 0.3) idx = remaining.lastIndexOf('\n', maxLen);
+    if (idx < maxLen * 0.3) idx = maxLen;
+
+    const block = findContainingBlock(idx, ranges);
+
+    if (block) {
+      if (block.open > 0 && block.open > maxLen * 0.3) {
+        const retreatIdx = remaining.lastIndexOf('\n', block.open);
+        idx = retreatIdx > maxLen * 0.3 ? retreatIdx : block.open;
+        chunks.push(remaining.slice(0, idx).trimEnd());
+        remaining = remaining.slice(idx).replace(/^\n+/, '');
+      } else {
+        const chunk = remaining.slice(0, idx).trimEnd() + '\n```';
+        chunks.push(chunk);
+        const reopener = '```' + block.lang + '\n';
+        remaining = reopener + remaining.slice(idx).replace(/^\n/, '');
+      }
+    } else {
+      chunks.push(remaining.slice(0, idx).trimEnd());
+      remaining = remaining.slice(idx).replace(/^\n+/, '');
+    }
+  }
+
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
