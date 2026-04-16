@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.0] - 2026-04-17
+
+### Added
+- **CronJob scheduler**: file-based recurring task system with two job types
+  - `message` type: send fixed content directly via Feishu API (deterministic, no Claude)
+  - `prompt` type: inject prompt into Claude via channel notification, Claude executes and replies (best-effort)
+- **4 MCP tools**: `create_job`, `list_jobs`, `update_job`, `delete_job` — manage jobs from Feishu chat or terminal
+- **`/lark:jobs` skill** (`skills/jobs/SKILL.md`) — guided job management via Claude Code
+- **Crash recovery**: on restart, missed jobs (where `next_run_at < now`) are executed once
+- **Schedule aliases**: `every 30m`, `daily at 09:00`, `weekdays at 17:00` expanded to cron at creation
+- **New dependency**: `cron-parser` (~20KB) for cron expression parsing and next-run calculation
+- **New config**: `LARK_CRON_SCAN_INTERVAL` (default: 60s) — scheduler scan interval
+- Job storage at `~/.claude/channels/lark/jobs/{id}.json` with `meta` / `runtime` split structure
+- Design spec: `docs/superpowers/specs/2026-04-16-cronjob-scheduler-design.md`
+
 ## [0.7.1] - 2026-04-16
 
 ### Fixed
@@ -94,6 +109,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.8.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.0
 [0.7.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.7.1
 [0.7.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.7.0
 [0.6.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.6.1

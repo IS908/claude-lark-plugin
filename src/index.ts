@@ -10,6 +10,7 @@ import { registerTools } from './tools.js';
 import { ConversationBuffer } from './memory/buffer.js';
 import { buildFlushPrompt } from './memory/distiller.js';
 import { createMemoryProvider } from './memory/factory.js';
+import { JobScheduler } from './scheduler.js';
 
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
 
@@ -48,7 +49,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '0.7.1' },
+    { name: 'claude-lark-plugin', version: '0.8.0' },
     {
       capabilities: {
         logging: {},
@@ -63,6 +64,7 @@ async function main() {
         'If metadata has image_path, Read that file to see the image.',
         'If metadata has attachment_file_id, call download_attachment with message_id and file_key, then Read the path.',
         'Long replies with headings, code blocks, or tables render as a Feishu card automatically. Pass format=\'card\' to force, format=\'text\' to force plain. Optionally pass footer for a small footnote at the card bottom.',
+        'CronJob notifications arrive with source=\'cronjob\' in metadata. Dispatch these to a subagent when possible so the main thread stays available for Feishu messages. The chat_id in metadata is the target for your reply.',
         'Use save_memory for important facts; save_skill for reusable procedures.',
       ].join('\n'),
     }
@@ -167,6 +169,13 @@ async function main() {
 
   // 9. Re-arm flush timers from persisted episodes
   await buffer.rearmFromDisk();
+
+  // 10. Start cronjob scheduler
+  const scheduler = new JobScheduler({
+    server: server.server,
+    client: channel.getClient(),
+  });
+  await scheduler.start();
 
   console.error('[index] claude-lark-plugin started successfully');
 }

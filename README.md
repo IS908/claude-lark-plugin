@@ -48,11 +48,19 @@ The plugin connects to Feishu via the Lark SDK WebSocket client, receives messag
 - User profiles, chat episodes, thread episodes, and global skills
 - Memory-enriched context injection on every incoming message
 
+### Scheduled Jobs (CronJob)
+
+- **Two job types**: `message` (send fixed content, deterministic) and `prompt` (Claude executes and replies, best-effort)
+- Standard cron expressions + simplified aliases (`every 30m`, `daily at 09:00`, `weekdays at 17:00`)
+- Create and manage jobs through Feishu chat or `/lark:jobs` skill
+- Crash recovery: missed jobs are executed once on restart
+- Job storage as JSON files at `~/.claude/channels/lark/jobs/`
+
 ### Reliability
 
 - Per-chat message queue for sequential processing within each conversation
 - Single-instance lock to prevent duplicate event handling
-- User and chat ID whitelisting for access control
+- User and chat ID whitelisting for access control (OR semantics when both lists set)
 - Graceful degradation when memory providers are unavailable
 
 ---
@@ -219,6 +227,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 > **Whitelist semantics:** when both lists are set, a message is accepted if **either** the sender is in `LARK_ALLOWED_USER_IDS` **or** the chat is in `LARK_ALLOWED_CHAT_IDS` (OR). Setting only one list gates on that list alone.
 | `LARK_TEXT_CHUNK_LIMIT` | `4000` | Maximum characters per message chunk |
 | `LARK_ACK_EMOJI` | `MeMeMe` | Emoji reaction on message receive. Set to empty string to disable. |
+| `LARK_CRON_SCAN_INTERVAL` | `60` | CronJob scheduler scan interval in seconds |
 | `LARK_ENABLED_SKILLS` | `lark-im,lark-contact,lark-doc,lark-calendar,lark-task` | Comma-separated skills to load alongside the plugin |
 
 ### Optional -- Memory
@@ -325,6 +334,10 @@ The plugin registers the following MCP tools for Claude to use:
 | `download_attachment` | Download an attachment (image, file, audio, video) from a message to the local inbox. |
 | `save_memory` | Save a memory entry (profile, chat episode, or thread episode) for cross-session recall. |
 | `save_skill` | Save a reusable procedure as a globally searchable skill. |
+| `create_job` | Create a scheduled cronjob (message or prompt type). |
+| `list_jobs` | List all cronjobs and their status. |
+| `update_job` | Update a cronjob (schedule, content, pause/resume). |
+| `delete_job` | Delete a cronjob. |
 
 ---
 
