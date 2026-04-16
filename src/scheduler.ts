@@ -20,6 +20,52 @@ export interface SchedulerOptions {
   client: Lark.Client;
 }
 
+// ─── Retry Logic ────────────────────────────────────────────
+
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [30_000, 60_000, 120_000]; // 30s, 60s, 120s
+
+/** Network/transient error codes that warrant a retry. */
+const RETRYABLE_NETWORK_ERRORS = new Set([
+  'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED',
+  'ECONNABORTED', 'EAI_AGAIN', 'EPIPE',
+]);
+
+/** HTTP status codes that warrant a retry. */
+const RETRYABLE_HTTP_CODES = new Set([429, 500, 502, 503, 504]);
+
+function isRetryableError(err: any): boolean {
+  // Network-level errors (Node.js syscall errors)
+  if (err?.code && RETRYABLE_NETWORK_ERRORS.has(err.code)) return true;
+  if (err?.cause?.code && RETRYABLE_NETWORK_ERRORS.has(err.cause.code)) return true;
+
+  // HTTP status from Feishu SDK (wrapped in response)
+  const status = err?.response?.status ?? err?.status;
+  if (status && RETRYABLE_HTTP_CODES.has(status)) return true;
+
+  // Feishu API error codes — permission/param errors are NOT retryable
+  const apiCode = err?.response?.data?.code ?? err?.data?.code;
+  if (apiCode) {
+    // Known non-retryable Feishu codes
+    // 99991672 = permission denied, 230001 = param error
+    if (apiCode === 99991672 || apiCode === 230001) return false;
+    // Other Feishu codes starting with 9999 are usually transient
+    if (apiCode >= 99990000 && apiCode < 100000000) return true;
+  }
+
+  // Error message heuristics
+  const msg = (err?.message ?? '').toLowerCase();
+  if (msg.includes('timeout') || msg.includes('enotfound') || msg.includes('econnreset')) {
+    return true;
+  }
+
+  return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class JobScheduler {
   private timer: NodeJS.Timeout | null = null;
   private server: Server;
@@ -107,33 +153,66 @@ export class JobScheduler {
   }
 
   /**
-   * Execute a single job and update its runtime state.
+   * Execute a single job with retry logic for transient failures.
+   *
+   * Retry strategy:
+   * - Up to 3 retries with delays: 30s, 60s, 120s
+   * - Only retries transient errors (network, 5xx, rate-limit)
+   * - Permanent errors (permission denied, invalid params) fail immediately
+   * - On final failure, records last_error and advances next_run_at
    */
   private async executeJob(job: JobFile): Promise<void> {
     const startTime = Date.now();
+    let lastErr: any = null;
 
-    try {
-      if (job.meta.type === 'message') {
-        await this.executeMessageJob(job);
-      } else if (job.meta.type === 'prompt') {
-        await this.executePromptJob(job);
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        if (job.meta.type === 'message') {
+          await this.executeMessageJob(job);
+        } else if (job.meta.type === 'prompt') {
+          await this.executePromptJob(job);
+        }
+
+        // Success — update runtime
+        job.runtime.last_run_at = new Date(startTime).toISOString();
+        job.runtime.next_run_at = computeNextRun(job.meta.schedule);
+        job.runtime.run_count += 1;
+        job.runtime.last_error = null;
+
+        if (attempt > 0) {
+          console.error(`[scheduler] Job ${job.meta.id} succeeded on retry #${attempt} (run #${job.runtime.run_count})`);
+        } else {
+          console.error(`[scheduler] Job ${job.meta.id} executed successfully (run #${job.runtime.run_count})`);
+        }
+
+        await writeJob(job);
+        return;
+      } catch (err: any) {
+        lastErr = err;
+
+        // Check if the error is retryable
+        if (!isRetryableError(err) || attempt >= MAX_RETRIES) {
+          break; // permanent error or exhausted retries
+        }
+
+        const delay = RETRY_DELAYS[attempt] ?? RETRY_DELAYS[RETRY_DELAYS.length - 1];
+        console.error(
+          `[scheduler] Job ${job.meta.id} failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}), ` +
+          `retrying in ${delay / 1000}s: ${err?.message ?? err}`
+        );
+        await sleep(delay);
       }
-
-      // Success — update runtime
-      job.runtime.last_run_at = new Date(startTime).toISOString();
-      job.runtime.next_run_at = computeNextRun(job.meta.schedule);
-      job.runtime.run_count += 1;
-      job.runtime.last_error = null;
-
-      console.error(`[scheduler] Job ${job.meta.id} executed successfully (run #${job.runtime.run_count})`);
-    } catch (err: any) {
-      // Failure — record error, still advance next_run_at
-      job.runtime.last_run_at = new Date(startTime).toISOString();
-      job.runtime.next_run_at = computeNextRun(job.meta.schedule);
-      job.runtime.last_error = err?.message ?? String(err);
-
-      console.error(`[scheduler] Job ${job.meta.id} failed:`, job.runtime.last_error);
     }
+
+    // All retries exhausted or permanent error — record failure
+    job.runtime.last_run_at = new Date(startTime).toISOString();
+    job.runtime.next_run_at = computeNextRun(job.meta.schedule);
+    job.runtime.last_error = lastErr?.message ?? String(lastErr);
+
+    const retryNote = isRetryableError(lastErr)
+      ? ` (exhausted ${MAX_RETRIES} retries)`
+      : ' (non-retryable)';
+    console.error(`[scheduler] Job ${job.meta.id} failed${retryNote}: ${job.runtime.last_error}`);
 
     await writeJob(job);
   }
