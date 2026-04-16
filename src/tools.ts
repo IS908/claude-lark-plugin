@@ -8,6 +8,17 @@ import type { MemoryProvider } from './memory/interface.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { BotMessageTracker, LatestMessageTracker } from './channel.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
+import {
+  sanitizeJobId,
+  expandSchedule,
+  computeNextRun,
+  readJob,
+  writeJob,
+  deleteJob as deleteJobFile,
+  listAllJobs,
+  jobExists,
+  type JobFile,
+} from './job-store.js';
 
 /**
  * Register all 6 MCP tools on the server.
@@ -436,6 +447,248 @@ export function registerTools(
       await memoryProvider.saveSkill(name, description, content);
       return {
         content: [{ type: 'text' as const, text: `Saved skill "${name}": ${description}` }],
+      };
+    }
+  );
+
+  // ── create_job ──
+  server.registerTool(
+    'create_job',
+    {
+      description:
+        'Create a scheduled cronjob. Use type="message" for fixed content (deterministic) or type="prompt" for Claude-executed tasks (best-effort). For critical notifications use message type.',
+      inputSchema: z.object({
+        name: z.string().describe('Job display name (can be Chinese)'),
+        type: z.enum(['prompt', 'message']).describe('Job type'),
+        schedule: z
+          .string()
+          .describe(
+            'Cron expression or alias: "0 9 * * 1-5", "every 30m", "daily at 09:00", "weekdays at 09:00", "weekly on mon at 09:00"'
+          ),
+        prompt: z
+          .string()
+          .optional()
+          .describe('Prompt for Claude to execute (type=prompt)'),
+        content: z
+          .string()
+          .optional()
+          .describe('Fixed message content (type=message)'),
+        target_chat_id: z.string().describe('Chat ID to send results to'),
+        created_by: z
+          .string()
+          .optional()
+          .describe('Creator open_id (auto-filled from channel context if omitted)'),
+      }),
+    },
+    async ({ name, type, schedule, prompt, content, target_chat_id, created_by }) => {
+      // Validate type-specific fields
+      if (type === 'prompt' && !prompt) {
+        return {
+          content: [{ type: 'text' as const, text: 'prompt is required for type=prompt' }],
+          isError: true,
+        };
+      }
+      if (type === 'message' && !content) {
+        return {
+          content: [{ type: 'text' as const, text: 'content is required for type=message' }],
+          isError: true,
+        };
+      }
+
+      // Expand schedule alias and validate
+      let cron: string;
+      let scheduleHuman: string;
+      try {
+        const expanded = expandSchedule(schedule);
+        cron = expanded.cron;
+        scheduleHuman = expanded.human;
+      } catch (err: any) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Invalid schedule expression: ${err?.message ?? schedule}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Generate ID
+      const id = sanitizeJobId(name);
+      if (await jobExists(id)) {
+        return {
+          content: [
+            { type: 'text' as const, text: `Job "${id}" already exists. Use a different name or delete the existing job first.` },
+          ],
+          isError: true,
+        };
+      }
+
+      const nextRunAt = computeNextRun(cron);
+
+      const job: JobFile = {
+        meta: {
+          id,
+          name,
+          type,
+          schedule: cron,
+          schedule_human: scheduleHuman,
+          ...(type === 'prompt' ? { prompt } : { content, msg_type: 'text' }),
+          target_chat_id,
+          status: 'active',
+          created_by: created_by ?? '',
+          created_at: new Date().toISOString(),
+        },
+        runtime: {
+          last_run_at: null,
+          next_run_at: nextRunAt,
+          run_count: 0,
+          last_error: null,
+        },
+      };
+
+      await writeJob(job);
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Created job "${id}" (${scheduleHuman}). Next run: ${nextRunAt}`,
+          },
+        ],
+      };
+    }
+  );
+
+  // ── list_jobs ──
+  server.registerTool(
+    'list_jobs',
+    {
+      description: 'List all cronjobs and their status.',
+      inputSchema: z.object({
+        status: z
+          .enum(['active', 'paused', 'all'])
+          .optional()
+          .default('all')
+          .describe('Filter by status'),
+      }),
+    },
+    async ({ status }) => {
+      const jobs = await listAllJobs();
+      const filtered =
+        status === 'all' ? jobs : jobs.filter((j) => j.meta.status === status);
+
+      if (filtered.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: 'No jobs found.' }],
+        };
+      }
+
+      const lines = filtered.map((j) => {
+        const statusIcon = j.meta.status === 'active' ? '✅' : '⏸️';
+        const lastRun = j.runtime.last_run_at
+          ? new Date(j.runtime.last_run_at).toLocaleString()
+          : 'never';
+        const error = j.runtime.last_error ? ` ⚠️ ${j.runtime.last_error}` : '';
+        return `${statusIcon} **${j.meta.id}** (${j.meta.type}) — ${j.meta.schedule_human}\n   Next: ${j.runtime.next_run_at} | Last: ${lastRun} | Runs: ${j.runtime.run_count}${error}`;
+      });
+
+      return {
+        content: [{ type: 'text' as const, text: lines.join('\n\n') }],
+      };
+    }
+  );
+
+  // ── update_job ──
+  server.registerTool(
+    'update_job',
+    {
+      description:
+        'Update a cronjob — change schedule, content, pause, or resume.',
+      inputSchema: z.object({
+        id: z.string().describe('Job ID'),
+        status: z.enum(['active', 'paused']).optional().describe('Set status'),
+        schedule: z.string().optional().describe('New cron expression or alias'),
+        prompt: z.string().optional().describe('New prompt (type=prompt)'),
+        content: z.string().optional().describe('New content (type=message)'),
+        name: z.string().optional().describe('New display name'),
+      }),
+    },
+    async ({ id, status, schedule, prompt, content, name }) => {
+      const job = await readJob(id);
+      if (!job) {
+        return {
+          content: [{ type: 'text' as const, text: `Job "${id}" not found.` }],
+          isError: true,
+        };
+      }
+
+      if (name !== undefined) job.meta.name = name;
+      if (prompt !== undefined) job.meta.prompt = prompt;
+      if (content !== undefined) job.meta.content = content;
+
+      // Update schedule if provided
+      if (schedule !== undefined) {
+        try {
+          const expanded = expandSchedule(schedule);
+          job.meta.schedule = expanded.cron;
+          job.meta.schedule_human = expanded.human;
+          job.runtime.next_run_at = computeNextRun(expanded.cron);
+        } catch (err: any) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Invalid schedule: ${err?.message ?? schedule}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // Update status
+      if (status !== undefined) {
+        job.meta.status = status;
+        if (status === 'active' && !schedule) {
+          // Recompute next_run_at when resuming
+          job.runtime.next_run_at = computeNextRun(job.meta.schedule);
+        }
+      }
+
+      await writeJob(job);
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Updated job "${id}". Status: ${job.meta.status}, Next run: ${job.runtime.next_run_at}`,
+          },
+        ],
+      };
+    }
+  );
+
+  // ── delete_job ──
+  server.registerTool(
+    'delete_job',
+    {
+      description: 'Delete a cronjob permanently.',
+      inputSchema: z.object({
+        id: z.string().describe('Job ID to delete'),
+      }),
+    },
+    async ({ id }) => {
+      const deleted = await deleteJobFile(id);
+      if (!deleted) {
+        return {
+          content: [{ type: 'text' as const, text: `Job "${id}" not found.` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: 'text' as const, text: `Deleted job "${id}".` }],
       };
     }
   );

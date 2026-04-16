@@ -22,8 +22,11 @@ npm start -- --dry-run # Validate config and module loading without connecting
 src/index.ts        – Entry point: wires MCP server, LarkChannel, memory, and buffer together
 src/config.ts       – Loads config from ~/.claude/channels/lark/.env (dotenv)
 src/channel.ts      – LarkChannel: Feishu WebSocket client, message parsing, memory enrichment pipeline
-src/tools.ts        – Registers 6 MCP tools: reply, edit_message, react, download_attachment, save_memory, save_skill
-src/queue.ts        – Per-chat sequential message queue
+src/tools.ts        – Registers 10 MCP tools: reply, edit_message, react, download_attachment, save_memory, save_skill, create_job, list_jobs, update_job, delete_job
+src/feishu-card.ts  – Card builder: markdown optimization, Schema 2.0 card assembly
+src/job-store.ts    – Job CRUD: read/write JSON files, sanitizeJobId, expandScheduleAlias
+src/scheduler.ts    – JobScheduler: periodic scan (60s), trigger execution, crash recovery
+src/queue.ts        – Per-thread sequential message queue
 src/memory/
   interface.ts      – MemoryProvider interface (Episodes, Profiles, Skills)
   factory.ts        – Provider factory (file | openviking | mem0 stub)
@@ -37,6 +40,8 @@ src/memory/
 **Data flow:** Feishu event → `LarkChannel.handleMessageEvent` → whitelist check → ack reaction (MeMeMe) → text extraction → image auto-download → enqueue per-chat → record in buffer → enrich with memory (profile + episodes + skills) → forward via `notifications/claude/channel` → Claude calls `reply` tool → response sent back to Feishu → ack reaction revoked.
 
 **Reaction flow:** Feishu reaction event → `handleReactionEvent` → filter (bot self, bot messages only, whitelists) → forward to Claude via channel notification.
+
+**CronJob flow:** `JobScheduler.tick()` every 60s → read all job files → for each active job where `next_run_at <= now` → execute (message: direct Feishu API / prompt: inject via `notifications/claude/channel`) → update `runtime` in job file. On startup, `recoverMissedJobs()` runs the same check once for crash recovery.
 
 ## Key Design Decisions
 
