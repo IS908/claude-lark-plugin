@@ -36,6 +36,7 @@ export const appConfig = {
   textChunkLimit: optionalNumber('LARK_TEXT_CHUNK_LIMIT', 4000),
   ackEmoji: optional('LARK_ACK_EMOJI', 'MeMeMe'),
   botMessageTrackerSize: optionalNumber('LARK_BOT_MESSAGE_TRACKER_SIZE', 500),
+  cronScanInterval: optionalNumber('LARK_CRON_SCAN_INTERVAL', 60),
 
   // Memory
   memoryProvider: optional('MEMORY_PROVIDER', 'file') as 'file' | 'openviking' | 'mem0',
@@ -54,6 +55,7 @@ export const appConfig = {
   // Paths
   memoriesDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'memories'),
   inboxDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'inbox'),
+  jobsDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'jobs'),
 } as const;
 
 export type AppConfig = typeof appConfig;

@@ -24,4 +24,8 @@ echo "=== Card builder unit checks ==="
 npx tsx scripts/card-smoke.ts
 
 echo ""
+echo "=== Job store unit checks ==="
+npx tsx scripts/job-smoke.ts
+
+echo ""
 echo "All tests passed."
