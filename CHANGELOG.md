@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.4] - 2026-04-17
+
+### Fixed
+- **Image auto-download now works** (fixes #15): user-uploaded images are downloaded to `~/.claude/channels/lark/inbox/` as intended. Previously the plugin used `im.v1.image.get` which only works for images the bot itself uploaded — it silently failed for user-sent images. Switched to `im.v1.messageResource.get` with `type: 'image'` which is the correct API for downloading user-uploaded resources.
+- `download_attachment` tool: also switched all paths to `messageResource.get` (routing `type` by `img_` prefix: image → `'image'`, file/audio/video → `'file'` per Feishu API semantics). All resource types now download consistently through the same API.
+
 ## [0.8.3] - 2026-04-17
 
 ### Added
@@ -142,6 +148,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.8.4]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.4
 [0.8.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.3
 [0.8.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.2
 [0.8.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.1

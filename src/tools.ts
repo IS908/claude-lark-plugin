@@ -398,17 +398,14 @@ export function registerTools(
       const inboxDir = appConfig.inboxDir;
       await fs.mkdir(inboxDir, { recursive: true });
       try {
-        let data: any;
-        if (file_key.startsWith('img_')) {
-          data = await client.im.v1.image.get({
-            path: { image_key: file_key },
-          });
-        } else {
-          data = await client.im.v1.messageResource.get({
-            path: { message_id, file_key },
-            params: { type: 'file' },
-          });
-        }
+        // Always use messageResource.get for user-uploaded resources.
+        // image.get only works for images the bot itself uploaded.
+        // Route type by key prefix: img_* → image, otherwise → file.
+        const resourceType = file_key.startsWith('img_') ? 'image' : 'file';
+        const data: any = await client.im.v1.messageResource.get({
+          path: { message_id, file_key },
+          params: { type: resourceType },
+        });
         if (data) {
           const filePath = path.join(inboxDir, file_key);
           await fs.writeFile(filePath, data as any);

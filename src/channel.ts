@@ -471,12 +471,16 @@ export class LarkChannel {
   /**
    * Download an image by image_key and save to inboxDir.
    * Returns the absolute path to the saved file, or undefined on failure.
+   *
+   * Uses messageResource.get because image.get can only download images that
+   * the bot itself uploaded — not images users send to the bot.
    */
   private async downloadImage(imageKey: string, messageId: string): Promise<string | undefined> {
     try {
       mkdirSync(appConfig.inboxDir, { recursive: true });
-      const resp = await this.client.im.v1.image.get({
-        path: { image_key: imageKey },
+      const resp = await this.client.im.v1.messageResource.get({
+        path: { message_id: messageId, file_key: imageKey },
+        params: { type: 'image' },
       } as any);
       if (resp) {
         const filename = `${Date.now()}-${imageKey}.png`;
