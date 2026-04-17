@@ -8,6 +8,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { appConfig } from './config.js';
+import { cronJobPrompt } from './prompts.js';
 import {
   listAllJobs,
   writeJob,
@@ -238,13 +239,11 @@ export class JobScheduler {
    * prompt type: inject prompt into Claude's channel via MCP notification.
    */
   private async executePromptJob(job: JobFile): Promise<void> {
-    const promptContent = [
-      `[CronJob: ${job.meta.name}]`,
-      `Execute this task and reply to chat_id=${job.meta.target_chat_id} with the result.`,
-      `Do NOT reply to any other chat. Use a subagent when possible so the main thread stays responsive.`,
-      ``,
-      job.meta.prompt ?? '',
-    ].join('\n');
+    const promptContent = cronJobPrompt(
+      job.meta.name,
+      job.meta.target_chat_id,
+      job.meta.prompt ?? ''
+    );
 
     await this.server.notification({
       method: 'notifications/claude/channel',

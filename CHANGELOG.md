@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.3] - 2026-04-17
+
+### Added
+- Raw card JSON support: `reply` tool accepts a `card` param with Feishu Schema 2.0 JSON, sending pre-built cards directly without `buildCards` conversion
+- Centralized prompt templates: all hardcoded prompts extracted to `src/prompts.ts` (`flushPrompt`, `profileDistillationPrompt`, `cronJobPrompt`, `enrichmentPrompt`)
+- `scripts/reply-card-smoke.ts` — 8 smoke test assertions covering the raw card path (valid/invalid JSON, reply_to routing, buffer recording, ack revocation, fallback text)
+
+### Fixed
+- Raw card path now records assistant response in `ConversationBuffer` (previously skipped due to early return)
+- Raw card path now revokes ack reaction (previously skipped due to early return)
+- Removed unused `chat_id` destructuring in `save_skill` handler
+- Stale JSDoc comment ("Register all 6 MCP tools" → "Register all MCP tools")
+
+### Changed
+- Deduplicated buffer-record + ack-revoke logic into shared `recordAndRevokeAck()` helper in `reply` tool
+- `files` param description now notes it is ignored when `card` is provided
+
 ## [0.8.2] - 2026-04-17
 
 ### Fixed
@@ -125,6 +142,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.8.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.3
 [0.8.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.2
 [0.8.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.1
 [0.8.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.0
