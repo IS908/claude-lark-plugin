@@ -37,6 +37,7 @@ export const appConfig = {
   ackEmoji: optional('LARK_ACK_EMOJI', 'MeMeMe'),
   botMessageTrackerSize: optionalNumber('LARK_BOT_MESSAGE_TRACKER_SIZE', 500),
   cronScanInterval: optionalNumber('LARK_CRON_SCAN_INTERVAL', 60),
+  cronTimezone: optional('LARK_CRON_TIMEZONE', Intl.DateTimeFormat().resolvedOptions().timeZone),
 
   // Memory
   memoryProvider: optional('MEMORY_PROVIDER', 'file') as 'file' | 'openviking' | 'mem0',

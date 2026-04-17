@@ -103,4 +103,35 @@ if (e11.cron !== '*/5 * * * *') fail(`expand minutes: got ${e11.cron}`);
 const e12 = expandSchedule('every 3 hours');
 if (e12.cron !== '0 */3 * * *') fail(`expand hours: got ${e12.cron}`);
 
+// 22. computeNextRun — respects timezone (wall-clock hour matches target tz)
+// Set tz via env override then re-import to pick it up would require
+// dynamic imports; instead we verify the default path returns a string
+// that when re-parsed matches the pattern "0 9" for daily at 9 in system tz.
+const nextDaily = computeNextRun('0 9 * * *');
+const d9 = new Date(nextDaily);
+if (isNaN(d9.getTime())) fail(`computeNextRun tz test: invalid date ${nextDaily}`);
+// Sanity: the returned ISO time should be in the future
+if (d9.getTime() <= Date.now()) fail('computeNextRun tz: not in future');
+// Sanity: the hour in system-local should be 9
+const systemHour9 = d9.toLocaleString('en-US', {
+  hour: 'numeric',
+  hour12: false,
+  timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+});
+if (!systemHour9.startsWith('9') && !systemHour9.startsWith('09')) {
+  fail(`computeNextRun tz: expected local hour 9, got ${systemHour9}`);
+}
+
+// 23. computeNextRun — different cron expressions produce different times
+const nextA = computeNextRun('0 0 * * *');
+const nextB = computeNextRun('0 12 * * *');
+if (nextA === nextB) fail('computeNextRun: different crons produced same time');
+
+// 24. expandSchedule validates the *final* cron (even for alias paths)
+// Alias paths now validate too — this catches invalid LARK_CRON_TIMEZONE
+// at create_job time rather than at scheduler-tick time.
+// Verify alias result is consistent: daily at 09:00 → 0 9 * * *
+const aliasResult = expandSchedule('daily at 09:00');
+if (aliasResult.cron !== '0 9 * * *') fail(`alias validation: got ${aliasResult.cron}`);
+
 console.log('PASS');

@@ -211,6 +211,8 @@ node -e "console.log(require('./package.json').version)"
 
 > **白名单语义**：两个列表都设置时，发送者在 `LARK_ALLOWED_USER_IDS` 里**或**聊天在 `LARK_ALLOWED_CHAT_IDS` 里即允许（OR 关系）。只设置一个列表时，只用那个列表过滤。
 | `LARK_TEXT_CHUNK_LIMIT` | `4000` | 单条消息最大字符数 |
+| `LARK_CRON_SCAN_INTERVAL` | `60` | 定时任务扫描间隔（秒） |
+| `LARK_CRON_TIMEZONE` | 系统时区 | IANA 时区名（如 `Asia/Shanghai`、`UTC`），影响 cron 表达式中小时字段的墙钟映射 |
 | `LARK_ENABLED_SKILLS` | （空） | lark-cli 技能白名单，用于 start.sh |
 
 ### 可选 -- 记忆
