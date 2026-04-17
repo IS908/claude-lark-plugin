@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.2] - 2026-04-17
+
+### Fixed
+- CronJob timezone drift: `cron-parser` now uses an explicit timezone (`LARK_CRON_TIMEZONE`, defaults to system timezone) so cron hours always map to the user's wall-clock time. Previously the scheduler implicitly used the system tz, causing mismatched expectations when jobs were created with UTC-converted hours.
+- `create_job` and `update_job` responses now surface the timezone used (`tz=...`) for verification.
+- Early validation: `expandSchedule` now validates the final cron against the configured timezone for all paths (aliases + raw cron), catching invalid `LARK_CRON_TIMEZONE` values at `create_job` time instead of later at scheduler-tick time.
+
+### Added
+- `LARK_CRON_TIMEZONE` config option (IANA timezone name, e.g. `Asia/Shanghai`, `UTC`)
+- 3 new smoke test assertions covering `computeNextRun` timezone behavior and alias validation
+
+## [0.8.1] - 2026-04-17
+
+### Fixed
+- Cronjob execution failure retry: transient errors (DNS, timeout, 429, 5xx) now retry up to 3 times with delays 30s → 60s → 120s. Permanent errors (permission denied, param error) fail immediately without retry. Previously a brief network hiccup would cause a daily job to be skipped for 24 hours.
+
 ## [0.8.0] - 2026-04-17
 
 ### Added
@@ -109,6 +125,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.8.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.2
+[0.8.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.1
 [0.8.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.0
 [0.7.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.7.1
 [0.7.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.7.0

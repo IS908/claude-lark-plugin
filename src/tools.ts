@@ -554,7 +554,7 @@ export function registerTools(
         content: [
           {
             type: 'text' as const,
-            text: `Created job "${id}" (${scheduleHuman}). Next run: ${nextRunAt}`,
+            text: `Created job "${id}" (${scheduleHuman}, tz=${appConfig.cronTimezone}). Next run: ${nextRunAt}`,
           },
         ],
       };
@@ -595,7 +595,12 @@ export function registerTools(
       });
 
       return {
-        content: [{ type: 'text' as const, text: lines.join('\n\n') }],
+        content: [
+          {
+            type: 'text' as const,
+            text: `Timezone: ${appConfig.cronTimezone}\n\n${lines.join('\n\n')}`,
+          },
+        ],
       };
     }
   );
@@ -624,17 +629,12 @@ export function registerTools(
         };
       }
 
-      if (name !== undefined) job.meta.name = name;
-      if (prompt !== undefined) job.meta.prompt = prompt;
-      if (content !== undefined) job.meta.content = content;
-
-      // Update schedule if provided
+      // Validate schedule first (before mutating any fields) so a bad
+      // schedule returns an error with the job left untouched.
+      let expandedSchedule: { cron: string; human: string } | null = null;
       if (schedule !== undefined) {
         try {
-          const expanded = expandSchedule(schedule);
-          job.meta.schedule = expanded.cron;
-          job.meta.schedule_human = expanded.human;
-          job.runtime.next_run_at = computeNextRun(expanded.cron);
+          expandedSchedule = expandSchedule(schedule);
         } catch (err: any) {
           return {
             content: [
@@ -648,7 +648,15 @@ export function registerTools(
         }
       }
 
-      // Update status
+      // All inputs validated — apply updates
+      if (name !== undefined) job.meta.name = name;
+      if (prompt !== undefined) job.meta.prompt = prompt;
+      if (content !== undefined) job.meta.content = content;
+      if (expandedSchedule) {
+        job.meta.schedule = expandedSchedule.cron;
+        job.meta.schedule_human = expandedSchedule.human;
+        job.runtime.next_run_at = computeNextRun(expandedSchedule.cron);
+      }
       if (status !== undefined) {
         job.meta.status = status;
         if (status === 'active' && !schedule) {
@@ -663,7 +671,7 @@ export function registerTools(
         content: [
           {
             type: 'text' as const,
-            text: `Updated job "${id}". Status: ${job.meta.status}, Next run: ${job.runtime.next_run_at}`,
+            text: `Updated job "${id}". Status: ${job.meta.status}, Next run: ${job.runtime.next_run_at} (tz=${appConfig.cronTimezone})`,
           },
         ],
       };

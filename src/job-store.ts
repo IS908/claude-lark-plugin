@@ -65,55 +65,76 @@ const DAY_MAP: Record<string, string> = {
  */
 export function expandSchedule(input: string): { cron: string; human: string } {
   const trimmed = input.trim().toLowerCase();
+  let result: { cron: string; human: string } | null = null;
 
   // every Nm
   let match = trimmed.match(/^every\s+(\d+)\s*m(?:in(?:ute)?s?)?$/);
   if (match) {
     const n = match[1];
-    return { cron: `*/${n} * * * *`, human: `every ${n}m` };
+    result = { cron: `*/${n} * * * *`, human: `every ${n}m` };
   }
 
   // every Nh
-  match = trimmed.match(/^every\s+(\d+)\s*h(?:ours?)?$/);
-  if (match) {
-    const n = match[1];
-    return { cron: `0 */${n} * * *`, human: `every ${n}h` };
-  }
-
-  // daily at HH:MM
-  match = trimmed.match(/^daily\s+at\s+(\d{1,2}):(\d{2})$/);
-  if (match) {
-    const [, h, m] = match;
-    return { cron: `${parseInt(m)} ${parseInt(h)} * * *`, human: `daily at ${h}:${m}` };
-  }
-
-  // weekdays at HH:MM
-  match = trimmed.match(/^weekdays\s+at\s+(\d{1,2}):(\d{2})$/);
-  if (match) {
-    const [, h, m] = match;
-    return { cron: `${parseInt(m)} ${parseInt(h)} * * 1-5`, human: `weekdays at ${h}:${m}` };
-  }
-
-  // weekly on {day} at HH:MM
-  match = trimmed.match(/^weekly\s+on\s+(\w+)\s+at\s+(\d{1,2}):(\d{2})$/);
-  if (match) {
-    const [, day, h, m] = match;
-    const dayNum = DAY_MAP[day];
-    if (dayNum !== undefined) {
-      return { cron: `${parseInt(m)} ${parseInt(h)} * * ${dayNum}`, human: `weekly on ${day} at ${h}:${m}` };
+  if (!result) {
+    match = trimmed.match(/^every\s+(\d+)\s*h(?:ours?)?$/);
+    if (match) {
+      const n = match[1];
+      result = { cron: `0 */${n} * * *`, human: `every ${n}h` };
     }
   }
 
-  // Already a cron expression — validate it
-  CronExpressionParser.parse(trimmed); // throws if invalid
-  return { cron: trimmed, human: trimmed };
+  // daily at HH:MM
+  if (!result) {
+    match = trimmed.match(/^daily\s+at\s+(\d{1,2}):(\d{2})$/);
+    if (match) {
+      const [, h, m] = match;
+      result = { cron: `${parseInt(m)} ${parseInt(h)} * * *`, human: `daily at ${h}:${m}` };
+    }
+  }
+
+  // weekdays at HH:MM
+  if (!result) {
+    match = trimmed.match(/^weekdays\s+at\s+(\d{1,2}):(\d{2})$/);
+    if (match) {
+      const [, h, m] = match;
+      result = { cron: `${parseInt(m)} ${parseInt(h)} * * 1-5`, human: `weekdays at ${h}:${m}` };
+    }
+  }
+
+  // weekly on {day} at HH:MM
+  if (!result) {
+    match = trimmed.match(/^weekly\s+on\s+(\w+)\s+at\s+(\d{1,2}):(\d{2})$/);
+    if (match) {
+      const [, day, h, m] = match;
+      const dayNum = DAY_MAP[day];
+      if (dayNum !== undefined) {
+        result = { cron: `${parseInt(m)} ${parseInt(h)} * * ${dayNum}`, human: `weekly on ${day} at ${h}:${m}` };
+      }
+    }
+  }
+
+  // Fallback: treat input as a raw cron expression
+  if (!result) {
+    result = { cron: trimmed, human: trimmed };
+  }
+
+  // Parse the final cron against the configured timezone to validate syntax.
+  // Bad cron syntax throws immediately; invalid LARK_CRON_TIMEZONE values
+  // only fail later when computeNextRun() calls .next() on the expression,
+  // but create_job always calls computeNextRun after expandSchedule, so both
+  // classes of error surface at create_job time (not at scheduler-tick time).
+  CronExpressionParser.parse(result.cron, { tz: appConfig.cronTimezone });
+
+  return result;
 }
 
 /**
  * Compute the next run time from a cron expression.
+ * Uses the configured timezone (LARK_CRON_TIMEZONE) so cron hours
+ * always match the user's local wall-clock time.
  */
 export function computeNextRun(cronExpr: string): string {
-  const expr = CronExpressionParser.parse(cronExpr);
+  const expr = CronExpressionParser.parse(cronExpr, { tz: appConfig.cronTimezone });
   return expr.next().toISOString()!;
 }
 
