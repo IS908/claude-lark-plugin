@@ -3,6 +3,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
+import { enrichmentPrompt } from './prompts.js';
 import { MessageQueue } from './queue.js';
 import type { MemoryProvider } from './memory/interface.js';
 import type { ConversationBuffer } from './memory/buffer.js';
@@ -458,12 +459,13 @@ export class LarkChannel {
     // Assemble
     if (parts.length === 0) return msg.text;
 
-    const memoryContext = parts.join('\n\n');
-    const parentContext = msg.parentContent
-      ? `\n[Quoted Message]\n${msg.parentContent}\n`
-      : '';
-
-    return `[Memory Context]\n${memoryContext}\n${parentContext}\n[Current Message]\nFrom: ${msg.senderId} in ${msg.chatId}\n${msg.text}`;
+    return enrichmentPrompt(
+      parts.join('\n\n'),
+      msg.parentContent,
+      msg.senderId,
+      msg.chatId,
+      msg.text
+    );
   }
 
   /**

@@ -21,7 +21,7 @@ import {
 } from './job-store.js';
 
 /**
- * Register all 6 MCP tools on the server.
+ * Register all MCP tools on the server.
  */
 export function registerTools(
   server: McpServer,
@@ -37,10 +37,16 @@ export function registerTools(
     'reply',
     {
       description:
-        'Send a reply to a Feishu chat. Plain text by default; long or markdown-rich content auto-renders as a Feishu card. Supports optional images (≤10 MB) or files (≤30 MB).',
+        'Send a reply to a Feishu chat. Plain text by default; long or markdown-rich content auto-renders as a Feishu card. Pass "card" param with raw Schema 2.0 JSON to send a pre-built card directly.',
       inputSchema: z.object({
         chat_id: z.string().describe('The chat ID to reply in'),
-        text: z.string().describe('The text content to send'),
+        text: z.string().describe('The text content to send (ignored when card is provided)'),
+        card: z
+          .string()
+          .optional()
+          .describe(
+            'Raw Feishu Schema 2.0 card JSON string. When provided, sends the card directly without buildCards conversion. Use this for pre-built cards from scripts/skills.'
+          ),
         reply_to: z.string().optional().describe('Message ID to reply to (quoted reply)'),
         thread_id: z
           .string()
@@ -68,10 +74,10 @@ export function registerTools(
             })
           )
           .optional()
-          .describe('Optional attachments'),
+          .describe('Optional attachments (ignored when card is provided)'),
       }),
     },
-    async ({ chat_id, text, reply_to, thread_id, format, footer, files }) => {
+    async ({ chat_id, text, card, reply_to, thread_id, format, footer, files }) => {
       // Auto-correct reply_to from the plugin's per-thread tracker when Claude
       // omits it but passes thread_id. Explicit reply_to from Claude always wins.
       let effectiveReplyTo = reply_to;
@@ -83,6 +89,81 @@ export function registerTools(
             `[tools] Auto-filled reply_to=${latest.messageId} for thread ${thread_id}`
           );
         }
+      }
+
+      // Helper: record in buffer + revoke ack (shared by card & normal paths)
+      function recordAndRevokeAck(replyText: string) {
+        conversationBuffer?.record(chat_id, {
+          role: 'assistant',
+          senderId: 'bot',
+          text: replyText.slice(0, 500),
+          timestamp: new Date().toISOString(),
+        });
+
+        if (ackReactions && ackReactions.size > 0) {
+          const msgId = effectiveReplyTo || '';
+          const reactionId = msgId ? ackReactions.get(msgId) : undefined;
+          if (reactionId) {
+            ackReactions.delete(msgId);
+            client.im.v1.messageReaction.delete({
+              path: { message_id: msgId, reaction_id: reactionId },
+            }).catch(() => {});
+          } else {
+            for (const [mid, rid] of ackReactions.entries()) {
+              ackReactions.delete(mid);
+              client.im.v1.messageReaction.delete({
+                path: { message_id: mid, reaction_id: rid },
+              }).catch(() => {});
+            }
+          }
+        }
+      }
+
+      // Raw card JSON path — bypass buildCards entirely
+      if (card) {
+        let cardObj: object;
+        try {
+          cardObj = JSON.parse(card);
+        } catch {
+          return {
+            content: [{ type: 'text' as const, text: 'Invalid card JSON' }],
+            isError: true,
+          };
+        }
+        const content = JSON.stringify(cardObj);
+        try {
+          let resp: any;
+          if (effectiveReplyTo) {
+            resp = await client.im.v1.message.reply({
+              path: { message_id: effectiveReplyTo },
+              data: { content, msg_type: 'interactive' },
+            });
+          } else {
+            resp = await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chat_id,
+                content,
+                msg_type: 'interactive',
+              },
+            });
+          }
+          const sentId = resp?.data?.message_id;
+          if (sentId && botMessageTracker) botMessageTracker.add(sentId);
+        } catch (err: any) {
+          const apiError = err?.response?.data ?? err?.data;
+          if (apiError?.code && apiError?.msg) {
+            console.error(`[tools] Feishu API error [${apiError.code}]: ${apiError.msg}`);
+            throw new Error(`Feishu API [${apiError.code}]: ${apiError.msg}`);
+          }
+          throw err;
+        }
+
+        recordAndRevokeAck((text || '[card]'));
+
+        return {
+          content: [{ type: 'text' as const, text: 'Sent 1 card message' }],
+        };
       }
 
       // Dispatch: card path vs plain-text path
@@ -231,34 +312,7 @@ export function registerTools(
         }
       }
 
-      // Record assistant response in buffer for distillation
-      conversationBuffer?.record(chat_id, {
-        role: 'assistant',
-        senderId: 'bot',
-        text: text.slice(0, 500), // truncate for buffer efficiency
-        timestamp: new Date().toISOString(),
-      });
-
-      // Revoke ack reaction — try effective reply_to first, then scan all pending acks
-      if (ackReactions && ackReactions.size > 0) {
-        const msgId = effectiveReplyTo || '';
-        const reactionId = msgId ? ackReactions.get(msgId) : undefined;
-        if (reactionId) {
-          // Exact match on reply_to
-          ackReactions.delete(msgId);
-          client.im.v1.messageReaction.delete({
-            path: { message_id: msgId, reaction_id: reactionId },
-          }).catch(() => {});
-        } else {
-          // Fallback: revoke all pending acks (handles case where Claude didn't pass reply_to)
-          for (const [mid, rid] of ackReactions.entries()) {
-            ackReactions.delete(mid);
-            client.im.v1.messageReaction.delete({
-              path: { message_id: mid, reaction_id: rid },
-            }).catch(() => {});
-          }
-        }
-      }
+      recordAndRevokeAck(text);
 
       return {
         content: [{ type: 'text' as const, text: `Sent ${sentCount} message(s)` }],
@@ -443,7 +497,7 @@ export function registerTools(
         chat_id: z.string().optional().describe('Chat ID where this skill was created (for context)'),
       }),
     },
-    async ({ name, description, content, chat_id }) => {
+    async ({ name, description, content }) => {
       await memoryProvider.saveSkill(name, description, content);
       return {
         content: [{ type: 'text' as const, text: `Saved skill "${name}": ${description}` }],

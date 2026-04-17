@@ -28,4 +28,8 @@ echo "=== Job store unit checks ==="
 npx tsx scripts/job-smoke.ts
 
 echo ""
+echo "=== Reply raw-card unit checks ==="
+npx tsx scripts/reply-card-smoke.ts
+
+echo ""
 echo "All tests passed."
