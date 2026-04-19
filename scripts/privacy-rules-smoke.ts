@@ -5,7 +5,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyL1, loadL2Rules, addL2Rule } from '../src/privacy-rules.js';
+import { applyL1, loadL2Rules, addL2Rule, extractL2PrivatePhrases } from '../src/privacy-rules.js';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -77,4 +77,56 @@ l2Passed++;
 
 rmSync(tmp, { recursive: true, force: true });
 
-console.log(`privacy-rules smoke: L1 ${l1Passed}/${l1Cases.length}, L2 ${l2Passed}/5 — PASS`);
+// ── extractL2PrivatePhrases ──
+
+let extractPassed = 0;
+
+// E.1 — empty / null input
+if (extractL2PrivatePhrases('').length !== 0) fail('extract.1 empty');
+extractPassed++;
+
+// E.2 — only Always-private section
+const p2 = extractL2PrivatePhrases(`## Always private
+- 项目代号 Phoenix
+- 客户 ACME Corp
+`);
+if (p2.length !== 2) fail(`extract.2 count: got ${p2.length}`);
+if (p2[0] !== '项目代号 Phoenix') fail(`extract.2 item 0: ${p2[0]}`);
+extractPassed++;
+
+// E.3 — ignores Always-public section
+const p3 = extractL2PrivatePhrases(`## Always private
+- secret 1
+
+## Always public
+- public 1
+`);
+if (p3.length !== 1 || p3[0] !== 'secret 1') fail(`extract.3: ${JSON.stringify(p3)}`);
+extractPassed++;
+
+// E.4 — handles mixed-order sections
+const p4 = extractL2PrivatePhrases(`## Always public
+- visible
+
+## Always private
+- hidden
+`);
+if (p4.length !== 1 || p4[0] !== 'hidden') fail(`extract.4: ${JSON.stringify(p4)}`);
+extractPassed++;
+
+// E.5 — tolerates blank lines and comments between bullets
+const p5 = extractL2PrivatePhrases(`## Always private
+- first
+
+- second
+some non-bullet prose that should be ignored
+- third
+`);
+if (p5.length !== 3) fail(`extract.5 count: got ${p5.length}`);
+extractPassed++;
+
+// E.6 — no Always-private section returns []
+if (extractL2PrivatePhrases('## Always public\n- x\n').length !== 0) fail('extract.6');
+extractPassed++;
+
+console.log(`privacy-rules smoke: L1 ${l1Passed}/${l1Cases.length}, L2 ${l2Passed}/5, extract ${extractPassed}/6 — PASS`);

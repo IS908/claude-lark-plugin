@@ -120,6 +120,52 @@ if (existsSync(join(partialRoot, 'profiles', 'ou_partial.md'))) {
 }
 passed++;
 
+// ── 8b. legacy migration respects L2 privacy-rules.md ──────
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-l2-migrate-'));
+  // Point L2 path to a file inside this tmp root; write rules BEFORE reading profile.
+  const l2Path = join(r, 'privacy-rules.md');
+  writeFileSync(
+    l2Path,
+    '## Always private\n- Phoenix\n- ACME Corp\n',
+    'utf-8',
+  );
+  process.env.LARK_PRIVACY_RULES_FILE = l2Path;
+
+  // Legacy single-file profile that L1 alone wouldn't flag
+  mkdirSync(join(r, 'profiles'), { recursive: true });
+  writeFileSync(
+    join(r, 'profiles', 'ou_org.md'),
+    [
+      '- 参与了项目 Phoenix 的评估', // L2 "Phoenix" → private
+      '- 客户 ACME Corp 的年度回顾',  // L2 "ACME Corp" → private
+      '- 熟悉 TypeScript 和 Rust',     // L1 whitelist → public
+      '- 偏好会议安排在下午',            // gray → public
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const s = new MemoryStore(r);
+  const own = await s.getProfile('ou_org', 'ou_org');
+  const byOther = await s.getProfile('ou_org', 'ou_other');
+
+  // Owner sees everything merged
+  if (!own?.includes('Phoenix')) fail('8b: owner should see Phoenix');
+  if (!own?.includes('ACME Corp')) fail('8b: owner should see ACME Corp');
+  if (!own?.includes('TypeScript')) fail('8b: owner should see TS');
+
+  // Non-owner view: Phoenix + ACME must be hidden (they went to private via L2),
+  // TypeScript + 偏好会议 should remain in public
+  if (byOther?.includes('Phoenix')) fail('8b: L2 private phrase leaked to public (Phoenix)');
+  if (byOther?.includes('ACME Corp')) fail('8b: L2 private phrase leaked to public (ACME)');
+  if (!byOther?.includes('TypeScript')) fail('8b: TS should be in public');
+  if (!byOther?.includes('偏好会议')) fail('8b: gray content should stay in public');
+
+  delete process.env.LARK_PRIVACY_RULES_FILE;
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
 // ── 9a. saveProfile on unmigrated legacy runs migration first ──
 {
   const r = mkdtempSync(join(tmpdir(), 'profile-save-first-'));
@@ -217,4 +263,4 @@ rmSync(legacyRoot, { recursive: true, force: true });
 rmSync(partialRoot, { recursive: true, force: true });
 rmSync(writeRoot, { recursive: true, force: true });
 
-console.log(`profile-tier smoke: ${passed}/17 PASS`);
+console.log(`profile-tier smoke: ${passed}/18 PASS`);

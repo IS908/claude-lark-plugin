@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { appConfig } from '../config.js';
-import { applyL1 } from '../privacy-rules.js';
+import { applyL1, loadL2Rules, extractL2PrivatePhrases } from '../privacy-rules.js';
 
 export type Tier = 'public' | 'private';
 
@@ -97,17 +97,33 @@ export class MemoryStore {
     const publicLines: string[] = [];
     const privateLines: string[] = [];
 
+    // Pre-load L2 user rules so operators who configure privacy-rules.md
+    // BEFORE upgrading can influence their own legacy-profile migration
+    // (org codenames, people mentions, etc. that L1 doesn't cover).
+    // Substring match is case-insensitive, deterministic, no LLM needed.
+    const l2Phrases = extractL2PrivatePhrases(await loadL2Rules()).map((p) => p.toLowerCase());
+
     for (const line of content.split('\n')) {
       if (!line.trim()) {
         // Preserve blank lines in public for readability; skip in private.
         publicLines.push(line);
         continue;
       }
+
       if (applyL1(line) === 'private') {
         privateLines.push(line);
-      } else {
-        publicLines.push(line);
+        continue;
       }
+
+      if (l2Phrases.length > 0) {
+        const lower = line.toLowerCase();
+        if (l2Phrases.some((p) => lower.includes(p))) {
+          privateLines.push(line);
+          continue;
+        }
+      }
+
+      publicLines.push(line);
     }
 
     await fs.mkdir(dir, { recursive: true });
