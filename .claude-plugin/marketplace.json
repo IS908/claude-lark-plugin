@@ -1,6 +1,6 @@
 {
   "name": "claude-lark-plugin",
-  "description": "Chat with Claude Code in real time through Feishu (Lark) with pluggable memory backends",
+  "description": "Chat with Claude Code in real time through Feishu (Lark) with local-file memory and scheduled jobs",
   "owner": {
     "name": "IS908",
     "email": "kevinchen0635@gmail.com"
@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "lark",
-      "version": "0.8.4",
+      "version": "0.8.5",
       "source": "./",
       "description": "Feishu/Lark channel plugin for Claude Code — receive messages via WebSocket, reply with text/images/files, manage cross-session memory",
       "category": "productivity",

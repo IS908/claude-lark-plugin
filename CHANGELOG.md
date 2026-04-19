@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.5] - 2026-04-19
+
+### Removed
+- `MemoryProvider` abstraction and the `openviking` / `mem0` backends. The file-based memory store is now the only (and always-was-the-default) backend.
+- Config keys no longer read: `MEMORY_PROVIDER`, `OPENVIKING_URL`, `OPENVIKING_API_KEY`, `MEM0_URL`, `MEM0_API_KEY`.
+- Deleted: `src/memory/interface.ts`, `src/memory/factory.ts`, `src/memory/openviking.ts`, `src/memory/mem0.ts`, `test/test-openviking.ts`.
+
+### Changed
+- `FileMemoryProvider` renamed to `MemoryStore`; `Episode` / `EpisodeMeta` / `Skill` types are now defined inline in `src/memory/file.ts`.
+- `/lark:configure setup` simplified from 5 steps to 3 (credentials, filtering, memory tuning) — the provider selection and backend-config steps are gone.
+- Docs, README, and README_CN updated to describe the single local backend.
+
+### Migration
+- Users on `MEMORY_PROVIDER=file` (the default): zero action required.
+- Users previously on `MEMORY_PROVIDER=openviking`: local memory files (profiles/episodes/skills) are preserved — the OpenViking hot-path already used local files as primary storage. Only the Viking-side vector index is abandoned; semantic episode search falls back to the file provider's keyword + recency scoring.
+- `MEMORY_PROVIDER=mem0` was a stub that always threw — no one was running it.
+
+### Rationale
+Precondition for the privacy redesign (#35). A pluggable abstraction made every downstream interface change a three-file synchronization exercise, and the OpenViking vector index raised a policy question ("do we index private-tier content?") with no good default for a one-operator plugin. Removing the abstraction now is cheaper than maintaining it through the next three releases.
+
 ## [0.8.4] - 2026-04-17
 
 ### Fixed
@@ -148,6 +168,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.8.5]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.5
 [0.8.4]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.4
 [0.8.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.3
 [0.8.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.2
