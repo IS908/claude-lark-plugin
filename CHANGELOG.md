@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.11.0] - 2026-04-19
+
+Phase 3 of the privacy redesign. Adds user-facing control over what the bot remembers, a self-learning loop that promotes user corrections into persistent rules, and terminal-side safeguards against incidental exposure.
+
+### Added
+- **`what_do_you_know` tool** — lists the caller's profile entries with per-line 8-char hashes. Path-B tool (filtered by rendering visibility): in private chat, both public + private tiers are shown; in a group, only the public tier (the reply is visible to the whole group). Each line's hash is the handle that `forget_memory` uses to remove it.
+- **`forget_memory` tool** — removes a specific line from the caller's profile by hash. Always caller-scoped; idempotent. Optional `promote_to_rule: true` appends the removed line to `privacy-rules.md` under `## Always private` so future distillations classify similar content as private — this is the **self-learning loop**: user corrections become persistent L2 rules without requiring manual file editing.
+- **Append-only audit log** (`src/audit-log.ts`) at `~/.claude/channels/lark/audit.log`. Every sensitive-tool invocation (save_memory / create_job / list_jobs / update_job / delete_job / what_do_you_know / forget_memory) writes a line recording the timestamp, tool name, outcome (ok/denied/error), caller, and a redacted args preview. Long string fields are truncated to 60 chars + length marker. Best-effort — log failures never propagate.
+- **`/lark:jobs` terminal skill** (`skills/jobs/SKILL.md`) — reworked to default to a **redacted** output view that hides `prompt`, `content`, and free-form `meta` fields. The user must explicitly ask "verbose" / "show full" / "dump prompt" to see them. Destructive operations (delete / pause / reschedule / prompt-change) prompt for interactive confirmation.
+- `LARK_AUDIT_LOG` config key — optional override for the audit log path.
+- `MemoryStore.listProfileLines(ownerId, tier)` / `removeProfileLine(ownerId, tier, hash)` — line-level profile helpers that power `what_do_you_know` and `forget_memory`. New exported `ProfileLine` type.
+- `scripts/transparency-smoke.ts` — 9 smoke assertions covering list/remove/idempotency, cross-tier isolation, L2 rule-append round-trip, audit log redaction, and audit-log guard against unserializable args (BigInt, circular refs).
+
+### Changed
+- **`resolveCaller` now audit-logs denials automatically.** Takes `toolName` and `args` as new parameters; all 7 sensitive tool handlers updated to pass them. Callers only need to emit an `ok` audit on successful completion — denial paths are handled in the helper.
+- Sensitive tools emit `void audit(toolName, caller, args, 'ok')` at each success return path, completing the audit coverage.
+
+### Security
+- **Users gain inspection + correction rights over their own profile.** Previously, profiles were silently distilled without any user-facing way to review or remove entries. `what_do_you_know` + `forget_memory` close this gap, and the `promote_to_rule` option turns each correction into a durable policy.
+- **Terminal-side exposure reduced.** The `/lark:jobs` skill no longer dumps prompt bodies by default — a significant mitigation against screen-share and shoulder-surfing leaks. Destructive operations require confirmation.
+- **Retrospective auditability.** The operator can inspect `audit.log` to see exactly which tools were invoked on their machine, when, by whom, and whether the call succeeded or was denied. Useful for post-incident review (borrowed laptop, accidental invocation, etc.).
+
+### Migration
+- **No operator action required.** The existing `/lark:jobs` skill continues to work; invocations now return the redacted view by default. The audit log file is created on first use.
+- The `buildProfileDistillationPrompt` + `parseTieredProfile` infrastructure added in v0.10.0 is still not triggered by any production code path in this release — explicit distillation loops are left for future work.
+
 ## [0.10.0] - 2026-04-19
 
 Phase 2 of the privacy redesign (#35). Closes the profile-memory cross-chat leak — facts distilled from a user's private chat no longer surface when someone else @mentions that user in a group.
@@ -228,6 +254,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.11.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.0
 [0.10.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.10.0
 [0.9.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.9.0
 [0.8.5]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.5
