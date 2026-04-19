@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "lark",
-      "version": "0.9.0",
+      "version": "0.10.0",
       "source": "./",
       "description": "Feishu/Lark channel plugin for Claude Code — receive messages via WebSocket, reply with text/images/files, manage cross-session memory",
       "category": "productivity",

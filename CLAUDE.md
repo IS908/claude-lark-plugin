@@ -28,9 +28,10 @@ src/job-store.ts    – Job CRUD: read/write JSON files, sanitizeJobId, expandSc
 src/scheduler.ts    – JobScheduler: periodic scan (60s), trigger execution, crash recovery
 src/queue.ts        – Per-thread sequential message queue
 src/memory/
-  file.ts           – MemoryStore: local markdown files under ~/.claude/channels/lark/memories/ (Episodes, Profiles, Skills)
+  file.ts           – MemoryStore: local markdown files under ~/.claude/channels/lark/memories/ (Episodes, tiered Profiles public.md/private.md, Skills)
   buffer.ts         – In-memory ring buffer with auto-flush on inactivity
-  distiller.ts      – Builds flush prompts to distill buffer into episodic memory
+  distiller.ts      – Builds flush prompts to distill buffer into episodic memory; parseTieredProfile with L1 safety net
+src/privacy-rules.ts  – L1 hardcoded regex + keyword rules; L2 user-rules file (privacy-rules.md) read/append
 ```
 
 **Data flow:** Feishu event → `LarkChannel.handleMessageEvent` → whitelist check → ack reaction (MeMeMe) → text extraction → image auto-download → enqueue per-chat → record in buffer → enrich with memory (profile + episodes + skills) → forward via `notifications/claude/channel` → Claude calls `reply` tool → response sent back to Feishu → ack reaction revoked.
@@ -48,6 +49,8 @@ src/memory/
 - **Single-instance lock**: PID-based lock file in `/tmp/` prevents duplicate WebSocket connections.
 - **Config location**: All user config lives at `~/.claude/channels/lark/.env`, not in the repo.
 - **Memory is local-only**: All memory (profiles, episodes, skills) lives as markdown files under `~/.claude/channels/lark/memories/`. No remote backends — this keeps the trust boundary at OS file permissions and avoids vector-index policy questions for sensitive content.
+- **Tiered profile memory (v0.10.0+)**: each user's profile lives at `profiles/{userId}/public.md` + `private.md`. `getProfile(ownerId, caller)` returns both tiers joined when caller === ownerId, and only public otherwise. Legacy single-file profiles lazy-migrate on first read (L1 classifier splits lines).
+- **3-layer privacy classification**: L1 hardcoded regex/keyword rules (in code) > L2 user-edited `privacy-rules.md` (injected into distiller prompt) > L3 LLM judgment. `parseTieredProfile` applies L1 as a safety net over LLM output.
 - **Identity is server-derived**: `IdentitySession` maps `(chat_id, thread_id?) → open_id` from authenticated Feishu events. MCP tools never accept a client-declared `open_id` or `created_by` — those are resolved server-side. Trust anchor = Feishu webhook signature.
 - **CronJob visibility**: `list_jobs` filters by rendering-visibility — private chat shows caller's own jobs; group shows jobs whose `send_chat_id` matches the current chat (with prompt bodies redacted for non-owners). `update_job` / `delete_job` are owner-only.
 - **Image auto-download**: Images are downloaded to `~/.claude/channels/lark/inbox/` on receive. Claude reads local paths via `image_path` in notification meta.

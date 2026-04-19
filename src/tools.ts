@@ -467,7 +467,7 @@ export function registerTools(
     'save_memory',
     {
       description:
-        'Save a memory entry for cross-session recall. Only save durable, reusable facts — user preferences, communication style, key decisions, ongoing projects, resolved problems. Do NOT save pleasantries, failed attempts, ephemeral details, or conversation filler. Profile writes always save facts about the CALLER of this tool (i.e. the Feishu user whose message triggered the current turn) — you cannot save profile facts about a different user.',
+        'Save a memory entry for cross-session recall. Only save durable, reusable facts — user preferences, communication style, key decisions, ongoing projects, resolved problems. Do NOT save pleasantries, failed attempts, ephemeral details, or conversation filler. Profile writes always save facts about the CALLER of this tool (i.e. the Feishu user whose message triggered the current turn) — you cannot save profile facts about a different user. For profile writes, pass tier="public" only for facts that are safe for anyone mentioning this user to see (job title, tech stack, team); everything else defaults to "private" (owner-only).',
       inputSchema: z.object({
         type: z
           .enum(['profile', 'chat', 'thread'])
@@ -483,18 +483,25 @@ export function registerTools(
           .describe(
             'Thread ID from the current notification\'s metadata. Required whenever present — both for server-side caller resolution (omitting it silently attributes the call to the wrong user in cronjob turns) and when type="thread".'
           ),
+        tier: z
+          .enum(['public', 'private'])
+          .optional()
+          .describe(
+            'Profile tier (type="profile" only). "public": safe for others to see when they @mention this user (job title, tech stack, team). "private": owner-only (preferences, ongoing work, emotional state, etc.). Defaults to "private" when omitted — err on the side of less exposure.'
+          ),
       }),
     },
-    async ({ type, content, reason, chat_id, thread_id }) => {
+    async ({ type, content, reason, chat_id, thread_id, tier }) => {
       const auth = resolveCaller(chat_id, thread_id);
       if ('error' in auth) return auth.error;
       const { caller } = auth;
 
       if (type === 'profile') {
-        await memoryStore.saveProfile(caller, content);
+        const effectiveTier = tier ?? 'private';
+        await memoryStore.saveProfile(caller, content, effectiveTier);
         return {
           content: [
-            { type: 'text' as const, text: `Saved profile for ${caller}. Reason: ${reason}` },
+            { type: 'text' as const, text: `Saved ${effectiveTier} profile for ${caller}. Reason: ${reason}` },
           ],
         };
       }
