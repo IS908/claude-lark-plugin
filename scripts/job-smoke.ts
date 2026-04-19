@@ -196,6 +196,40 @@ const transitionalJob = {
 } as unknown as JobFile;
 const b2b = backfillJob(transitionalJob);
 if (b2b.meta.target_chat_id !== 'oc_v09_chat') fail(`backfill send_chat_id→target: got "${b2b.meta.target_chat_id}"`);
+// And the legacy field should be DELETED from the in-memory object so it
+// doesn't persist on next writeJob (cleaning up ghost fields).
+if ('send_chat_id' in (b2b.meta as Record<string, unknown>)) {
+  fail('27: send_chat_id ghost field should be deleted after backfill');
+}
+
+// 27b. backfill: cleanup happens even when both fields coexisted (common
+// case for jobs created by v0.9-v0.11.0 which wrote BOTH fields)
+const dualJob = {
+  meta: {
+    id: 'dual',
+    name: 'Dual',
+    type: 'prompt' as const,
+    schedule: '0 9 * * *',
+    schedule_human: 'daily at 09:00',
+    target_chat_id: 'oc_dual',  // present
+    send_chat_id: 'oc_dual',    // ghost to be cleaned
+    origin_chat_id: 'oc_dual',
+    status: 'active' as const,
+    created_by: 'ou_x',
+    created_at: '2026-01-01T00:00:00Z',
+  },
+  runtime: {
+    last_run_at: null,
+    next_run_at: '2026-12-31T01:00:00Z',
+    run_count: 0,
+    last_error: null,
+  },
+} as unknown as JobFile;
+const b2c = backfillJob(dualJob);
+if (b2c.meta.target_chat_id !== 'oc_dual') fail('27b: target preserved');
+if ('send_chat_id' in (b2c.meta as Record<string, unknown>)) {
+  fail('27b: send_chat_id ghost should be deleted even when target already present');
+}
 
 // 28. backfill: empty created_by attributes to LARK_OWNER_OPEN_ID when set
 // Simulate by setting the env and re-importing config; instead verify conditional:

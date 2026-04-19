@@ -169,10 +169,15 @@ function jobPath(id: string): string {
 export function backfillJob(job: JobFile): JobFile {
   // Resurrect target_chat_id from the dropped v0.9-v0.11.0 send_chat_id field
   // if a job file was written by one of those releases and target_chat_id is
-  // somehow missing. Realistic only for operators who ran those versions.
+  // somehow missing. Then drop the legacy field so it doesn't get persisted
+  // back on the next write — prevents permanent ghost-field pollution of
+  // operators' job JSON files.
   const legacy = job.meta as unknown as { send_chat_id?: string };
   if (!job.meta.target_chat_id && legacy.send_chat_id) {
     job.meta.target_chat_id = legacy.send_chat_id;
+  }
+  if (legacy.send_chat_id !== undefined) {
+    delete legacy.send_chat_id;
   }
 
   if (!job.meta.origin_chat_id) job.meta.origin_chat_id = job.meta.target_chat_id;
