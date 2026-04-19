@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.11.2] - 2026-04-20
+
+Packaging-only patch. Closes #44.
+
+### Fixed
+- **Explicit `"files"` whitelist in `package.json`** — ensures the plugin cache (`~/.claude/plugins/cache/claude-lark-plugin/lark/<version>/`) receives `skills/` and `.claude-plugin/` when Claude Code syncs from the marketplace clone. Previously these directories could go missing from the cache, breaking `/lark:configure` and `/lark:jobs` slash commands for users installing via the marketplace.
+- **`.claude/` added to `.gitignore`** — prevents local dev settings (`settings.local.json`) from leaking into `npm pack` output.
+
+### No behavior change
+- No source changes. `npm pack --dry-run` now emits exactly the plugin runtime files (37 files including `skills/`, `.claude-plugin/`, `.mcp.json`, `.env.example`, and all documentation). No more local-dev pollution.
+
 ## [0.11.1] - 2026-04-20
 
 Two cleanups landed together:
@@ -273,6 +284,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.11.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.2
 [0.11.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.1
 [0.11.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.0
 [0.10.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.10.0
