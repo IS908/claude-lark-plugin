@@ -50,7 +50,10 @@ The plugin connects to Feishu via the Lark SDK WebSocket client, receives messag
 
 ### Privacy & Security (v0.9.0+)
 
-- **Server-derived caller identity**: sensitive tools (`save_memory`, `create_job`, `list_jobs`, `update_job`, `delete_job`) resolve the calling user from the authenticated Feishu event stream, not from tool arguments — socially-engineered prompts cannot act on behalf of another user
+- **Server-derived caller identity**: sensitive tools (`save_memory`, `create_job`, `list_jobs`, `update_job`, `delete_job`, `what_do_you_know`, `forget_memory`) resolve the calling user from the authenticated Feishu event stream, not from tool arguments — socially-engineered prompts cannot act on behalf of another user
+- **Memory transparency (v0.11.0+)**: `what_do_you_know` lists what the bot has stored about the caller (filtered by current-chat visibility); `forget_memory` removes a specific line by hash. Optional `promote_to_rule` feeds corrections into `privacy-rules.md` — a self-learning loop that makes future misclassifications less likely
+- **Append-only audit log (v0.11.0+)**: `~/.claude/channels/lark/audit.log` records every sensitive-tool invocation (timestamp / tool / caller / outcome / redacted args) so the operator can retrospectively inspect what was accessed on their machine
+- **Terminal skills default to redacted output (v0.11.0+)**: `/lark:jobs` hides prompt bodies by default; verbose opt-in is required. Destructive operations require interactive confirmation
 - **Tiered profile memory (v0.10.0+)**: each user's profile is split into `public.md` (visible to anyone who @mentions the user) and `private.md` (owner-only). Private-chat preferences no longer leak into groups via @mention injection
 - **L1/L2/L3 classification** (v0.10.0+): hardcoded regex + keyword rules catch phones / credentials / sensitive Chinese keywords. Email is intentionally NOT in L1 — the plugin targets **work-chat use cases** where emails are commonly shared via signatures/directories; personal deployments can add their own "Always private" email rule to `privacy-rules.md`. User-editable `privacy-rules.md` covers personal/org-specific cases; LLM handles the nuance. `parseTieredProfile` applies an L1 safety net over LLM output so misclassified credentials get forced to private
 - **`list_jobs` visibility filter**: in a group chat, members only see jobs whose `send_chat_id` matches that group (with prompt bodies redacted for non-owners); in a private chat, the caller sees their own jobs. Group members can no longer inspect each other's private jobs
@@ -256,6 +259,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 | `LARK_OWNER_OPEN_ID` | (empty) | Operator open_id. Enables terminal skill invocations (e.g. `/lark:jobs`) to resolve the caller via the reserved `__terminal__` chat id. When unset, terminal-side sensitive operations are denied. |
 | `LARK_IDENTITY_SESSION_TTL_MS` | `max(2h, LARK_INACTIVITY_HOURS × 2h)` | Lifetime of a server-side `(chat_id, thread_id?) → open_id` session entry. Must exceed the auto-flush window so distillation-triggered tool calls still resolve to the last real user. |
 | `LARK_PRIVACY_RULES_FILE` | `~/.claude/channels/lark/privacy-rules.md` | Override the path to the L2 user rules file. The distiller injects this file's contents into its classification prompt. |
+| `LARK_AUDIT_LOG` | `~/.claude/channels/lark/audit.log` | Override the path to the append-only audit log. Every sensitive-tool invocation is recorded (best-effort; log failures never propagate). (v0.11.0+) |
 
 ---
 
@@ -344,6 +348,8 @@ The plugin registers the following MCP tools for Claude to use:
 | `list_jobs` | List cronjobs visible in the current chat. Filter follows rendering-visibility: private → caller's own jobs, group → jobs with `send_chat_id == currentChat` (prompts redacted for non-owners). Requires `chat_id`. |
 | `update_job` | Update a cronjob (schedule, content, pause/resume). Owner-only. Requires `chat_id`. |
 | `delete_job` | Delete a cronjob. Owner-only. Requires `chat_id`. |
+| `what_do_you_know` | List what the bot has stored in the caller's profile. Filtered by rendering visibility (both tiers in p2p, public only in groups). Each line carries an 8-char hash for use with `forget_memory`. (v0.11.0+) |
+| `forget_memory` | Remove a specific line from the caller's profile by hash. Caller-scoped and idempotent. Optional `promote_to_rule` promotes the removal into a durable `## Always private` rule in `privacy-rules.md`. (v0.11.0+) |
 
 ---
 

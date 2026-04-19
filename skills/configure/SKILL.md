@@ -132,6 +132,7 @@ If user says "use defaults" or "skip", leave these at defaults.
 | `LARK_OWNER_OPEN_ID` | Identity | No | (empty) |
 | `LARK_IDENTITY_SESSION_TTL_MS` | Identity | No | auto |
 | `LARK_PRIVACY_RULES_FILE` | Privacy | No | `~/.claude/channels/lark/privacy-rules.md` |
+| `LARK_AUDIT_LOG` | Privacy | No | `~/.claude/channels/lark/audit.log` |
 
 ## Notes
 

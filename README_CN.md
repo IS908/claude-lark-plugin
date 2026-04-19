@@ -45,7 +45,10 @@
 
 ### 隐私与安全（v0.9.0+）
 
-- **服务端派生的调用者身份**：敏感工具（`save_memory` / `create_job` / `list_jobs` / `update_job` / `delete_job`）从飞书事件流派生调用者身份，不信任工具参数——社工提示无法假冒他人操作
+- **服务端派生的调用者身份**：敏感工具（`save_memory` / `create_job` / `list_jobs` / `update_job` / `delete_job` / `what_do_you_know` / `forget_memory`）从飞书事件流派生调用者身份，不信任工具参数——社工提示无法假冒他人操作
+- **记忆透明度（v0.11.0+）**：`what_do_you_know` 列出 bot 记住了调用者的哪些信息（按当前 chat 可见性过滤）；`forget_memory` 按 hash 删除特定条目，可选 `promote_to_rule` 把删除动作沉淀为 `privacy-rules.md` 中的规则——**自学习闭环**让误判随使用递减
+- **追加式审计日志（v0.11.0+）**：`~/.claude/channels/lark/audit.log` 记录每次敏感工具调用（时间戳 / 工具名 / 调用者 / 结果 / 脱敏后的参数摘要），运营者可事后回溯查看本机上发生了什么
+- **终端技能默认脱敏（v0.11.0+）**：`/lark:jobs` 默认不展示 prompt 正文，需显式要求 verbose；破坏性操作需交互确认
 - **分层 profile 记忆（v0.10.0+）**：每个用户的 profile 拆成 `public.md`（他人 @mention 时可见）和 `private.md`（仅 owner 可见）。私聊里的偏好不会通过 @mention 注入泄露到群聊
 - **L1/L2/L3 分类体系**（v0.10.0+）：硬编码的 regex + 关键词规则拦截手机/凭据/敏感中文词。邮箱**不在** L1——本插件定位为**工作 IM 场景**，工作邮箱常通过签名和通讯录公开；个人使用的部署可以在自己的 `privacy-rules.md` 里加一条 "Always private" 规则专门归类邮箱。用户可编辑的 `privacy-rules.md` 处理个人和组织特有场景；LLM 处理灰色地带。`parseTieredProfile` 在 LLM 分类之上加 L1 兜底——误判为 public 的凭据被强制归 private
 - **`list_jobs` 可见性过滤**：群聊里只能看到 `send_chat_id` 匹配本群的 job（非 owner 看不到 prompt 正文）；私聊里只能看到自己建的 job。群成员不再能互相窥探定时任务
@@ -241,6 +244,7 @@ node -e "console.log(require('./package.json').version)"
 | `LARK_OWNER_OPEN_ID` | （空） | 运营者 open_id。用于终端技能（如 `/lark:jobs`）通过 `__terminal__` 哨兵 chat_id 解析调用者。未设置时，终端侧的敏感操作将被拒绝 |
 | `LARK_IDENTITY_SESSION_TTL_MS` | `max(2h, LARK_INACTIVITY_HOURS × 2h)` | 服务端 `(chat_id, thread_id?) → open_id` 会话条目的 TTL。必须超过自动蒸馏窗口，以保证 flush 触发的工具调用仍能解析到最后的真实用户 |
 | `LARK_PRIVACY_RULES_FILE` | `~/.claude/channels/lark/privacy-rules.md` | L2 用户规则文件路径。蒸馏器会把文件内容注入分类 prompt（v0.10.0+）|
+| `LARK_AUDIT_LOG` | `~/.claude/channels/lark/audit.log` | 审计日志路径。每次敏感工具调用都会追加一行（尽力而为，写入失败不影响工具行为）（v0.11.0+）|
 
 ---
 
@@ -338,6 +342,8 @@ tmux kill-session -t lark
 | `list_jobs` | `(status?, chat_id, thread_id?)` | 列出当前 chat 可见的 job。私聊返回 caller 自己建的；群里返回 `send_chat_id` 为本群的（非 owner 视图脱敏 prompt）|
 | `update_job` | `(id, status?, schedule?, prompt?, content?, name?, chat_id, thread_id?)` | 修改 job。仅 owner 可操作 |
 | `delete_job` | `(id, chat_id, thread_id?)` | 删除 job。仅 owner 可操作 |
+| `what_do_you_know` | `(chat_id, thread_id?)` | 列出 bot 存储的当前调用者 profile 条目。按可见性过滤（私聊展示 public+private，群里只展示 public）。每行附带 8 位 hash，供 `forget_memory` 使用（v0.11.0+）|
+| `forget_memory` | `(chat_id, thread_id?, hash, tier?, promote_to_rule?)` | 按 hash 删除 profile 里的某行。调用者本人才能操作。可选 `promote_to_rule=true` 把本次删除沉淀为 `privacy-rules.md` 的永久规则（v0.11.0+）|
 
 ---
 

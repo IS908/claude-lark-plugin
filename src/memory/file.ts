@@ -1,10 +1,22 @@
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { appConfig } from '../config.js';
 import { applyL1 } from '../privacy-rules.js';
 
 export type Tier = 'public' | 'private';
+
+/** Short, stable-per-text identifier for a profile line (used by forget_memory). */
+export interface ProfileLine {
+  index: number;
+  hash: string;
+  text: string;
+}
+
+function lineHash(text: string): string {
+  return createHash('sha1').update(text).digest('hex').slice(0, 8);
+}
 
 export interface Episode {
   id: string;
@@ -151,6 +163,42 @@ export class MemoryStore {
     const dir = this.profileDir(userId);
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(this.profileTierPath(userId, tier), content, 'utf-8');
+  }
+
+  /**
+   * Return the lines of a profile tier as addressable items. Each line carries
+   * a short sha1-based hash that is stable per content — callers (e.g. the
+   * forget_memory tool) use the hash to identify a line without the file
+   * needing a durable row id.
+   *
+   * Blank lines are skipped. Leading/trailing whitespace is trimmed.
+   */
+  async listProfileLines(ownerId: string, tier: Tier): Promise<ProfileLine[]> {
+    await this.migrateIfNeeded(ownerId);
+    const p = this.profileTierPath(ownerId, tier);
+    if (!existsSync(p)) return [];
+    const content = await fs.readFile(p, 'utf-8');
+    return content
+      .split('\n')
+      .map((raw) => raw.trim())
+      .filter(Boolean)
+      .map((text, index) => ({ index, hash: lineHash(text), text }));
+  }
+
+  /**
+   * Remove a single line (identified by its hash from {@link listProfileLines})
+   * from the given tier file. Returns true if a line was removed, false if
+   * nothing matched. Idempotent — removing the same hash twice returns false
+   * on the second call.
+   */
+  async removeProfileLine(ownerId: string, tier: Tier, hash: string): Promise<boolean> {
+    const lines = await this.listProfileLines(ownerId, tier);
+    const kept = lines.filter((l) => l.hash !== hash);
+    if (kept.length === lines.length) return false;
+
+    const next = kept.map((l) => l.text).join('\n') + (kept.length > 0 ? '\n' : '');
+    await fs.writeFile(this.profileTierPath(ownerId, tier), next, 'utf-8');
+    return true;
   }
 
   // ── Episodes ──
