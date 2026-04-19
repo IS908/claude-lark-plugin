@@ -44,4 +44,8 @@ echo "=== Profile tiering unit checks ==="
 npx tsx scripts/profile-tier-smoke.ts
 
 echo ""
+echo "=== Transparency unit checks ==="
+npx tsx scripts/transparency-smoke.ts
+
+echo ""
 echo "All tests passed."

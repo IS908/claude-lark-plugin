@@ -22,7 +22,8 @@ npm start -- --dry-run # Validate config and module loading without connecting
 src/index.ts        – Entry point: wires MCP server, LarkChannel, memory, and buffer together
 src/config.ts       – Loads config from ~/.claude/channels/lark/.env (dotenv)
 src/channel.ts      – LarkChannel: Feishu WebSocket client, message parsing, memory enrichment pipeline
-src/tools.ts        – Registers 10 MCP tools: reply, edit_message, react, download_attachment, save_memory, save_skill, create_job, list_jobs, update_job, delete_job
+src/tools.ts        – Registers 12 MCP tools: reply, edit_message, react, download_attachment, save_memory, save_skill, create_job, list_jobs, update_job, delete_job, what_do_you_know, forget_memory
+src/audit-log.ts    – Append-only audit log for sensitive tool invocations
 src/feishu-card.ts  – Card builder: markdown optimization, Schema 2.0 card assembly
 src/job-store.ts    – Job CRUD: read/write JSON files, sanitizeJobId, expandScheduleAlias
 src/scheduler.ts    – JobScheduler: periodic scan (60s), trigger execution, crash recovery
@@ -40,7 +41,7 @@ src/privacy-rules.ts  – L1 hardcoded regex + keyword rules; L2 user-rules file
 
 **CronJob flow:** `JobScheduler.tick()` every 60s → read all job files → for each active job where `next_run_at <= now` → execute (message: direct Feishu API / prompt: inject via `notifications/claude/channel` under a unique `thread_id` + bind session identity to `job.created_by`) → update `runtime` in job file. On startup, `recoverMissedJobs()` runs the same check once for crash recovery.
 
-**Identity flow (v0.9.0+):** Every inbound message calls `identitySession.setCaller(chatId, threadId, senderId)` before enqueue. Sensitive MCP tools (`save_memory`, `create_job`, `list_jobs`, `update_job`, `delete_job`) derive the caller from the session via `resolveCaller(chat_id, thread_id)` — they never trust Claude-declared identity parameters. Terminal skills use the reserved `chat_id = "__terminal__"` which resolves to `LARK_OWNER_OPEN_ID`.
+**Identity flow (v0.9.0+):** Every inbound message calls `identitySession.setCaller(chatId, threadId, senderId)` before enqueue. Sensitive MCP tools (`save_memory`, `create_job`, `list_jobs`, `update_job`, `delete_job`, `what_do_you_know`, `forget_memory`) derive the caller from the session via `resolveCaller(chat_id, thread_id)` — they never trust Claude-declared identity parameters. Terminal skills use the reserved `chat_id = "__terminal__"` which resolves to `LARK_OWNER_OPEN_ID`.
 
 ## Key Design Decisions
 
@@ -53,6 +54,8 @@ src/privacy-rules.ts  – L1 hardcoded regex + keyword rules; L2 user-rules file
 - **3-layer privacy classification**: L1 hardcoded regex/keyword rules (in code) > L2 user-edited `privacy-rules.md` (injected into distiller prompt) > L3 LLM judgment. `parseTieredProfile` applies L1 as a safety net over LLM output.
 - **Identity is server-derived**: `IdentitySession` maps `(chat_id, thread_id?) → open_id` from authenticated Feishu events. MCP tools never accept a client-declared `open_id` or `created_by` — those are resolved server-side. Trust anchor = Feishu webhook signature.
 - **CronJob visibility**: `list_jobs` filters by rendering-visibility — private chat shows caller's own jobs; group shows jobs whose `send_chat_id` matches the current chat (with prompt bodies redacted for non-owners). `update_job` / `delete_job` are owner-only.
+- **Memory transparency (v0.11.0+)**: `what_do_you_know` returns the caller's profile entries (filtered by current-chat visibility); `forget_memory` removes a line by 8-char hash. `forget_memory(promote_to_rule=true)` appends the removed line to `privacy-rules.md` so future distillations classify similar content as private — the self-learning loop that completes the L1/L2/L3 infrastructure from v0.10.0.
+- **Audit log (v0.11.0+)**: every sensitive-tool invocation appends a line to `~/.claude/channels/lark/audit.log` (ok/denied/error with redacted args). Best-effort — log failures never propagate into tool behavior.
 - **Image auto-download**: Images are downloaded to `~/.claude/channels/lark/inbox/` on receive. Claude reads local paths via `image_path` in notification meta.
 - **Ack reaction**: Configurable emoji (`LARK_ACK_EMOJI`, default `MeMeMe`) sent on receive, auto-revoked after reply. Fire-and-forget, won't block message processing.
 - **Bot message tracking**: `BotMessageTracker` (default 500, FIFO, configurable via `LARK_BOT_MESSAGE_TRACKER_SIZE`) tracks bot-sent message IDs. Used to filter reaction events — only reactions on bot messages are forwarded to Claude.
