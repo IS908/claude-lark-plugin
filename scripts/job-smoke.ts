@@ -147,8 +147,7 @@ function makeLegacyJob(overrides: Partial<JobFile['meta']> = {}): JobFile {
       schedule: '0 9 * * *',
       schedule_human: 'daily at 09:00',
       target_chat_id: 'oc_legacy_chat',
-      send_chat_id: '', // intentionally missing — simulate pre-v0.9 job
-      origin_chat_id: '', // same
+      origin_chat_id: '', // intentionally empty — simulate pre-v0.9 job
       status: 'active',
       created_by: '',
       created_at: '2026-01-01T00:00:00Z',
@@ -163,16 +162,40 @@ function makeLegacyJob(overrides: Partial<JobFile['meta']> = {}): JobFile {
   };
 }
 
-// 25. backfill: send_chat_id defaults to target_chat_id
+// 25. backfill: origin_chat_id defaults to target_chat_id when empty
 const b1 = backfillJob(makeLegacyJob());
-if (b1.meta.send_chat_id !== 'oc_legacy_chat') fail(`backfill send_chat_id: got "${b1.meta.send_chat_id}"`);
-
-// 26. backfill: origin_chat_id defaults to target_chat_id
 if (b1.meta.origin_chat_id !== 'oc_legacy_chat') fail(`backfill origin_chat_id: got "${b1.meta.origin_chat_id}"`);
 
-// 27. backfill: does not overwrite existing send_chat_id
-const b2 = backfillJob(makeLegacyJob({ send_chat_id: 'oc_already_set' }));
-if (b2.meta.send_chat_id !== 'oc_already_set') fail(`backfill should not overwrite: got "${b2.meta.send_chat_id}"`);
+// 26. backfill: does not overwrite existing origin_chat_id
+const b2 = backfillJob(makeLegacyJob({ origin_chat_id: 'oc_already_set' }));
+if (b2.meta.origin_chat_id !== 'oc_already_set') fail(`backfill should not overwrite origin: got "${b2.meta.origin_chat_id}"`);
+
+// 27. backfill: resurrects target_chat_id from short-lived v0.9 send_chat_id field
+// Simulate a job file written by v0.9-v0.11.0 that has send_chat_id but no target_chat_id
+// (extremely unlikely in practice but the backfill path should handle it).
+const transitionalJob = {
+  meta: {
+    id: 'transitional',
+    name: 'Transitional',
+    type: 'prompt' as const,
+    schedule: '0 9 * * *',
+    schedule_human: 'daily at 09:00',
+    target_chat_id: '',  // missing
+    send_chat_id: 'oc_v09_chat', // short-lived legacy field
+    origin_chat_id: 'oc_v09_chat',
+    status: 'active' as const,
+    created_by: 'ou_x',
+    created_at: '2026-01-01T00:00:00Z',
+  },
+  runtime: {
+    last_run_at: null,
+    next_run_at: '2026-12-31T01:00:00Z',
+    run_count: 0,
+    last_error: null,
+  },
+} as unknown as JobFile;
+const b2b = backfillJob(transitionalJob);
+if (b2b.meta.target_chat_id !== 'oc_v09_chat') fail(`backfill send_chat_id→target: got "${b2b.meta.target_chat_id}"`);
 
 // 28. backfill: empty created_by attributes to LARK_OWNER_OPEN_ID when set
 // Simulate by setting the env and re-importing config; instead verify conditional:

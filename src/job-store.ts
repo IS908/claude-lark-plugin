@@ -21,10 +21,8 @@ export interface JobMeta {
   prompt?: string;
   content?: string;
   msg_type?: string;
-  /** Legacy field, equivalent to send_chat_id. Backfilled for forward compatibility. */
+  /** Chat that receives the job output. Used by scheduler delivery + list_jobs visibility filter. */
   target_chat_id: string;
-  /** Where the job delivers output. Used by list_jobs visibility filter. */
-  send_chat_id: string;
   /** Where the job was created (debug/audit). For legacy jobs, backfilled from target_chat_id. */
   origin_chat_id: string;
   status: 'active' | 'paused';
@@ -158,10 +156,27 @@ function jobPath(id: string): string {
 /**
  * Backfill new fields on pre-v0.9 jobs so the rest of the code can rely on them.
  * Exported for unit testing; production callers should use readJob / listAllJobs.
+ *
+ * Handles in-field transitions from earlier releases:
+ *   - Pre-v0.9 jobs lack origin_chat_id. Backfill from target_chat_id.
+ *   - Pre-v0.9 jobs often have empty created_by. Attribute to LARK_OWNER_OPEN_ID
+ *     so the operator retains update/delete rights after upgrade.
+ *
+ * v0.9.0 also introduced a short-lived `send_chat_id` field (identical to
+ * target_chat_id). v0.11.1 drops it — any job file still carrying the key
+ * is handled by a cast-aware read below, then forgotten on next write.
  */
 export function backfillJob(job: JobFile): JobFile {
-  if (!job.meta.send_chat_id) job.meta.send_chat_id = job.meta.target_chat_id;
+  // Resurrect target_chat_id from the dropped v0.9-v0.11.0 send_chat_id field
+  // if a job file was written by one of those releases and target_chat_id is
+  // somehow missing. Realistic only for operators who ran those versions.
+  const legacy = job.meta as unknown as { send_chat_id?: string };
+  if (!job.meta.target_chat_id && legacy.send_chat_id) {
+    job.meta.target_chat_id = legacy.send_chat_id;
+  }
+
   if (!job.meta.origin_chat_id) job.meta.origin_chat_id = job.meta.target_chat_id;
+
   // Legacy jobs may have empty created_by (the old create_job defaulted to '').
   // Without a valid owner, update_job / delete_job would permanently reject
   // every caller. Attribute to the operator via LARK_OWNER_OPEN_ID so the

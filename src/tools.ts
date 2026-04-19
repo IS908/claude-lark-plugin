@@ -578,7 +578,7 @@ export function registerTools(
           .describe('Fixed message content (type=message)'),
         target_chat_id: z
           .string()
-          .describe('Chat ID that receives job output (stored as send_chat_id for visibility filtering)'),
+          .describe('Chat ID that receives job output. Used by scheduler delivery and list_jobs visibility filter.'),
         chat_id: z
           .string()
           .describe('Chat ID where this create_job call was triggered — used to resolve caller identity and to populate origin_chat_id'),
@@ -651,7 +651,6 @@ export function registerTools(
           schedule_human: scheduleHuman,
           ...(type === 'prompt' ? { prompt } : { content, msg_type: 'text' }),
           target_chat_id,
-          send_chat_id: target_chat_id,
           origin_chat_id: chat_id,
           status: 'active',
           created_by: caller,
@@ -713,7 +712,7 @@ export function registerTools(
       const isPrivate = channel.isPrivateChat(chat_id);
       const visible = byStatus.filter((j) => {
         if (isPrivate) return j.meta.created_by === caller;
-        return j.meta.send_chat_id === chat_id;
+        return j.meta.target_chat_id === chat_id;
       });
 
       if (visible.length === 0) {

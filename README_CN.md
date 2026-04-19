@@ -52,7 +52,7 @@
 - **分层 profile 记忆（v0.10.0+）**：每个用户的 profile 拆成 `public.md`（他人 @mention 时可见）和 `private.md`（仅 owner 可见）。私聊里的偏好不会通过 @mention 注入泄露到群聊
 - **L1/L2/L3 分类体系**（v0.10.0+）：硬编码的 regex + 关键词规则拦截手机/凭据/敏感中文词。邮箱**不在** L1——本插件定位为**工作 IM 场景**，工作邮箱常通过签名和通讯录公开；个人使用的部署可以在自己的 `privacy-rules.md` 里加一条 "Always private" 规则专门归类邮箱。用户可编辑的 `privacy-rules.md` 处理个人和组织特有场景；LLM 处理灰色地带。`parseTieredProfile` 在 LLM 分类之上加 L1 兜底——误判为 public 的凭据被强制归 private
 - **老版本 profile 迁移尊重 L2 规则（v0.11.1+）**：操作者在升级前（或同步）编辑 `privacy-rules.md`，`## Always private` 段的短语会以 case-insensitive 子串方式在迁移时生效——组织内项目代号、客户名、人名提及等 L1 无法覆盖的内容会被直接分到 `private.md`
-- **`list_jobs` 可见性过滤**：群聊里只能看到 `send_chat_id` 匹配本群的 job（非 owner 看不到 prompt 正文）；私聊里只能看到自己建的 job。群成员不再能互相窥探定时任务
+- **`list_jobs` 可见性过滤**：群聊里只能看到 `target_chat_id` 匹配本群的 job（非 owner 看不到 prompt 正文）；私聊里只能看到自己建的 job。群成员不再能互相窥探定时任务
 - **仅 owner 可改**：`update_job` / `delete_job` 要求 `caller == created_by`
 - **CronJob 身份隔离**：每次 cronjob 触发使用独立 `thread_id`，不会和同一 chat 的真人消息串线
 - **终端回退**：`/lark:jobs` 等终端技能通过保留的 `__terminal__` chat id 回退到 `LARK_OWNER_OPEN_ID`
@@ -340,7 +340,7 @@ tmux kill-session -t lark
 | `save_memory` | `(type, content, reason, chat_id, thread_id?, tier?)` | 保存用户画像、会话情景或话题情景。画像写入总是针对调用者本人（v0.9.0 起）；v0.10.0 起可选 `tier` 参数（`public` / `private`，默认 `private`）决定归属哪一档 |
 | `save_skill` | `(name, description, content, chat_id?)` | 保存可复用的操作流程为全局技能 |
 | `create_job` | `(name, type, schedule, prompt?, content?, target_chat_id, chat_id, thread_id?)` | 创建定时任务。创建者由 session 派生，不再接受 `created_by`；`chat_id` 用于派生调用者身份并填充 `origin_chat_id` |
-| `list_jobs` | `(status?, chat_id, thread_id?)` | 列出当前 chat 可见的 job。私聊返回 caller 自己建的；群里返回 `send_chat_id` 为本群的（非 owner 视图脱敏 prompt）|
+| `list_jobs` | `(status?, chat_id, thread_id?)` | 列出当前 chat 可见的 job。私聊返回 caller 自己建的；群里返回 `target_chat_id` 为本群的（非 owner 视图脱敏 prompt）|
 | `update_job` | `(id, status?, schedule?, prompt?, content?, name?, chat_id, thread_id?)` | 修改 job。仅 owner 可操作 |
 | `delete_job` | `(id, chat_id, thread_id?)` | 删除 job。仅 owner 可操作 |
 | `what_do_you_know` | `(chat_id, thread_id?)` | 列出 bot 存储的当前调用者 profile 条目。按可见性过滤（私聊展示 public+private，群里只展示 public）。每行附带 8 位 hash，供 `forget_memory` 使用（v0.11.0+）|
