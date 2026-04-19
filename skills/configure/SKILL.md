@@ -129,6 +129,8 @@ If user says "use defaults" or "skip", leave these at defaults.
 | `LARK_ALLOWED_CHAT_IDS` | Filtering | No | (empty) |
 | `LARK_TEXT_CHUNK_LIMIT` | Filtering | No | `4000` |
 | `LARK_ENABLED_SKILLS` | Filtering | No | (empty) |
+| `LARK_OWNER_OPEN_ID` | Identity | No | (empty) |
+| `LARK_IDENTITY_SESSION_TTL_MS` | Identity | No | auto |
 
 ## Notes
 

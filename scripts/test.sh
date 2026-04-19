@@ -32,4 +32,8 @@ echo "=== Reply raw-card unit checks ==="
 npx tsx scripts/reply-card-smoke.ts
 
 echo ""
+echo "=== Identity session unit checks ==="
+npx tsx scripts/identity-smoke.ts
+
+echo ""
 echo "All tests passed."

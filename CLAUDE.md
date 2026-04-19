@@ -37,7 +37,9 @@ src/memory/
 
 **Reaction flow:** Feishu reaction event → `handleReactionEvent` → filter (bot self, bot messages only, whitelists) → forward to Claude via channel notification.
 
-**CronJob flow:** `JobScheduler.tick()` every 60s → read all job files → for each active job where `next_run_at <= now` → execute (message: direct Feishu API / prompt: inject via `notifications/claude/channel`) → update `runtime` in job file. On startup, `recoverMissedJobs()` runs the same check once for crash recovery.
+**CronJob flow:** `JobScheduler.tick()` every 60s → read all job files → for each active job where `next_run_at <= now` → execute (message: direct Feishu API / prompt: inject via `notifications/claude/channel` under a unique `thread_id` + bind session identity to `job.created_by`) → update `runtime` in job file. On startup, `recoverMissedJobs()` runs the same check once for crash recovery.
+
+**Identity flow (v0.9.0+):** Every inbound message calls `identitySession.setCaller(chatId, threadId, senderId)` before enqueue. Sensitive MCP tools (`save_memory`, `create_job`, `list_jobs`, `update_job`, `delete_job`) derive the caller from the session via `resolveCaller(chat_id, thread_id)` — they never trust Claude-declared identity parameters. Terminal skills use the reserved `chat_id = "__terminal__"` which resolves to `LARK_OWNER_OPEN_ID`.
 
 ## Key Design Decisions
 
@@ -46,6 +48,8 @@ src/memory/
 - **Single-instance lock**: PID-based lock file in `/tmp/` prevents duplicate WebSocket connections.
 - **Config location**: All user config lives at `~/.claude/channels/lark/.env`, not in the repo.
 - **Memory is local-only**: All memory (profiles, episodes, skills) lives as markdown files under `~/.claude/channels/lark/memories/`. No remote backends — this keeps the trust boundary at OS file permissions and avoids vector-index policy questions for sensitive content.
+- **Identity is server-derived**: `IdentitySession` maps `(chat_id, thread_id?) → open_id` from authenticated Feishu events. MCP tools never accept a client-declared `open_id` or `created_by` — those are resolved server-side. Trust anchor = Feishu webhook signature.
+- **CronJob visibility**: `list_jobs` filters by rendering-visibility — private chat shows caller's own jobs; group shows jobs whose `send_chat_id` matches the current chat (with prompt bodies redacted for non-owners). `update_job` / `delete_job` are owner-only.
 - **Image auto-download**: Images are downloaded to `~/.claude/channels/lark/inbox/` on receive. Claude reads local paths via `image_path` in notification meta.
 - **Ack reaction**: Configurable emoji (`LARK_ACK_EMOJI`, default `MeMeMe`) sent on receive, auto-revoked after reply. Fire-and-forget, won't block message processing.
 - **Bot message tracking**: `BotMessageTracker` (default 500, FIFO, configurable via `LARK_BOT_MESSAGE_TRACKER_SIZE`) tracks bot-sent message IDs. Used to filter reaction events — only reactions on bot messages are forwarded to Claude.
@@ -53,6 +57,8 @@ src/memory/
 ## Configuration
 
 Required env vars: `LARK_APP_ID`, `LARK_APP_SECRET` (in `~/.claude/channels/lark/.env`).
+
+Optional but recommended: `LARK_OWNER_OPEN_ID` — enables terminal-side skills (e.g. `/lark:jobs`) to act as the operator. Without it, terminal tool calls are denied.
 
 The `/lark:configure` skill (in `skills/configure/SKILL.md`) provides interactive setup within Claude Code.
 
