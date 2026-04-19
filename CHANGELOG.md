@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.10.0] - 2026-04-19
+
+Phase 2 of the privacy redesign (#35). Closes the profile-memory cross-chat leak — facts distilled from a user's private chat no longer surface when someone else @mentions that user in a group.
+
+### Added
+- **Tiered profile storage** (`src/memory/file.ts`) — profiles are split into `profiles/{userId}/public.md` + `private.md`. When a caller is the profile's owner they see both tiers joined; any other caller sees only the public tier. This is the core fix for the leak path still open after v0.9.0.
+- **L1 hardcoded privacy rules** (`src/privacy-rules.ts`) — regex + keyword classifier for universal sensitive patterns (phone numbers, ID numbers, credit cards, tokens, monetary amounts, Chinese sensitive keywords like 薪资 / 跳槽 / 焦虑 / 医院) plus a whitelist for safe-for-public attributes (job titles, team names, common tech stack). **Scope note**: email addresses are intentionally NOT in L1. This plugin positions itself for **work-chat use cases** (Feishu is a corporate IM where work emails are routinely shared via signatures and directories); email falls through to L2/L3 classification with a source-based default (group → public, p2p → private). Personal deployments that want stricter handling can add an "Always private" rule for emails in their own `privacy-rules.md`.
+- **L2 user rules file** — `~/.claude/channels/lark/privacy-rules.md`. Natural-language markdown the distiller injects into its classification prompt. New `loadL2Rules()` reads it; `addL2Rule(rule, section)` appends a rule under `## Always private` or `## Always public`. Intended for the Phase 3 `forget_memory` self-learning loop — not yet wired to any production caller.
+- **L3 LLM classification** — `buildProfileDistillationPrompt({userId, currentProfile, episodeSummaries, chatType, l2Rules})` produces a prompt that instructs Claude to emit a `{ "public": [...], "private": [...] }` JSON object. Source-chat-type is included as a classification hint (group → public default; p2p → private default).
+- **`parseTieredProfile(raw)`** (`src/memory/distiller.ts`) — parses the distiller's JSON output, tolerates markdown code fences, falls back conservatively (entire blob → private) on parse failure, and **applies the L1 safety net**: anything the LLM classified as public but matching an L1 regex (phone, credential, token, etc.) is forced back to private.
+- **`save_memory`'s new `tier` parameter** — `type="profile"` saves accept an optional `tier` of `"public"` or `"private"`. Defaults to `"private"` when omitted — err on the side of less exposure.
+- `scripts/privacy-rules-smoke.ts` — 15 smoke assertions covering L1 classification (10) and L2 file I/O with env override (5).
+- `scripts/profile-tier-smoke.ts` — 17 smoke assertions covering tiered read/write, owner vs non-owner visibility (including private-only user never leaking to non-owner), lazy migration, migration idempotency, partial-failure recovery, save-before-read migration safety, and `parseTieredProfile` edge cases (valid JSON, fence stripping, L1 safety net, parse-failure fallback, malformed object, coercion).
+- `LARK_PRIVACY_RULES_FILE` config knob — overrides the default path for the L2 rules file.
+
+### Changed
+- **`MemoryStore.getProfile(userId)` → `MemoryStore.getProfile(ownerId, caller)`.** Callers now pass both the profile owner and the caller making the read; only when they match does the private tier load. Updated at two call sites in `src/channel.ts` (own profile, mentioned-user profiles).
+- **`MemoryStore.saveProfile(userId, content)` → `MemoryStore.saveProfile(userId, content, tier)`.** Required new `tier` parameter (no default at the storage layer; `save_memory` tool defaults at its API layer).
+- `profileDistillationPrompt` signature changed from positional args to an options object `{userId, currentProfile, episodeSummaries, chatType, l2Rules}`. The prompt itself emits JSON now; previously emitted free-form markdown.
+
+### Security
+- **Profile-memory cross-chat leak closed.** A user's private-chat preferences, ongoing work, and emotional content no longer reach others via `@mention` injection in groups — those facts live in `private.md`, which is never loaded when the caller is someone other than the owner.
+- **L1 safety net on LLM output.** Even if the LLM misclassifies an email, credential, or amount as public, `parseTieredProfile` forces it back to private. Defense in depth against classification errors.
+
+### Migration
+- **Legacy single-file profiles** (`profiles/{userId}.md` from v0.9.x and earlier) are migrated lazily on first read. The migration runs the L1 classifier line-by-line: blacklist hits (phones, 跳槽, 薪资, ...) move to `private.md`; whitelist hits (工程师, TypeScript, ...) stay in `public.md`; gray content stays in `public.md` (matches pre-upgrade exposure — no regression).
+- A console log summarizes each migration: `[migrate] profile ou_xxx: N public, M private`.
+- Migration is idempotent: rerunning after a partial failure cleans up stale legacy files. The legacy file is deleted only after both tier files are successfully written.
+- **One-way migration.** Downgrading to v0.9.x after upgrading is possible but requires manual reconstruction: `cat profiles/{userId}/public.md profiles/{userId}/private.md > profiles/{userId}.md`. Snapshot `~/.claude/channels/lark/memories/` before upgrade if you need a rollback path.
+- **Distillation pipeline is infrastructure-only.** `buildProfileDistillationPrompt` and `parseTieredProfile` are ready to use but not yet triggered from any code path in this release. The loop that turns episode summaries into profile updates is completed in Phase 3 together with the `forget_memory` / `what_do_you_know` tools.
+
 ## [0.9.0] - 2026-04-19
 
 ### Added
@@ -197,6 +228,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.10.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.10.0
 [0.9.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.9.0
 [0.8.5]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.5
 [0.8.4]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.4
