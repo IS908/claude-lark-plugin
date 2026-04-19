@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.11.1] - 2026-04-20
+
+Two cleanups landed together:
+1. Legacy-profile migration now honors the operator's L2 privacy rules in addition to L1 (#42).
+2. Consolidated `JobMeta.send_chat_id` into `target_chat_id` (internal refactor; no behavior change).
+
+### Added
+- **`extractL2PrivatePhrases(markdown)`** (`src/privacy-rules.ts`) — parses the `## Always private` section of a markdown L2 rules file and returns the bulleted phrases. Used by legacy-profile migration.
+- 6 new assertions in `privacy-rules-smoke.ts` and 1 new integration assertion in `profile-tier-smoke.ts` covering the new migration path.
+- 1 new assertion in `job-smoke.ts` covering the v0.9–v0.11.0 `send_chat_id` → `target_chat_id` rollback transition.
+
+### Changed
+- **`MemoryStore.migrateIfNeeded` now also consults L2 rules.** An operator who authors `~/.claude/channels/lark/privacy-rules.md` with `## Always private` phrases for their org-specific categories (project codenames, client names, people mentions) will see those phrases applied during legacy-profile migration — lines matching any L2 phrase via case-insensitive substring get routed to `private.md`. L1 still runs first and wins; L2 only applies to lines L1 would have classified as `public` or `gray`.
+- **`JobMeta.send_chat_id` removed; `target_chat_id` is the canonical field.** v0.9.0–v0.11.0 kept both fields with identical values (the former as "new" name, the latter for v0.8 backward compat). The consolidation is internal-only: the `create_job` tool parameter remains `target_chat_id`; the scheduler, `list_jobs` visibility filter, and audit paths now read `target_chat_id` directly. Any job file written by v0.9–v0.11.0 with `send_chat_id` is handled by `backfillJob` (resurrects `target_chat_id` from it on first read).
+
+### Non-change (for clarity)
+- L3 LLM-based re-classification is still NOT part of migration. That was considered and rejected during Phase 2 brainstorming for latency/failure-mode reasons. If it's ever added, it will be an opt-in terminal command, not part of the automatic first-read trigger.
+- Substring matching (not regex, not full NLU) is intentional. L2 rules authored as abstract descriptions ("涉及人际冲突的内容") still apply at L3 distillation time; for migration they'd need to be restated as concrete phrases if the operator wants them to match.
+
 ## [0.11.0] - 2026-04-19
 
 Phase 3 of the privacy redesign. Adds user-facing control over what the bot remembers, a self-learning loop that promotes user corrections into persistent rules, and terminal-side safeguards against incidental exposure.
@@ -254,6 +273,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.11.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.1
 [0.11.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.0
 [0.10.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.10.0
 [0.9.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.9.0

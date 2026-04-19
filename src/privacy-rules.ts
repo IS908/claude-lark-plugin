@@ -105,6 +105,51 @@ export async function loadL2Rules(overridePath?: string): Promise<string> {
 }
 
 /**
+ * Extract the bullet items under `## Always private` from L2 markdown as
+ * plain phrases. Used by legacy-profile migration to do a deterministic
+ * substring check — the LLM is not available in that synchronous path.
+ *
+ * Only phrases under `## Always private` are returned; `## Always public`
+ * (if any) is ignored because migration defaults gray content to public
+ * anyway.
+ *
+ * Matching semantics at the call site are **case-insensitive substring**.
+ * This works well for concrete nouns / identifiers (company names, project
+ * codenames, people mentions) but does NOT interpret abstract descriptions
+ * like "涉及人际冲突的内容" the way an LLM would. That's a deliberate
+ * trade-off — deterministic and fast, at the cost of expressivity. Abstract
+ * L2 rules still apply at L3 distillation time as before.
+ *
+ * Warning: very short phrases (e.g. "a", "的") will substring-match almost
+ * everything and effectively turn the whole profile private. This extractor
+ * does NOT reject them — operators author L2 deliberately, and migration
+ * over-protection is safer than under-protection. Prefer concrete multi-char
+ * phrases.
+ */
+export function extractL2PrivatePhrases(markdown: string): string[] {
+  if (!markdown) return [];
+  const phrases: string[] = [];
+  let inSection = false;
+  for (const raw of markdown.split('\n')) {
+    const line = raw.trim();
+    if (/^##\s+always\s+private\s*$/i.test(line)) {
+      inSection = true;
+      continue;
+    }
+    if (inSection && /^##\s+/.test(line)) {
+      // Entered a different section — stop collecting
+      inSection = false;
+      continue;
+    }
+    if (inSection && line.startsWith('- ')) {
+      const phrase = line.slice(2).trim();
+      if (phrase) phrases.push(phrase);
+    }
+  }
+  return phrases;
+}
+
+/**
  * Add a rule line to the L2 file under the given section. Creates the file
  * if missing; creates the section header if missing. New rules are inserted
  * at the TOP of their section (newest-first, changelog-style) so users who

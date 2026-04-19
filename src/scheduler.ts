@@ -236,7 +236,7 @@ export class JobScheduler {
     await this.client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: {
-        receive_id: job.meta.send_chat_id,
+        receive_id: job.meta.target_chat_id,
         content: JSON.stringify(msgType === 'text' ? { text: content } : { content }),
         msg_type: msgType,
       },
@@ -255,11 +255,11 @@ export class JobScheduler {
     // Bind the job owner as caller so tools invoked from this Claude turn
     // (e.g. save_memory, list_jobs) resolve to the job creator, not to any
     // human who happened to send a message to the same chat.
-    this.identitySession.setCaller(job.meta.send_chat_id, jobThreadId, job.meta.created_by);
+    this.identitySession.setCaller(job.meta.target_chat_id, jobThreadId, job.meta.created_by);
 
     const promptContent = cronJobPrompt(
       job.meta.name,
-      job.meta.send_chat_id,
+      job.meta.target_chat_id,
       job.meta.prompt ?? ''
     );
 
@@ -268,7 +268,7 @@ export class JobScheduler {
       params: {
         content: promptContent,
         meta: {
-          chat_id: job.meta.send_chat_id,
+          chat_id: job.meta.target_chat_id,
           thread_id: jobThreadId,
           source: 'cronjob',
           job_id: job.meta.id,

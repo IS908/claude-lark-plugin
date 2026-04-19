@@ -54,7 +54,7 @@ Before calling `delete_job`, or `update_job` with `status=paused` /
 user first:
 
 > "Confirm: delete job `<id>` (runs `<schedule>`, targets
-> `<send_chat_id>`)? Reply `yes` to proceed."
+> `<target_chat_id>`)? Reply `yes` to proceed."
 
 Do not proceed without an affirmative response. For read-only calls
 (`list_jobs`) and for `update_job` that only changes `name`, no
