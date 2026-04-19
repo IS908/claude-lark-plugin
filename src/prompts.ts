@@ -27,31 +27,55 @@ ${conversation}
 }
 
 /**
- * Distillation Stage 2: Episodes → Profile.
- * Instructs Claude to extract durable facts from episode summaries into a
- * user profile. Note (v0.9.0+): `save_memory` writes profile facts about
- * the CALLER (derived server-side); the caller must be `${userId}` when
- * this prompt fires, i.e. this prompt is triggered from a turn originally
- * initiated by the target user.
+ * Distillation Stage 2: Episodes → Profile (tiered, v0.10.0+).
+ *
+ * Instructs Claude to extract durable facts from episode summaries and
+ * output a JSON object with `public` and `private` arrays. The caller of
+ * the distillation turn must be `userId` (profile writes resolve to caller
+ * server-side, v0.9.0+).
+ *
+ * Classification rules are embedded directly in the prompt — the
+ * distiller's output is later post-processed by `parseTieredProfile` in
+ * src/memory/distiller.ts, which additionally applies the L1 safety net
+ * (anything marked public that hits an L1 regex gets forced to private).
  */
-export function profileDistillationPrompt(
-  userId: string,
-  currentProfile: string | null,
-  episodeSummaries: string[]
-): string {
+export function profileDistillationPrompt(args: {
+  userId: string;
+  currentProfile: string | null;
+  episodeSummaries: string[];
+  chatType: 'p2p' | 'group';
+  l2Rules: string;
+}): string {
+  const { userId, currentProfile, episodeSummaries, chatType, l2Rules } = args;
   return `[Profile-distillation]
 Target user: ${userId}
+Source chat type: ${chatType}
+
 Current user profile:
 ${currentProfile || '(empty — no profile yet)'}
 
 Recent conversation summaries (${episodeSummaries.length}):
-${episodeSummaries.join('\n\n')}
+${episodeSummaries.map((s, i) => `[${i + 1}] ${s}`).join('\n\n')}
 
-Please update the user profile:
-- ADD: new preferences, facts, expertise discovered in conversations
-- UPDATE: information that has changed (e.g., switched tech stack, new project)
-- REMOVE: outdated information no longer relevant
-Output the complete updated profile and call save_memory(type="profile", content=<full profile>, reason=<why>, chat_id=<current chat>). The profile is saved for the caller of this turn, who should be ${userId}.`;
+User privacy rules (L2):
+${l2Rules.trim() || '(none set)'}
+
+Output a JSON object with exactly two arrays:
+{
+  "public":  [ "fact", "fact", ... ],   // facts safe for anyone who @mentions this user to see
+  "private": [ "fact", "fact", ... ]    // facts only the user themselves should see
+}
+
+Classification rules (apply in order; higher priority wins):
+1. Match any "Always private" rule in L2 → private.
+2. Match any "Always public" rule in L2 → public.
+3. Specific emails, phone numbers, monetary amounts, passwords, tokens, credentials — ALWAYS private, even if mentioned in a group.
+4. Source-based default:
+   - chatType=group → unknown facts default to public (they were already said in front of the group).
+   - chatType=p2p → unknown facts default to private (never voluntarily shared beyond 1:1).
+5. When truly uncertain: choose private.
+
+Return ONLY the JSON object, no prose or code fences. Then call save_memory(type="profile", content=<public-array-as-markdown-list>, reason=<why>, chat_id=<current>, tier="public") and again with tier="private" for the private array. Skip either call if its array is empty.`;
 }
 
 /**

@@ -437,16 +437,22 @@ export class LarkChannel {
     }
 
     // 1. User profile (hot injection — always loaded)
-    const profile = await this.memoryStore.getProfile(msg.senderId).catch(() => null);
+    // The caller is the sender themselves, so they see both public and private tiers.
+    const profile = await this.memoryStore
+      .getProfile(msg.senderId, msg.senderId)
+      .catch(() => null);
     if (profile) {
       parts.push(`[User Profile]\n${profile}`);
     }
 
     // 2. Mentioned user profiles (hot injection)
+    // Caller is the sender, not the mentioned user, so only the public tier is loaded.
     if (msg.mentions?.length) {
       for (const mention of msg.mentions) {
         if (mention.id && mention.id !== msg.senderId) {
-          const mentionProfile = await this.memoryStore.getProfile(mention.id).catch(() => null);
+          const mentionProfile = await this.memoryStore
+            .getProfile(mention.id, msg.senderId)
+            .catch(() => null);
           if (mentionProfile) {
             parts.push(`[Mentioned User: ${mention.name}]\n${mentionProfile}`);
           }

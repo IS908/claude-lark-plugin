@@ -41,10 +41,13 @@
 - 三层架构：Buffer（短期）/ 情景记忆（中期）/ 语义记忆（长期）
 - 自动蒸馏：对话静默超时后自动触发摘要
 - 本地 markdown 文件存储，路径 `~/.claude/channels/lark/memories/`
+- 用户 profile 分层存储（v0.10.0+）：`public.md`（@mention 可见）/ `private.md`（仅 owner 可见）
 
 ### 隐私与安全（v0.9.0+）
 
 - **服务端派生的调用者身份**：敏感工具（`save_memory` / `create_job` / `list_jobs` / `update_job` / `delete_job`）从飞书事件流派生调用者身份，不信任工具参数——社工提示无法假冒他人操作
+- **分层 profile 记忆（v0.10.0+）**：每个用户的 profile 拆成 `public.md`（他人 @mention 时可见）和 `private.md`（仅 owner 可见）。私聊里的偏好不会通过 @mention 注入泄露到群聊
+- **L1/L2/L3 分类体系**（v0.10.0+）：硬编码的 regex + 关键词规则拦截手机/凭据/敏感中文词。邮箱**不在** L1——本插件定位为**工作 IM 场景**，工作邮箱常通过签名和通讯录公开；个人使用的部署可以在自己的 `privacy-rules.md` 里加一条 "Always private" 规则专门归类邮箱。用户可编辑的 `privacy-rules.md` 处理个人和组织特有场景；LLM 处理灰色地带。`parseTieredProfile` 在 LLM 分类之上加 L1 兜底——误判为 public 的凭据被强制归 private
 - **`list_jobs` 可见性过滤**：群聊里只能看到 `send_chat_id` 匹配本群的 job（非 owner 看不到 prompt 正文）；私聊里只能看到自己建的 job。群成员不再能互相窥探定时任务
 - **仅 owner 可改**：`update_job` / `delete_job` 要求 `caller == created_by`
 - **CronJob 身份隔离**：每次 cronjob 触发使用独立 `thread_id`，不会和同一 chat 的真人消息串线
@@ -237,6 +240,7 @@ node -e "console.log(require('./package.json').version)"
 |------|--------|------|
 | `LARK_OWNER_OPEN_ID` | （空） | 运营者 open_id。用于终端技能（如 `/lark:jobs`）通过 `__terminal__` 哨兵 chat_id 解析调用者。未设置时，终端侧的敏感操作将被拒绝 |
 | `LARK_IDENTITY_SESSION_TTL_MS` | `max(2h, LARK_INACTIVITY_HOURS × 2h)` | 服务端 `(chat_id, thread_id?) → open_id` 会话条目的 TTL。必须超过自动蒸馏窗口，以保证 flush 触发的工具调用仍能解析到最后的真实用户 |
+| `LARK_PRIVACY_RULES_FILE` | `~/.claude/channels/lark/privacy-rules.md` | L2 用户规则文件路径。蒸馏器会把文件内容注入分类 prompt（v0.10.0+）|
 
 ---
 
@@ -328,7 +332,7 @@ tmux kill-session -t lark
 | `edit_message` | `(message_id, text, format?)` | 编辑已发送的机器人消息（支持 text 和 card_markdown 格式） |
 | `react` | `(message_id, emoji)` | 对消息添加表情回复 |
 | `download_attachment` | `(message_id, file_key)` | 下载消息中的附件到本地收件箱 |
-| `save_memory` | `(type, content, reason, chat_id, thread_id?)` | 保存用户画像、会话情景或话题情景。画像写入总是针对调用者本人（v0.9.0 起），不再接受 `open_id` 参数 |
+| `save_memory` | `(type, content, reason, chat_id, thread_id?, tier?)` | 保存用户画像、会话情景或话题情景。画像写入总是针对调用者本人（v0.9.0 起）；v0.10.0 起可选 `tier` 参数（`public` / `private`，默认 `private`）决定归属哪一档 |
 | `save_skill` | `(name, description, content, chat_id?)` | 保存可复用的操作流程为全局技能 |
 | `create_job` | `(name, type, schedule, prompt?, content?, target_chat_id, chat_id, thread_id?)` | 创建定时任务。创建者由 session 派生，不再接受 `created_by`；`chat_id` 用于派生调用者身份并填充 `origin_chat_id` |
 | `list_jobs` | `(status?, chat_id, thread_id?)` | 列出当前 chat 可见的 job。私聊返回 caller 自己建的；群里返回 `send_chat_id` 为本群的（非 owner 视图脱敏 prompt）|

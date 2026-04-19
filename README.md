@@ -45,12 +45,14 @@ The plugin connects to Feishu via the Lark SDK WebSocket client, receives messag
 - Three-layer architecture: Buffer, Episodic, and Semantic memory
 - Auto-flush distillation from conversation buffer to episodic memory
 - Local markdown-file storage under `~/.claude/channels/lark/memories/`
-- User profiles, chat episodes, thread episodes, and global skills
-- Memory-enriched context injection on every incoming message
+- User profiles (tiered public/private since v0.10.0), chat episodes, thread episodes, and global skills
+- Memory-enriched context injection on every incoming message, filtered by caller identity
 
 ### Privacy & Security (v0.9.0+)
 
 - **Server-derived caller identity**: sensitive tools (`save_memory`, `create_job`, `list_jobs`, `update_job`, `delete_job`) resolve the calling user from the authenticated Feishu event stream, not from tool arguments — socially-engineered prompts cannot act on behalf of another user
+- **Tiered profile memory (v0.10.0+)**: each user's profile is split into `public.md` (visible to anyone who @mentions the user) and `private.md` (owner-only). Private-chat preferences no longer leak into groups via @mention injection
+- **L1/L2/L3 classification** (v0.10.0+): hardcoded regex + keyword rules catch phones / credentials / sensitive Chinese keywords. Email is intentionally NOT in L1 — the plugin targets **work-chat use cases** where emails are commonly shared via signatures/directories; personal deployments can add their own "Always private" email rule to `privacy-rules.md`. User-editable `privacy-rules.md` covers personal/org-specific cases; LLM handles the nuance. `parseTieredProfile` applies an L1 safety net over LLM output so misclassified credentials get forced to private
 - **`list_jobs` visibility filter**: in a group chat, members only see jobs whose `send_chat_id` matches that group (with prompt bodies redacted for non-owners); in a private chat, the caller sees their own jobs. Group members can no longer inspect each other's private jobs
 - **Owner-only mutations**: `update_job` / `delete_job` require `caller == created_by`
 - **CronJob isolation**: each cronjob execution runs under a unique `thread_id` so scheduled actions don't collide with concurrent human messages in the same chat
@@ -253,6 +255,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 |---|---|---|
 | `LARK_OWNER_OPEN_ID` | (empty) | Operator open_id. Enables terminal skill invocations (e.g. `/lark:jobs`) to resolve the caller via the reserved `__terminal__` chat id. When unset, terminal-side sensitive operations are denied. |
 | `LARK_IDENTITY_SESSION_TTL_MS` | `max(2h, LARK_INACTIVITY_HOURS × 2h)` | Lifetime of a server-side `(chat_id, thread_id?) → open_id` session entry. Must exceed the auto-flush window so distillation-triggered tool calls still resolve to the last real user. |
+| `LARK_PRIVACY_RULES_FILE` | `~/.claude/channels/lark/privacy-rules.md` | Override the path to the L2 user rules file. The distiller injects this file's contents into its classification prompt. |
 
 ---
 
@@ -335,7 +338,7 @@ The plugin registers the following MCP tools for Claude to use:
 | `edit_message` | Edit a previously sent bot message (text or card_markdown). |
 | `react` | Add an emoji reaction to a message. |
 | `download_attachment` | Download an attachment (image, file, audio, video) from a message to the local inbox. |
-| `save_memory` | Save a memory entry (profile / chat episode / thread episode) for cross-session recall. Profile writes target the resolved caller (server-derived, v0.9.0+). Requires `chat_id`. |
+| `save_memory` | Save a memory entry (profile / chat episode / thread episode) for cross-session recall. Profile writes target the resolved caller (server-derived, v0.9.0+) and go into the chosen `tier` (`public` or `private`, default `private`, v0.10.0+). Requires `chat_id`. |
 | `save_skill` | Save a reusable procedure as a globally searchable skill. |
 | `create_job` | Create a scheduled cronjob (message or prompt type). Creator derived from session; requires `chat_id` (used to populate `origin_chat_id`). |
 | `list_jobs` | List cronjobs visible in the current chat. Filter follows rendering-visibility: private → caller's own jobs, group → jobs with `send_chat_id == currentChat` (prompts redacted for non-owners). Requires `chat_id`. |

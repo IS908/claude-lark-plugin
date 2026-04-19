@@ -36,4 +36,12 @@ echo "=== Identity session unit checks ==="
 npx tsx scripts/identity-smoke.ts
 
 echo ""
+echo "=== Privacy rules unit checks ==="
+npx tsx scripts/privacy-rules-smoke.ts
+
+echo ""
+echo "=== Profile tiering unit checks ==="
+npx tsx scripts/profile-tier-smoke.ts
+
+echo ""
 echo "All tests passed."

@@ -1,6 +1,10 @@
 import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { appConfig } from '../config.js';
+import { applyL1 } from '../privacy-rules.js';
+
+export type Tier = 'public' | 'private';
 
 export interface Episode {
   id: string;
@@ -37,21 +41,116 @@ export class MemoryStore {
 
   async healthCheck(): Promise<boolean> { return true; }
 
-  // ── User Profile ──
+  // ── User Profile (tiered, v0.10.0+) ──
 
-  async getProfile(userId: string): Promise<string | null> {
-    const filePath = path.join(this.baseDir, 'profiles', `${userId}.md`);
-    try {
-      return await fs.readFile(filePath, 'utf-8');
-    } catch {
-      return null;
-    }
+  private profileDir(userId: string): string {
+    return path.join(this.baseDir, 'profiles', userId);
   }
 
-  async saveProfile(userId: string, content: string): Promise<void> {
-    const dir = path.join(this.baseDir, 'profiles');
+  private profileTierPath(userId: string, tier: Tier): string {
+    return path.join(this.profileDir(userId), `${tier}.md`);
+  }
+
+  private legacyProfilePath(userId: string): string {
+    return path.join(this.baseDir, 'profiles', `${userId}.md`);
+  }
+
+  /**
+   * Migrate a pre-v0.10 single-file profile to the tiered layout, applying
+   * the L1 classifier line-by-line to split into public/private.
+   *
+   * Idempotent: runs at most once per user. Partial-failure safe: legacy file
+   * is deleted only after both target files are successfully written.
+   *
+   *  legacy: profiles/{userId}.md
+   *  target: profiles/{userId}/{public,private}.md
+   *
+   * See spec's "Migration" section for the trade-off discussion (approach B:
+   * deterministic L1 filter, no LLM dependency).
+   */
+  private async migrateIfNeeded(userId: string): Promise<void> {
+    const legacy = this.legacyProfilePath(userId);
+    const dir = this.profileDir(userId);
+
+    if (!existsSync(legacy)) return; // fresh user or already migrated
+
+    if (existsSync(dir)) {
+      // Mid-failure from a previous migration — new layout already exists.
+      // Safe to drop the legacy file; new layout is authoritative.
+      try { await fs.unlink(legacy); } catch {}
+      return;
+    }
+
+    const content = await fs.readFile(legacy, 'utf-8');
+    const publicLines: string[] = [];
+    const privateLines: string[] = [];
+
+    for (const line of content.split('\n')) {
+      if (!line.trim()) {
+        // Preserve blank lines in public for readability; skip in private.
+        publicLines.push(line);
+        continue;
+      }
+      if (applyL1(line) === 'private') {
+        privateLines.push(line);
+      } else {
+        publicLines.push(line);
+      }
+    }
+
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, `${userId}.md`), content, 'utf-8');
+    await fs.writeFile(this.profileTierPath(userId, 'public'), publicLines.join('\n'), 'utf-8');
+    if (privateLines.length > 0) {
+      await fs.writeFile(this.profileTierPath(userId, 'private'), privateLines.join('\n'), 'utf-8');
+    }
+    // Wrap unlink in try/catch to tolerate concurrent migrations of the
+    // same user (e.g. User A is mentioned in two chats handled in parallel
+    // by different queues — both enter migrateIfNeeded before either
+    // finishes). ENOENT on the second unlink is benign.
+    try { await fs.unlink(legacy); } catch {}
+
+    console.error(
+      `[migrate] profile ${userId}: ${publicLines.filter(l => l.trim()).length} public, ${privateLines.length} private`,
+    );
+  }
+
+  /**
+   * Load a user's profile, filtered by rendering visibility.
+   * - caller === ownerId → return public + private tiers joined
+   * - caller !== ownerId → return public tier only
+   *
+   * Returns null if neither tier file has content.
+   */
+  async getProfile(ownerId: string, caller: string): Promise<string | null> {
+    await this.migrateIfNeeded(ownerId);
+
+    const readOpt = async (p: string): Promise<string> => {
+      if (!existsSync(p)) return '';
+      try { return await fs.readFile(p, 'utf-8'); } catch { return ''; }
+    };
+
+    const pub = (await readOpt(this.profileTierPath(ownerId, 'public'))).trim();
+    if (caller === ownerId) {
+      const priv = (await readOpt(this.profileTierPath(ownerId, 'private'))).trim();
+      const joined = [pub, priv].filter(Boolean).join('\n\n');
+      return joined || null;
+    }
+    return pub || null;
+  }
+
+  /**
+   * Persist a profile tier. Creates the user directory if missing.
+   *
+   * Runs {@link migrateIfNeeded} first so that a save on an unmigrated user
+   * does not silently drop their legacy profile content. Without this call,
+   * the order save → read would see dir-exists-early-return in migration and
+   * throw away the legacy file without classifying it.
+   */
+  async saveProfile(userId: string, content: string, tier: Tier): Promise<void> {
+    await this.migrateIfNeeded(userId);
+    const dir = this.profileDir(userId);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(this.profileTierPath(userId, tier), content, 'utf-8');
   }
 
   // ── Episodes ──
