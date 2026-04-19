@@ -40,18 +40,9 @@ export const appConfig = {
   cronTimezone: optional('LARK_CRON_TIMEZONE', Intl.DateTimeFormat().resolvedOptions().timeZone),
 
   // Memory
-  memoryProvider: optional('MEMORY_PROVIDER', 'file') as 'file' | 'openviking' | 'mem0',
   minSearchScore: optionalNumber('LARK_MIN_SEARCH_SCORE', 0.3),
   maxSearchResults: optionalNumber('LARK_MAX_SEARCH_RESULTS', 2),
   inactivityHours: optionalNumber('LARK_INACTIVITY_HOURS', 3),
-
-  // OpenViking
-  openVikingUrl: optional('OPENVIKING_URL', 'http://localhost:1933'),
-  openVikingApiKey: process.env.OPENVIKING_API_KEY || '',
-
-  // mem0
-  mem0Url: process.env.MEM0_URL || '',
-  mem0ApiKey: process.env.MEM0_API_KEY || '',
 
   // Paths
   memoriesDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'memories'),

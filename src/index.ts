@@ -9,7 +9,7 @@ import { LarkChannel } from './channel.js';
 import { registerTools } from './tools.js';
 import { ConversationBuffer } from './memory/buffer.js';
 import { buildFlushPrompt } from './memory/distiller.js';
-import { createMemoryProvider } from './memory/factory.js';
+import { MemoryStore } from './memory/file.js';
 import { JobScheduler } from './scheduler.js';
 
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
@@ -44,8 +44,9 @@ async function acquireLock(): Promise<void> {
 async function main() {
   const isDryRun = process.argv.includes('--dry-run');
 
-  // 1. Create memory provider
-  const memoryProvider = await createMemoryProvider();
+  // 1. Create memory store
+  const memoryStore = new MemoryStore();
+  console.error(`[memory] Using ${appConfig.memoriesDir}`);
 
   // 2. Create MCP server
   const server = new McpServer(
@@ -72,7 +73,7 @@ async function main() {
 
   // 3. Create Lark channel
   const channel = new LarkChannel();
-  channel.setMemoryProvider(memoryProvider);
+  channel.setMemoryStore(memoryStore);
 
   // 4. Create conversation buffer + wire flush handler
   const buffer = new ConversationBuffer();
@@ -100,7 +101,7 @@ async function main() {
   registerTools(
     server,
     channel.getClient(),
-    memoryProvider,
+    memoryStore,
     buffer,
     channel.getAckReactions(),
     channel.getBotMessageTracker(),
@@ -153,7 +154,7 @@ async function main() {
   });
 
   if (isDryRun) {
-    console.error('[dry-run] All modules loaded successfully. Memory provider:', appConfig.memoryProvider);
+    console.error('[dry-run] All modules loaded successfully.');
     console.error('[dry-run] Tools registered. Exiting.');
     process.exit(0);
   }
