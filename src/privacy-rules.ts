@@ -119,6 +119,12 @@ export async function loadL2Rules(overridePath?: string): Promise<string> {
  * like "涉及人际冲突的内容" the way an LLM would. That's a deliberate
  * trade-off — deterministic and fast, at the cost of expressivity. Abstract
  * L2 rules still apply at L3 distillation time as before.
+ *
+ * Warning: very short phrases (e.g. "a", "的") will substring-match almost
+ * everything and effectively turn the whole profile private. This extractor
+ * does NOT reject them — operators author L2 deliberately, and migration
+ * over-protection is safer than under-protection. Prefer concrete multi-char
+ * phrases.
  */
 export function extractL2PrivatePhrases(markdown: string): string[] {
   if (!markdown) return [];
