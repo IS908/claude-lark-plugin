@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.9.0] - 2026-04-19
+
+### Added
+- **`IdentitySession`** (`src/identity-session.ts`) — server-side `(chat_id, thread_id?) → open_id` mapping populated from Feishu events. Sensitive MCP tools now consult the session instead of trusting Claude-declared identity parameters. Closes a privacy hole where a socially-engineered prompt could make tools act on behalf of another user.
+- **`send_chat_id` and `origin_chat_id` on `JobMeta`** — enables visibility filtering based on where a job delivers output vs where it was created. Legacy jobs are backfilled from `target_chat_id` on read.
+- **`LARK_OWNER_OPEN_ID` config key** — identity fallback for terminal skill invocations. Terminal skills pass the reserved `__terminal__` chat id; the session resolves it to this owner. Without this set, terminal-side sensitive operations are denied.
+- **`LARK_IDENTITY_SESSION_TTL_MS` config key** — optional override for session entry staleness. Default is `max(2h, LARK_INACTIVITY_HOURS × 2h)` so session entries always outlive the auto-flush window — otherwise flush-triggered `save_memory` calls would fail to resolve the caller.
+- `scripts/identity-smoke.ts` — 8 smoke assertions covering chat/thread precedence, fallback, terminal sentinel, unknown chat, staleness, cleanup, and overwrite.
+
+### Changed
+- **`list_jobs` now filters by rendering visibility.** In a private chat, the caller sees jobs they created. In a group chat, everyone sees jobs whose `send_chat_id` matches that group — with prompt/content/meta redacted for non-owners (owner identity and schedule remain visible for accountability). Closes the hole where group members could inspect each other's full job prompts.
+- **`update_job` / `delete_job` restricted to job owner.** Visibility ≠ mutation rights.
+- **`save_memory` no longer accepts a client-supplied `open_id`.** Profile writes always target the resolved caller — you cannot write facts "on behalf of" another user.
+- **`create_job` now requires `chat_id`** (used to resolve caller identity and populate `origin_chat_id`). The `created_by` parameter is removed; creator is derived from the session.
+- **Scheduler attaches a unique `thread_id`** (`job-<id>-<timestamp>`) to each cronjob execution so cronjob session entries don't clobber concurrent inbound human messages in the same chat.
+- Cronjob deliveries use `send_chat_id` (same value as `target_chat_id` for freshly created jobs).
+
+### Security
+- Group members can no longer list or inspect other users' jobs in a group — `list_jobs` returns only the jobs delivering output to that group, with free-form content redacted for non-owners.
+- Socially-engineered prompts ("act as kk and list their jobs") can no longer direct tools to act on behalf of a different user — the caller is derived server-side from the Feishu event, not from tool arguments.
+- Terminal skill invocations now require `LARK_OWNER_OPEN_ID` to be configured; missing or mismatched identity results in tool rejection.
+- **Defensive posture for the `__terminal__` sentinel.** The MCP server instructions explicitly warn Claude never to substitute `__terminal__` for a real `chat_id`, and `src/identity-session.ts` carries a SECURITY NOTE documenting the trust-but-verify model. A stronger server-side heuristic (e.g. reject `__terminal__` when a fresh real-chat session entry exists) is deferred to Phase 3. Practical risk is low — the sentinel is not surfaced in any notification metadata, so Claude would need to invent the string on its own.
+- Thread-id handling strengthened at the parameter-description level on all sensitive tools (`save_memory`, `create_job`, `list_jobs`, `update_job`, `delete_job`): Claude is told explicitly that omitting `thread_id` in a cronjob turn silently attributes the action to the wrong user. Prevents a subtle cross-turn leak where a cronjob-owned action would be recorded against the last human speaker's identity.
+
+### Migration
+- **Legacy jobs with empty `created_by`** (created before the field was enforced) are backfilled to `LARK_OWNER_OPEN_ID` on read. This keeps the operator's existing jobs mutable via `update_job` / `delete_job` after upgrade. If `LARK_OWNER_OPEN_ID` is unset, legacy jobs with empty `created_by` remain un-mutable — set the env var and restart to recover them.
+- **Legacy jobs missing `send_chat_id` / `origin_chat_id`** are backfilled from `target_chat_id` on read. No operator action required.
+- **`MEMORY_PROVIDER=openviking` or `mem0`** users: already migrated in v0.8.5 (those backends were dropped). No v0.9.0-specific migration.
+
 ## [0.8.5] - 2026-04-19
 
 ### Removed
@@ -168,6 +197,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[0.9.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.9.0
 [0.8.5]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.5
 [0.8.4]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.4
 [0.8.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.8.3

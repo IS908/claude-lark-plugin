@@ -5,6 +5,8 @@
  */
 import { registerTools } from '../src/tools.js';
 import type { MemoryStore } from '../src/memory/file.js';
+import { IdentitySession } from '../src/identity-session.js';
+import type { LarkChannel } from '../src/channel.js';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -104,10 +106,17 @@ async function run() {
   const ackReactions = new Map<string, string>();
 
   // Register tools (captures handlers via fake server)
+  const identitySession = new IdentitySession(() => null);
+  // Bind a fake caller so resolveCaller-gated tools can be exercised.
+  identitySession.setCaller('chat_001', undefined, 'ou_reply_smoke');
+  const fakeChannel = { isPrivateChat: () => true } as unknown as LarkChannel;
+
   registerTools(
     fakeServer as any,
     client as any,
     noopMemory,
+    identitySession,
+    fakeChannel,
     buffer as any,
     ackReactions,
     botTracker as any,

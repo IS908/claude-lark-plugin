@@ -6,7 +6,8 @@ import { appConfig } from './config.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
-import type { BotMessageTracker, LatestMessageTracker } from './channel.js';
+import type { BotMessageTracker, LatestMessageTracker, LarkChannel } from './channel.js';
+import type { IdentitySession } from './identity-session.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
 import {
   sanitizeJobId,
@@ -27,11 +28,49 @@ export function registerTools(
   server: McpServer,
   client: Lark.Client,
   memoryStore: MemoryStore,
+  identitySession: IdentitySession,
+  channel: LarkChannel,
   conversationBuffer?: ConversationBuffer,
   ackReactions?: Map<string, string>,
   botMessageTracker?: BotMessageTracker,
   latestMessageTracker?: LatestMessageTracker
 ): void {
+  /**
+   * Resolve the true caller for a sensitive tool invocation via the server-side
+   * IdentitySession. Returns either `{ caller }` on success or `{ error }` —
+   * an MCP tool result to return directly — on failure. This deliberately
+   * ignores any Claude-declared identity parameters.
+   */
+  function resolveCaller(
+    chat_id: string | undefined,
+    thread_id: string | undefined,
+  ):
+    | { caller: string }
+    | { error: { isError: true; content: { type: 'text'; text: string }[] } } {
+    if (!chat_id) {
+      return {
+        error: {
+          isError: true,
+          content: [{ type: 'text' as const, text: 'chat_id is required for this tool' }],
+        },
+      };
+    }
+    const caller = identitySession.getCaller(chat_id, thread_id);
+    if (!caller) {
+      return {
+        error: {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `No active identity session for chat ${chat_id}. This tool requires an inbound Feishu message to establish caller identity, or a terminal invocation with LARK_OWNER_OPEN_ID set.`,
+            },
+          ],
+        },
+      };
+    }
+    return { caller };
+  }
   // ── 1. reply ──
   server.registerTool(
     'reply',
@@ -428,40 +467,35 @@ export function registerTools(
     'save_memory',
     {
       description:
-        'Save a memory entry for cross-session recall. Only save durable, reusable facts — user preferences, communication style, key decisions, ongoing projects, resolved problems. Do NOT save pleasantries, failed attempts, ephemeral details, or conversation filler.',
+        'Save a memory entry for cross-session recall. Only save durable, reusable facts — user preferences, communication style, key decisions, ongoing projects, resolved problems. Do NOT save pleasantries, failed attempts, ephemeral details, or conversation filler. Profile writes always save facts about the CALLER of this tool (i.e. the Feishu user whose message triggered the current turn) — you cannot save profile facts about a different user.',
       inputSchema: z.object({
         type: z
           .enum(['profile', 'chat', 'thread'])
           .describe(
-            'Memory type: "profile" for user preferences/facts, "chat" for conversation summary, "thread" for thread-level summary'
+            'Memory type: "profile" for facts about the caller, "chat" for conversation summary, "thread" for thread-level summary'
           ),
         content: z.string().describe('The memory content to save (concise, factual)'),
         reason: z.string().describe('Why this is worth remembering'),
-        chat_id: z.string().optional().describe('Chat ID (required for chat/thread type)'),
-        thread_id: z.string().optional().describe('Thread ID (required for thread type)'),
-        open_id: z.string().optional().describe('User open_id (required for profile type)'),
+        chat_id: z.string().describe('Chat ID — required; also used to resolve caller identity'),
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            'Thread ID from the current notification\'s metadata. Required whenever present — both for server-side caller resolution (omitting it silently attributes the call to the wrong user in cronjob turns) and when type="thread".'
+          ),
       }),
     },
-    async ({ type, content, reason, chat_id, thread_id, open_id }) => {
+    async ({ type, content, reason, chat_id, thread_id }) => {
+      const auth = resolveCaller(chat_id, thread_id);
+      if ('error' in auth) return auth.error;
+      const { caller } = auth;
+
       if (type === 'profile') {
-        if (!open_id) {
-          return {
-            content: [{ type: 'text' as const, text: 'open_id is required for profile type' }],
-            isError: true,
-          };
-        }
-        await memoryStore.saveProfile(open_id, content);
+        await memoryStore.saveProfile(caller, content);
         return {
           content: [
-            { type: 'text' as const, text: `Saved profile for ${open_id}. Reason: ${reason}` },
+            { type: 'text' as const, text: `Saved profile for ${caller}. Reason: ${reason}` },
           ],
-        };
-      }
-
-      if (!chat_id) {
-        return {
-          content: [{ type: 'text' as const, text: 'chat_id is required for chat/thread type' }],
-          isError: true,
         };
       }
 
@@ -507,7 +541,7 @@ export function registerTools(
     'create_job',
     {
       description:
-        'Create a scheduled cronjob. Use type="message" for fixed content (deterministic) or type="prompt" for Claude-executed tasks (best-effort). For critical notifications use message type.',
+        'Create a scheduled cronjob. Use type="message" for fixed content (deterministic) or type="prompt" for Claude-executed tasks (best-effort). For critical notifications use message type. The creator identity is derived from the server-side session — you cannot create a job "on behalf of" another user.',
       inputSchema: z.object({
         name: z.string().describe('Job display name (can be Chinese)'),
         type: z.enum(['prompt', 'message']).describe('Job type'),
@@ -524,14 +558,25 @@ export function registerTools(
           .string()
           .optional()
           .describe('Fixed message content (type=message)'),
-        target_chat_id: z.string().describe('Chat ID to send results to'),
-        created_by: z
+        target_chat_id: z
+          .string()
+          .describe('Chat ID that receives job output (stored as send_chat_id for visibility filtering)'),
+        chat_id: z
+          .string()
+          .describe('Chat ID where this create_job call was triggered — used to resolve caller identity and to populate origin_chat_id'),
+        thread_id: z
           .string()
           .optional()
-          .describe('Creator open_id (auto-filled from channel context if omitted)'),
+          .describe(
+            'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
+          ),
       }),
     },
-    async ({ name, type, schedule, prompt, content, target_chat_id, created_by }) => {
+    async ({ name, type, schedule, prompt, content, target_chat_id, chat_id, thread_id }) => {
+      const auth = resolveCaller(chat_id, thread_id);
+      if ('error' in auth) return auth.error;
+      const { caller } = auth;
+
       // Validate type-specific fields
       if (type === 'prompt' && !prompt) {
         return {
@@ -587,8 +632,10 @@ export function registerTools(
           schedule_human: scheduleHuman,
           ...(type === 'prompt' ? { prompt } : { content, msg_type: 'text' }),
           target_chat_id,
+          send_chat_id: target_chat_id,
+          origin_chat_id: chat_id,
           status: 'active',
-          created_by: created_by ?? '',
+          created_by: caller,
           created_at: new Date().toISOString(),
         },
         runtime: {
@@ -616,32 +663,57 @@ export function registerTools(
   server.registerTool(
     'list_jobs',
     {
-      description: 'List all cronjobs and their status.',
+      description:
+        'List cronjobs visible in the current chat. Filter follows the rendering-visibility principle: in a private chat the caller sees all jobs they created; in a group chat everyone sees jobs that deliver output to that group (with prompt bodies redacted for non-owners).',
       inputSchema: z.object({
         status: z
           .enum(['active', 'paused', 'all'])
           .optional()
           .default('all')
           .describe('Filter by status'),
+        chat_id: z.string().describe('Chat ID where this list call is acting from'),
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
+          ),
       }),
     },
-    async ({ status }) => {
+    async ({ status, chat_id, thread_id }) => {
+      const auth = resolveCaller(chat_id, thread_id);
+      if ('error' in auth) return auth.error;
+      const { caller } = auth;
+
       const jobs = await listAllJobs();
-      const filtered =
+      const byStatus =
         status === 'all' ? jobs : jobs.filter((j) => j.meta.status === status);
 
-      if (filtered.length === 0) {
+      const isPrivate = channel.isPrivateChat(chat_id);
+      const visible = byStatus.filter((j) => {
+        if (isPrivate) return j.meta.created_by === caller;
+        return j.meta.send_chat_id === chat_id;
+      });
+
+      if (visible.length === 0) {
         return {
           content: [{ type: 'text' as const, text: 'No jobs found.' }],
         };
       }
 
-      const lines = filtered.map((j) => {
+      const lines = visible.map((j) => {
         const statusIcon = j.meta.status === 'active' ? '✅' : '⏸️';
         const lastRun = j.runtime.last_run_at
           ? new Date(j.runtime.last_run_at).toLocaleString()
           : 'never';
         const error = j.runtime.last_error ? ` ⚠️ ${j.runtime.last_error}` : '';
+        const isOwner = j.meta.created_by === caller;
+
+        // Group audit view — redact free-form content for non-owners.
+        // Keep created_by and schedule so the group retains accountability.
+        if (!isPrivate && !isOwner) {
+          return `${statusIcon} **${j.meta.id}** (${j.meta.type}) — ${j.meta.schedule_human}\n   By: ${j.meta.created_by} | Next: ${j.runtime.next_run_at}`;
+        }
         return `${statusIcon} **${j.meta.id}** (${j.meta.type}) — ${j.meta.schedule_human}\n   Next: ${j.runtime.next_run_at} | Last: ${lastRun} | Runs: ${j.runtime.run_count}${error}`;
       });
 
@@ -661,7 +733,7 @@ export function registerTools(
     'update_job',
     {
       description:
-        'Update a cronjob — change schedule, content, pause, or resume.',
+        'Update a cronjob — change schedule, content, pause, or resume. Only the job owner can mutate a job.',
       inputSchema: z.object({
         id: z.string().describe('Job ID'),
         status: z.enum(['active', 'paused']).optional().describe('Set status'),
@@ -669,13 +741,35 @@ export function registerTools(
         prompt: z.string().optional().describe('New prompt (type=prompt)'),
         content: z.string().optional().describe('New content (type=message)'),
         name: z.string().optional().describe('New display name'),
+        chat_id: z.string().describe('Chat ID where this update call is acting from'),
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
+          ),
       }),
     },
-    async ({ id, status, schedule, prompt, content, name }) => {
+    async ({ id, status, schedule, prompt, content, name, chat_id, thread_id }) => {
+      const auth = resolveCaller(chat_id, thread_id);
+      if ('error' in auth) return auth.error;
+      const { caller } = auth;
+
       const job = await readJob(id);
       if (!job) {
         return {
           content: [{ type: 'text' as const, text: `Job "${id}" not found.` }],
+          isError: true,
+        };
+      }
+      if (job.meta.created_by !== caller) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `You are not the owner of "${id}". Only ${job.meta.created_by} can update it.`,
+            },
+          ],
           isError: true,
         };
       }
@@ -733,12 +827,42 @@ export function registerTools(
   server.registerTool(
     'delete_job',
     {
-      description: 'Delete a cronjob permanently.',
+      description: 'Delete a cronjob permanently. Only the job owner can delete.',
       inputSchema: z.object({
         id: z.string().describe('Job ID to delete'),
+        chat_id: z.string().describe('Chat ID where this delete call is acting from'),
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
+          ),
       }),
     },
-    async ({ id }) => {
+    async ({ id, chat_id, thread_id }) => {
+      const auth = resolveCaller(chat_id, thread_id);
+      if ('error' in auth) return auth.error;
+      const { caller } = auth;
+
+      const existing = await readJob(id);
+      if (!existing) {
+        return {
+          content: [{ type: 'text' as const, text: `Job "${id}" not found.` }],
+          isError: true,
+        };
+      }
+      if (existing.meta.created_by !== caller) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `You are not the owner of "${id}". Only ${existing.meta.created_by} can delete it.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const deleted = await deleteJobFile(id);
       if (!deleted) {
         return {

@@ -10,7 +10,9 @@ import { registerTools } from './tools.js';
 import { ConversationBuffer } from './memory/buffer.js';
 import { buildFlushPrompt } from './memory/distiller.js';
 import { MemoryStore } from './memory/file.js';
+import { IdentitySession } from './identity-session.js';
 import { JobScheduler } from './scheduler.js';
+import { mcpServerInstructions } from './prompts.js';
 
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
 
@@ -48,9 +50,20 @@ async function main() {
   const memoryStore = new MemoryStore();
   console.error(`[memory] Using ${appConfig.memoriesDir}`);
 
+  // 1b. Create identity session (server-side caller tracking for sensitive tools)
+  const identitySession = new IdentitySession(
+    () => appConfig.ownerOpenId,
+    appConfig.identitySessionTtlMs,
+  );
+  if (appConfig.ownerOpenId) {
+    console.error(`[identity] owner fallback: ${appConfig.ownerOpenId}`);
+  } else {
+    console.error('[identity] no LARK_OWNER_OPEN_ID set — terminal skill invocations will be denied');
+  }
+
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '0.8.5' },
+    { name: 'claude-lark-plugin', version: '0.9.0' },
     {
       capabilities: {
         logging: {},
@@ -58,22 +71,14 @@ async function main() {
           'claude/channel': {},
         },
       },
-      instructions: [
-        'Users see Feishu, not this transcript. Use reply to respond; edit_message to update; react for acknowledgements.',
-        'Always pass reply_to=message_id so replies thread correctly in Feishu. When several <channel> notifications are in context, reply_to MUST be the message_id from the specific <channel> tag you are responding to — not any other.',
-        'If the triggering <channel> tag has thread_id, pass it to reply. The plugin uses thread_id to route the reply into the correct thread even if reply_to is omitted or ambiguous.',
-        'If metadata has image_path, Read that file to see the image.',
-        'If metadata has attachment_file_id, call download_attachment with message_id and file_key, then Read the path.',
-        'Long replies with headings, code blocks, or tables render as a Feishu card automatically. Pass format=\'card\' to force, format=\'text\' to force plain. Optionally pass footer for a small footnote at the card bottom.',
-        'CronJob notifications arrive with source=\'cronjob\' in metadata. Dispatch these to a subagent when possible so the main thread stays available for Feishu messages. The chat_id in metadata is the target for your reply.',
-        'Use save_memory for important facts; save_skill for reusable procedures.',
-      ].join('\n'),
+      instructions: mcpServerInstructions,
     }
   );
 
   // 3. Create Lark channel
   const channel = new LarkChannel();
   channel.setMemoryStore(memoryStore);
+  channel.setIdentitySession(identitySession);
 
   // 4. Create conversation buffer + wire flush handler
   const buffer = new ConversationBuffer();
@@ -102,6 +107,8 @@ async function main() {
     server,
     channel.getClient(),
     memoryStore,
+    identitySession,
+    channel,
     buffer,
     channel.getAckReactions(),
     channel.getBotMessageTracker(),
@@ -175,6 +182,7 @@ async function main() {
   const scheduler = new JobScheduler({
     server: server.server,
     client: channel.getClient(),
+    identitySession,
   });
   await scheduler.start();
 

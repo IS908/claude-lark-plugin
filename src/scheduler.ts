@@ -9,6 +9,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { appConfig } from './config.js';
 import { cronJobPrompt } from './prompts.js';
+import type { IdentitySession } from './identity-session.js';
 import {
   listAllJobs,
   writeJob,
@@ -19,6 +20,7 @@ import {
 export interface SchedulerOptions {
   server: Server;
   client: Lark.Client;
+  identitySession: IdentitySession;
 }
 
 // ─── Retry Logic ────────────────────────────────────────────
@@ -71,11 +73,13 @@ export class JobScheduler {
   private timer: NodeJS.Timeout | null = null;
   private server: Server;
   private client: Lark.Client;
+  private identitySession: IdentitySession;
   private running = false;
 
   constructor(opts: SchedulerOptions) {
     this.server = opts.server;
     this.client = opts.client;
+    this.identitySession = opts.identitySession;
   }
 
   /**
@@ -133,8 +137,12 @@ export class JobScheduler {
 
   /**
    * Periodic tick: scan all active jobs and execute due ones.
+   * Also piggybacks a cleanup pass over the identity session to drop
+   * stale entries so the in-memory map does not grow unboundedly.
    */
   private async tick(): Promise<void> {
+    this.identitySession.cleanup();
+
     const jobs = await listAllJobs();
     const now = Date.now();
 
@@ -228,7 +236,7 @@ export class JobScheduler {
     await this.client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: {
-        receive_id: job.meta.target_chat_id,
+        receive_id: job.meta.send_chat_id,
         content: JSON.stringify(msgType === 'text' ? { text: content } : { content }),
         msg_type: msgType,
       },
@@ -237,11 +245,21 @@ export class JobScheduler {
 
   /**
    * prompt type: inject prompt into Claude's channel via MCP notification.
+   *
+   * Each execution runs under a unique thread_id so its IdentitySession entry
+   * does not clobber concurrent inbound human messages in the same chat.
    */
   private async executePromptJob(job: JobFile): Promise<void> {
+    const jobThreadId = `job-${job.meta.id}-${Date.now()}`;
+
+    // Bind the job owner as caller so tools invoked from this Claude turn
+    // (e.g. save_memory, list_jobs) resolve to the job creator, not to any
+    // human who happened to send a message to the same chat.
+    this.identitySession.setCaller(job.meta.send_chat_id, jobThreadId, job.meta.created_by);
+
     const promptContent = cronJobPrompt(
       job.meta.name,
-      job.meta.target_chat_id,
+      job.meta.send_chat_id,
       job.meta.prompt ?? ''
     );
 
@@ -250,7 +268,8 @@ export class JobScheduler {
       params: {
         content: promptContent,
         meta: {
-          chat_id: job.meta.target_chat_id,
+          chat_id: job.meta.send_chat_id,
+          thread_id: jobThreadId,
           source: 'cronjob',
           job_id: job.meta.id,
           job_name: job.meta.name,

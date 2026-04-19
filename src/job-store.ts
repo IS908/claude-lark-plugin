@@ -21,7 +21,12 @@ export interface JobMeta {
   prompt?: string;
   content?: string;
   msg_type?: string;
+  /** Legacy field, equivalent to send_chat_id. Backfilled for forward compatibility. */
   target_chat_id: string;
+  /** Where the job delivers output. Used by list_jobs visibility filter. */
+  send_chat_id: string;
+  /** Where the job was created (debug/audit). For legacy jobs, backfilled from target_chat_id. */
+  origin_chat_id: string;
   status: 'active' | 'paused';
   created_by: string;
   created_at: string;
@@ -150,10 +155,28 @@ function jobPath(id: string): string {
   return path.join(appConfig.jobsDir, `${id}.json`);
 }
 
+/**
+ * Backfill new fields on pre-v0.9 jobs so the rest of the code can rely on them.
+ * Exported for unit testing; production callers should use readJob / listAllJobs.
+ */
+export function backfillJob(job: JobFile): JobFile {
+  if (!job.meta.send_chat_id) job.meta.send_chat_id = job.meta.target_chat_id;
+  if (!job.meta.origin_chat_id) job.meta.origin_chat_id = job.meta.target_chat_id;
+  // Legacy jobs may have empty created_by (the old create_job defaulted to '').
+  // Without a valid owner, update_job / delete_job would permanently reject
+  // every caller. Attribute to the operator via LARK_OWNER_OPEN_ID so the
+  // person running the upgrade can still manage them. If LARK_OWNER_OPEN_ID
+  // is unset, we leave the field empty — operator can set it and restart.
+  if (!job.meta.created_by && appConfig.ownerOpenId) {
+    job.meta.created_by = appConfig.ownerOpenId;
+  }
+  return job;
+}
+
 export async function readJob(id: string): Promise<JobFile | null> {
   try {
     const data = await fs.readFile(jobPath(id), 'utf-8');
-    return JSON.parse(data) as JobFile;
+    return backfillJob(JSON.parse(data) as JobFile);
   } catch {
     return null;
   }
@@ -181,7 +204,7 @@ export async function listAllJobs(): Promise<JobFile[]> {
     for (const file of files.filter(f => f.endsWith('.json'))) {
       try {
         const data = await fs.readFile(path.join(dir, file), 'utf-8');
-        jobs.push(JSON.parse(data) as JobFile);
+        jobs.push(backfillJob(JSON.parse(data) as JobFile));
       } catch (err) {
         console.error(`[job-store] Skipping corrupt job file ${file}:`, err);
       }

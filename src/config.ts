@@ -44,6 +44,22 @@ export const appConfig = {
   maxSearchResults: optionalNumber('LARK_MAX_SEARCH_RESULTS', 2),
   inactivityHours: optionalNumber('LARK_INACTIVITY_HOURS', 3),
 
+  // Identity / privacy
+  ownerOpenId: process.env.LARK_OWNER_OPEN_ID || null,
+  /**
+   * Session entry TTL. Must comfortably exceed the buffer auto-flush window
+   * (LARK_INACTIVITY_HOURS) so that save_memory / save_skill calls triggered
+   * by a flush still resolve to the last real user of the chat.
+   * Default: max(2h, inactivityHours × 2).
+   */
+  identitySessionTtlMs: optionalNumber(
+    'LARK_IDENTITY_SESSION_TTL_MS',
+    Math.max(
+      2 * 60 * 60 * 1000,
+      optionalNumber('LARK_INACTIVITY_HOURS', 3) * 2 * 60 * 60 * 1000,
+    ),
+  ),
+
   // Paths
   memoriesDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'memories'),
   inboxDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'inbox'),

@@ -7,6 +7,8 @@ import { enrichmentPrompt } from './prompts.js';
 import { MessageQueue } from './queue.js';
 import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
+import type { IdentitySession } from './identity-session.js';
+import { TERMINAL_CHAT_ID } from './identity-session.js';
 
 const DEBUG_LOG = path.join(os.homedir(), '.claude', 'channels', 'lark', 'debug.log');
 function debugLog(msg: string) {
@@ -118,12 +120,14 @@ export class LatestMessageTracker {
 export class LarkChannel {
   private client: Lark.Client;
   private nameCache = new Map<string, string>(); // open_id/chat_id → display name
+  private chatTypeCache = new Map<string, 'p2p' | 'group'>(); // chatId → type (populated from inbound events)
   private botOpenId: string = '';
   private wsClient: Lark.WSClient | null = null;
   private queue = new MessageQueue();
   private messageHandler: MessageHandler | null = null;
   private memoryStore: MemoryStore | null = null;
   private conversationBuffer: ConversationBuffer | null = null;
+  private identitySession: IdentitySession | null = null;
   private ackReactions = new Map<string, string>(); // messageId → reactionId
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
   private latestMessageTracker = new LatestMessageTracker();
@@ -152,6 +156,24 @@ export class LarkChannel {
 
   setMemoryStore(store: MemoryStore): void {
     this.memoryStore = store;
+  }
+
+  setIdentitySession(session: IdentitySession): void {
+    this.identitySession = session;
+  }
+
+  /**
+   * Returns true if the given chat_id should be treated as a private
+   * (caller-only visible) chat for rendering-visibility purposes.
+   *
+   * - Real p2p chats: inferred from inbound event chat_type, cached.
+   * - Terminal sentinel: treated as private (the operator is the sole viewer).
+   * - Unknown chat_ids: default to false (treat as group) to bias the filter
+   *   toward less exposure when we have no signal.
+   */
+  isPrivateChat(chatId: string): boolean {
+    if (chatId === TERMINAL_CHAT_ID) return true;
+    return this.chatTypeCache.get(chatId) === 'p2p';
   }
 
   setConversationBuffer(buffer: ConversationBuffer): void {
@@ -368,8 +390,17 @@ export class LarkChannel {
       }
     }
 
+    // Cache chat type for later lookups (e.g. list_jobs visibility filter).
+    if (chatType === 'p2p' || chatType === 'group') {
+      this.chatTypeCache.set(chatId, chatType);
+    }
+
     // Enqueue for sequential per-chat processing
     this.queue.enqueue(chatId, threadId, async () => {
+      // Bind identity for this chat/thread so MCP tools can resolve the
+      // true caller without trusting Claude-declared identity arguments.
+      this.identitySession?.setCaller(chatId, threadId, senderId);
+
       // Record in conversation buffer
       this.conversationBuffer?.record(chatId, {
         role: 'user',
