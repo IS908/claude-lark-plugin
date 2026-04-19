@@ -1,13 +1,34 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { appConfig } from '../config.js';
-import type { MemoryProvider, Episode, EpisodeMeta, Skill } from './interface.js';
+
+export interface Episode {
+  id: string;
+  content: string;
+  timestamp: string;
+  score?: number;
+  chatId?: string;
+  threadId?: string;
+}
+
+export interface EpisodeMeta {
+  chatId: string;
+  threadId?: string;
+  userId?: string;
+}
+
+export interface Skill {
+  name: string;
+  description: string;
+  content: string;
+  score?: number;
+}
 
 /**
- * File-based markdown memory adapter.
+ * Local markdown memory store.
  * Stores memories as .md files under ~/.claude/channels/lark/memories/
  */
-export class FileMemoryProvider implements MemoryProvider {
+export class MemoryStore {
   private baseDir: string;
 
   constructor(baseDir?: string) {

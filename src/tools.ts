@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { appConfig } from './config.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { MemoryProvider } from './memory/interface.js';
+import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { BotMessageTracker, LatestMessageTracker } from './channel.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
@@ -26,7 +26,7 @@ import {
 export function registerTools(
   server: McpServer,
   client: Lark.Client,
-  memoryProvider: MemoryProvider,
+  memoryStore: MemoryStore,
   conversationBuffer?: ConversationBuffer,
   ackReactions?: Map<string, string>,
   botMessageTracker?: BotMessageTracker,
@@ -450,7 +450,7 @@ export function registerTools(
             isError: true,
           };
         }
-        await memoryProvider.saveProfile(open_id, content);
+        await memoryStore.saveProfile(open_id, content);
         return {
           content: [
             { type: 'text' as const, text: `Saved profile for ${open_id}. Reason: ${reason}` },
@@ -465,7 +465,7 @@ export function registerTools(
         };
       }
 
-      await memoryProvider.saveEpisode(type, content, {
+      await memoryStore.saveEpisode(type, content, {
         chatId: chat_id,
         threadId: thread_id,
       });
@@ -495,7 +495,7 @@ export function registerTools(
       }),
     },
     async ({ name, description, content }) => {
-      await memoryProvider.saveSkill(name, description, content);
+      await memoryStore.saveSkill(name, description, content);
       return {
         content: [{ type: 'text' as const, text: `Saved skill "${name}": ${description}` }],
       };

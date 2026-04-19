@@ -4,7 +4,7 @@
 [![node](https://img.shields.io/badge/node-%3E%3D20.0.0-339933?logo=node.js&logoColor=white)](package.json)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-Chat with Claude Code in real time through Feishu (Lark). Pluggable memory with file-based and OpenViking backends.
+Chat with Claude Code in real time through Feishu (Lark). Local-file memory, scheduled jobs, rich media support.
 
 ---
 
@@ -44,7 +44,7 @@ The plugin connects to Feishu via the Lark SDK WebSocket client, receives messag
 
 - Three-layer architecture: Buffer, Episodic, and Semantic memory
 - Auto-flush distillation from conversation buffer to episodic memory
-- Pluggable backends: file-based (default), OpenViking (vector search), mem0 (planned)
+- Local markdown-file storage under `~/.claude/channels/lark/memories/`
 - User profiles, chat episodes, thread episodes, and global skills
 - Memory-enriched context injection on every incoming message
 
@@ -61,7 +61,7 @@ The plugin connects to Feishu via the Lark SDK WebSocket client, receives messag
 - Per-chat message queue for sequential processing within each conversation
 - Single-instance lock to prevent duplicate event handling
 - User and chat ID whitelisting for access control (OR semantics when both lists set)
-- Graceful degradation when memory providers are unavailable
+- Crash recovery for scheduled jobs (missed executions run once on restart)
 
 ---
 
@@ -125,7 +125,7 @@ npx skills add larksuite/cli -y -g
 /lark:configure setup
 ```
 
-This walks you through all configuration options step by step -- credentials, memory provider, filtering, and tuning.
+This walks you through all configuration options step by step -- credentials, filtering, and memory tuning.
 
 **Quick setup:**
 
@@ -185,8 +185,8 @@ node -e "console.log(require('./package.json').version)"
 | Layer | Name | Scope | Injection | Storage |
 |---|---|---|---|---|
 | 1 | Buffer | Per-chat | N/A (in-process) | In-memory ring buffer |
-| 2 | Episodic | Per-chat / per-thread | Cold (search-based) | File / OpenViking / mem0 (planned) |
-| 3 | Semantic | Per-user (profile) or global (skills) | Hot (always loaded) | File / OpenViking / mem0 (planned) |
+| 2 | Episodic | Per-chat / per-thread | Cold (search-based) | Local markdown files |
+| 3 | Semantic | Per-user (profile) or global (skills) | Hot (always loaded) | Local markdown files |
 
 ### Memory Enrichment Pipeline
 
@@ -235,14 +235,9 @@ On every incoming message, the plugin injects relevant memory context in this or
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_PROVIDER` | `file` | Memory backend: `file`, `openviking`, or `mem0` (planned) |
 | `LARK_MIN_SEARCH_SCORE` | `0.3` | Minimum similarity score for memory search results |
 | `LARK_MAX_SEARCH_RESULTS` | `2` | Maximum number of memory search results to inject |
 | `LARK_INACTIVITY_HOURS` | `3` | Hours of inactivity before buffer flush to episodic memory |
-| `OPENVIKING_URL` | `http://localhost:1933` | OpenViking server URL |
-| `OPENVIKING_API_KEY` | (empty) | OpenViking API key |
-| `MEM0_URL` | (empty) | mem0 server URL (planned) |
-| `MEM0_API_KEY` | (empty) | mem0 API key (planned) |
 
 ---
 
@@ -265,18 +260,10 @@ The interactive setup walks through 5 steps, each with the option to skip or use
 Step 1: Credentials
   -> LARK_APP_ID and LARK_APP_SECRET (shows masked current values if already set)
 
-Step 2: Memory Provider
-  -> file (default, zero deps) / openviking (vector search) / mem0 (planned)
-
-Step 3: Backend Config (conditional)
-  -> If openviking: OPENVIKING_URL, OPENVIKING_API_KEY
-  -> If mem0 (planned): MEM0_URL, MEM0_API_KEY
-  -> If file: skipped
-
-Step 4: Filtering (optional)
+Step 2: Filtering (optional)
   -> LARK_ALLOWED_USER_IDS, LARK_ALLOWED_CHAT_IDS
 
-Step 5: Memory Tuning (optional)
+Step 3: Memory Tuning (optional)
   -> LARK_INACTIVITY_HOURS, LARK_MAX_SEARCH_RESULTS, LARK_MIN_SEARCH_SCORE, LARK_TEXT_CHUNK_LIMIT
 ```
 
@@ -346,7 +333,6 @@ The plugin registers the following MCP tools for Claude to use:
 
 - **Node.js** 20+ and npm
 - **Feishu/Lark** custom app with WebSocket mode enabled
-- **OpenViking** (optional) -- for vector-based memory search
 - **lark-cli** (optional) -- for extended Feishu API access (calendar, docs, sheets, tasks, contacts)
 
 ---

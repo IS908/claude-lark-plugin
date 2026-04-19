@@ -5,7 +5,7 @@ import os from 'node:os';
 import { appConfig } from './config.js';
 import { enrichmentPrompt } from './prompts.js';
 import { MessageQueue } from './queue.js';
-import type { MemoryProvider } from './memory/interface.js';
+import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 
 const DEBUG_LOG = path.join(os.homedir(), '.claude', 'channels', 'lark', 'debug.log');
@@ -122,7 +122,7 @@ export class LarkChannel {
   private wsClient: Lark.WSClient | null = null;
   private queue = new MessageQueue();
   private messageHandler: MessageHandler | null = null;
-  private memoryProvider: MemoryProvider | null = null;
+  private memoryStore: MemoryStore | null = null;
   private conversationBuffer: ConversationBuffer | null = null;
   private ackReactions = new Map<string, string>(); // messageId → reactionId
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
@@ -150,8 +150,8 @@ export class LarkChannel {
     this.messageHandler = handler;
   }
 
-  setMemoryProvider(provider: MemoryProvider): void {
-    this.memoryProvider = provider;
+  setMemoryStore(store: MemoryStore): void {
+    this.memoryStore = store;
   }
 
   setConversationBuffer(buffer: ConversationBuffer): void {
@@ -391,7 +391,7 @@ export class LarkChannel {
   }
 
   private async enrichWithMemory(msg: LarkMessage): Promise<string> {
-    if (!this.memoryProvider) return msg.text;
+    if (!this.memoryStore) return msg.text;
 
     const parts: string[] = [];
 
@@ -406,7 +406,7 @@ export class LarkChannel {
     }
 
     // 1. User profile (hot injection — always loaded)
-    const profile = await this.memoryProvider.getProfile(msg.senderId).catch(() => null);
+    const profile = await this.memoryStore.getProfile(msg.senderId).catch(() => null);
     if (profile) {
       parts.push(`[User Profile]\n${profile}`);
     }
@@ -415,7 +415,7 @@ export class LarkChannel {
     if (msg.mentions?.length) {
       for (const mention of msg.mentions) {
         if (mention.id && mention.id !== msg.senderId) {
-          const mentionProfile = await this.memoryProvider.getProfile(mention.id).catch(() => null);
+          const mentionProfile = await this.memoryStore.getProfile(mention.id).catch(() => null);
           if (mentionProfile) {
             parts.push(`[Mentioned User: ${mention.name}]\n${mentionProfile}`);
           }
@@ -425,7 +425,7 @@ export class LarkChannel {
 
     // 3. Thread episodes (cold injection — semantic search with score filtering)
     if (msg.threadId) {
-      const threadEps = await this.memoryProvider
+      const threadEps = await this.memoryStore
         .searchEpisodes(searchQuery, { chatId: msg.chatId, threadId: msg.threadId })
         .catch(() => []);
       const filtered = threadEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
@@ -437,7 +437,7 @@ export class LarkChannel {
     }
 
     // 4. Chat episodes (cold injection — semantic search with score filtering)
-    const chatEps = await this.memoryProvider
+    const chatEps = await this.memoryStore
       .searchEpisodes(searchQuery, { chatId: msg.chatId })
       .catch(() => []);
     const filteredChat = chatEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
@@ -448,7 +448,7 @@ export class LarkChannel {
     }
 
     // 5. Skills (cold injection — inject name + description + path only, not full content)
-    const skills = await this.memoryProvider.searchSkills(searchQuery).catch(() => []);
+    const skills = await this.memoryStore.searchSkills(searchQuery).catch(() => []);
     const filteredSkills = skills.filter(s => s.score === undefined || s.score >= appConfig.minSearchScore);
     for (const skill of filteredSkills) {
       const scoreTag = skill.score !== undefined ? ` · score:${skill.score.toFixed(2)}` : '';

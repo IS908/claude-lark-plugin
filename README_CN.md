@@ -4,7 +4,7 @@
 [![node](https://img.shields.io/badge/node-%3E%3D20.0.0-339933?logo=node.js&logoColor=white)](package.json)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-通过飞书（Lark）与 Claude Code 实时聊天。支持可插拔记忆系统，内置文件存储和 OpenViking 后端。
+通过飞书（Lark）与 Claude Code 实时聊天。本地文件记忆、定时任务、富媒体支持。
 
 ---
 
@@ -40,7 +40,7 @@
 
 - 三层架构：Buffer（短期）/ 情景记忆（中期）/ 语义记忆（长期）
 - 自动蒸馏：对话静默超时后自动触发摘要
-- 可插拔后端：文件存储（内置）、OpenViking（向量搜索）、mem0（计划中）
+- 本地 markdown 文件存储，路径 `~/.claude/channels/lark/memories/`
 
 ### 定时任务（CronJob）
 
@@ -55,7 +55,7 @@
 - 每个会话独立消息队列，同一会话按序处理
 - 单实例锁，防止重复启动
 - 发送者/群聊白名单过滤（两个列表同时配置时为 OR 关系）
-- 优雅降级处理
+- 定时任务崩溃恢复（错过的任务重启后补执行一次）
 
 ---
 
@@ -109,7 +109,7 @@ npx skills add larksuite/cli -y -g
 /lark:configure setup
 ```
 
-引导式完成所有配置 -- 凭据、记忆后端、访问过滤、参数调优。
+引导式完成所有配置 -- 凭据、访问过滤、记忆参数调优。
 
 **快速配置：**
 
@@ -219,14 +219,9 @@ node -e "console.log(require('./package.json').version)"
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `MEMORY_PROVIDER` | `file` | 记忆后端：`file`、`openviking` 或 `mem0`（计划中） |
-| `LARK_MIN_SEARCH_SCORE` | `0.3` | 最低相关度分数（仅向量后端生效） |
+| `LARK_MIN_SEARCH_SCORE` | `0.3` | 最低相关度分数 |
 | `LARK_MAX_SEARCH_RESULTS` | `2` | 每次查询返回的最大情景数 |
 | `LARK_INACTIVITY_HOURS` | `3` | 自动蒸馏触发的静默时长（小时） |
-| `OPENVIKING_URL` | `http://localhost:1933` | OpenViking 服务地址 |
-| `OPENVIKING_API_KEY` | （空） | OpenViking API 密钥 |
-| `MEM0_URL` | （空） | mem0 服务地址（计划中） |
-| `MEM0_API_KEY` | （空） | mem0 API 密钥（计划中） |
 
 ---
 
@@ -243,24 +238,16 @@ node -e "console.log(require('./package.json').version)"
 
 ### `/lark:configure setup` 流程
 
-交互式引导分 5 步，每步可选择跳过或使用默认值：
+交互式引导分 3 步，每步可选择跳过或使用默认值：
 
 ```
 第 1 步：凭据
   -> LARK_APP_ID 和 LARK_APP_SECRET（已有配置时显示脱敏值，可选保留/更新）
 
-第 2 步：记忆后端
-  -> file（默认，零依赖）/ openviking（向量语义搜索）/ mem0（计划中）
-
-第 3 步：后端配置（按选择分支）
-  -> openviking: OPENVIKING_URL、OPENVIKING_API_KEY
-  -> mem0（计划中）: MEM0_URL、MEM0_API_KEY
-  -> file: 跳过
-
-第 4 步：访问过滤（可选）
+第 2 步：访问过滤（可选）
   -> LARK_ALLOWED_USER_IDS、LARK_ALLOWED_CHAT_IDS
 
-第 5 步：记忆参数调优（可选）
+第 3 步：记忆参数调优（可选）
   -> LARK_INACTIVITY_HOURS、LARK_MAX_SEARCH_RESULTS、LARK_MIN_SEARCH_SCORE、LARK_TEXT_CHUNK_LIMIT
 ```
 

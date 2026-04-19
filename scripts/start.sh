@@ -11,6 +11,5 @@ fi
 
 echo >&2 "Starting claude-lark-plugin..."
 echo >&2 "  App ID: ${LARK_APP_ID:-<not set>}"
-echo >&2 "  Memory: ${MEMORY_PROVIDER:-file}"
 
 exec claude --dangerously-load-development-channels "plugin:lark@claude-lark-plugin" --dangerously-skip-permissions

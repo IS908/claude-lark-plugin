@@ -4,7 +4,7 @@
  * Exits non-zero if any assertion fails.
  */
 import { registerTools } from '../src/tools.js';
-import type { MemoryProvider } from '../src/memory/interface.js';
+import type { MemoryStore } from '../src/memory/file.js';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -53,15 +53,18 @@ function mockLarkClient() {
   };
 }
 
-/** Minimal no-op MemoryProvider */
-const noopMemory: MemoryProvider = {
+/** Minimal no-op MemoryStore (matches the real class shape; methods reply-card doesn't use are still present as no-ops). */
+const noopMemory = {
+  healthCheck: async () => true,
   getProfile: async () => null,
   saveProfile: async () => {},
-  getEpisodes: async () => [],
+  searchEpisodes: async () => [],
   saveEpisode: async () => {},
-  getSkills: async () => [],
+  listEpisodes: async () => [],
+  deleteEpisodes: async () => {},
+  searchSkills: async () => [],
   saveSkill: async () => {},
-} as MemoryProvider;
+} as unknown as MemoryStore;
 
 /** ConversationBuffer that records calls */
 function makeBuffer() {

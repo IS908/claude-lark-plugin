@@ -28,11 +28,7 @@ src/job-store.ts    – Job CRUD: read/write JSON files, sanitizeJobId, expandSc
 src/scheduler.ts    – JobScheduler: periodic scan (60s), trigger execution, crash recovery
 src/queue.ts        – Per-thread sequential message queue
 src/memory/
-  interface.ts      – MemoryProvider interface (Episodes, Profiles, Skills)
-  factory.ts        – Provider factory (file | openviking | mem0 stub)
-  file.ts           – File-based provider (default, stores in ~/.claude/channels/lark/memories/)
-  openviking.ts     – OpenViking vector search provider (stub)
-  mem0.ts           – mem0 managed memory provider (stub)
+  file.ts           – MemoryStore: local markdown files under ~/.claude/channels/lark/memories/ (Episodes, Profiles, Skills)
   buffer.ts         – In-memory ring buffer with auto-flush on inactivity
   distiller.ts      – Builds flush prompts to distill buffer into episodic memory
 ```
@@ -49,7 +45,7 @@ src/memory/
 - **Stdio transport**: MCP server communicates via stdin/stdout; all debug logging goes to `console.error`.
 - **Single-instance lock**: PID-based lock file in `/tmp/` prevents duplicate WebSocket connections.
 - **Config location**: All user config lives at `~/.claude/channels/lark/.env`, not in the repo.
-- **Memory is pluggable**: `MemoryProvider` interface with three backends; `file` and `openviking` are implemented (mem0 is a stub).
+- **Memory is local-only**: All memory (profiles, episodes, skills) lives as markdown files under `~/.claude/channels/lark/memories/`. No remote backends — this keeps the trust boundary at OS file permissions and avoids vector-index policy questions for sensitive content.
 - **Image auto-download**: Images are downloaded to `~/.claude/channels/lark/inbox/` on receive. Claude reads local paths via `image_path` in notification meta.
 - **Ack reaction**: Configurable emoji (`LARK_ACK_EMOJI`, default `MeMeMe`) sent on receive, auto-revoked after reply. Fire-and-forget, won't block message processing.
 - **Bot message tracking**: `BotMessageTracker` (default 500, FIFO, configurable via `LARK_BOT_MESSAGE_TRACKER_SIZE`) tracks bot-sent message IDs. Used to filter reaction events — only reactions on bot messages are forwarded to Claude.
