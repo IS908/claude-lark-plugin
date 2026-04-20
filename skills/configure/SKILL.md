@@ -41,7 +41,17 @@ LARK_MIN_SEARCH_SCORE:     0.3
 === Filtering ===
 LARK_ALLOWED_USER_IDS:     (not set)
 LARK_ALLOWED_CHAT_IDS:     (not set)
+
+=== Messaging ===
 LARK_TEXT_CHUNK_LIMIT:     4000
+
+=== Acknowledgement ===
+LARK_ACK_EMOJI:                MeMeMe
+LARK_BOT_MESSAGE_TRACKER_SIZE: 500
+
+=== CronJob ===
+LARK_CRON_SCAN_INTERVAL:   60
+LARK_CRON_TIMEZONE:        (system tz)
 ```
 
 5. Suggest next steps:
@@ -83,17 +93,27 @@ Ask if the user wants to restrict access:
 - `LARK_ALLOWED_CHAT_IDS` — comma-separated chat ID whitelist. Empty = allow all.
 - If user says "skip" or "no", leave these empty.
 
-### Step 3: Memory tuning (optional)
+### Step 3: CronJob timezone (optional)
 
-Ask if the user wants to adjust memory settings (or use defaults):
-- `LARK_INACTIVITY_HOURS` — hours of silence before auto-flush (default: 3)
+Ask if the user wants to set a specific timezone for cronjob schedules:
+- `LARK_CRON_TIMEZONE` — IANA timezone name (e.g. `Asia/Shanghai`, `UTC`). Default: system timezone. This affects how cron hours map to wall-clock time — worth setting explicitly for servers that may move between timezones.
+
+If user says "use system tz" or "skip", leave unset.
+
+### Step 4: Advanced tuning (optional)
+
+Ask if the user wants to adjust any of these advanced settings (or use defaults):
+- `LARK_INACTIVITY_HOURS` — hours of silence before memory auto-flush (default: 3)
 - `LARK_MAX_SEARCH_RESULTS` — max episodes injected per message (default: 2)
 - `LARK_MIN_SEARCH_SCORE` — minimum relevance score for episode search (default: 0.3)
 - `LARK_TEXT_CHUNK_LIMIT` — max chars per reply chunk (default: 4000)
+- `LARK_ACK_EMOJI` — emoji reaction on message receive, empty to disable (default: `MeMeMe`)
+- `LARK_BOT_MESSAGE_TRACKER_SIZE` — max bot message IDs tracked for reaction filtering (default: 500)
+- `LARK_CRON_SCAN_INTERVAL` — cronjob scan interval in seconds (default: 60)
 
 If user says "use defaults" or "skip", leave these at defaults.
 
-### Step 4: Write config
+### Step 5: Write config
 
 1. Run `mkdir -p ~/.claude/channels/lark`.
 2. Read existing `.env` if present.
@@ -110,7 +130,11 @@ If user says "use defaults" or "skip", leave these at defaults.
 2. Remove all recognized keys:
    `LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_ALLOWED_USER_IDS`,
    `LARK_ALLOWED_CHAT_IDS`, `LARK_TEXT_CHUNK_LIMIT`, `LARK_INACTIVITY_HOURS`,
-   `LARK_MAX_SEARCH_RESULTS`, `LARK_MIN_SEARCH_SCORE`, `LARK_ENABLED_SKILLS`.
+   `LARK_MAX_SEARCH_RESULTS`, `LARK_MIN_SEARCH_SCORE`,
+   `LARK_ACK_EMOJI`, `LARK_BOT_MESSAGE_TRACKER_SIZE`,
+   `LARK_CRON_SCAN_INTERVAL`, `LARK_CRON_TIMEZONE`,
+   `LARK_OWNER_OPEN_ID`, `LARK_IDENTITY_SESSION_TTL_MS`,
+   `LARK_PRIVACY_RULES_FILE`, `LARK_AUDIT_LOG`.
 3. If the file becomes empty, delete it.
 4. Confirm: "All configuration cleared."
 
@@ -127,8 +151,11 @@ If user says "use defaults" or "skip", leave these at defaults.
 | `LARK_MIN_SEARCH_SCORE` | Memory | No | `0.3` |
 | `LARK_ALLOWED_USER_IDS` | Filtering | No | (empty) |
 | `LARK_ALLOWED_CHAT_IDS` | Filtering | No | (empty) |
-| `LARK_TEXT_CHUNK_LIMIT` | Filtering | No | `4000` |
-| `LARK_ENABLED_SKILLS` | Filtering | No | (empty) |
+| `LARK_TEXT_CHUNK_LIMIT` | Messaging | No | `4000` |
+| `LARK_ACK_EMOJI` | Acknowledgement | No | `MeMeMe` |
+| `LARK_BOT_MESSAGE_TRACKER_SIZE` | Acknowledgement | No | `500` |
+| `LARK_CRON_SCAN_INTERVAL` | CronJob | No | `60` |
+| `LARK_CRON_TIMEZONE` | CronJob | No | system timezone |
 | `LARK_OWNER_OPEN_ID` | Identity | No | (empty) |
 | `LARK_IDENTITY_SESSION_TTL_MS` | Identity | No | auto |
 | `LARK_PRIVACY_RULES_FILE` | Privacy | No | `~/.claude/channels/lark/privacy-rules.md` |

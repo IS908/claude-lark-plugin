@@ -15,7 +15,7 @@
                                                   <── 回复 / 编辑 / 表情 ──<
 ```
 
-本插件以 MCP Server 形式运行在 Claude Code 内部。通过 WebSocket 连接飞书开放平台（无需公网回调地址），接收消息后注入记忆上下文，转发给 Claude 处理。Claude 通过内置的 6 个 MCP 工具进行回复。lark-cli 的各项技能负责处理更广泛的飞书 API 操作（日历、文档、表格、任务、通讯录等）。
+本插件以 MCP Server 形式运行在 Claude Code 内部。通过 WebSocket 连接飞书开放平台（无需公网回调地址），接收消息后注入记忆上下文，转发给 Claude 处理。Claude 通过内置的 12 个 MCP 工具进行回复、编辑、加表情、下载附件，以及管理记忆与定时任务。lark-cli 的各项技能负责处理更广泛的飞书 API 操作（日历、文档、表格、任务、通讯录等）。
 
 ---
 
@@ -225,10 +225,26 @@ node -e "console.log(require('./package.json').version)"
 | `LARK_ALLOWED_CHAT_IDS` | （空） | 群聊 ID 白名单，逗号分隔 |
 
 > **白名单语义**：两个列表都设置时，发送者在 `LARK_ALLOWED_USER_IDS` 里**或**聊天在 `LARK_ALLOWED_CHAT_IDS` 里即允许（OR 关系）。只设置一个列表时，只用那个列表过滤。
+
+### 可选 —— 消息
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
 | `LARK_TEXT_CHUNK_LIMIT` | `4000` | 单条消息最大字符数 |
+
+### 可选 —— 确认回应
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LARK_ACK_EMOJI` | `MeMeMe` | 收到消息时的 emoji 回应。留空可禁用 |
+| `LARK_BOT_MESSAGE_TRACKER_SIZE` | `500` | 用于 reaction 过滤的 bot 消息 ID 追踪上限（FIFO） |
+
+### 可选 —— 定时任务
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
 | `LARK_CRON_SCAN_INTERVAL` | `60` | 定时任务扫描间隔（秒） |
 | `LARK_CRON_TIMEZONE` | 系统时区 | IANA 时区名（如 `Asia/Shanghai`、`UTC`），影响 cron 表达式中小时字段的墙钟映射 |
-| `LARK_ENABLED_SKILLS` | （空） | lark-cli 技能白名单，用于 start.sh |
 
 ### 可选 -- 记忆
 
@@ -262,7 +278,7 @@ node -e "console.log(require('./package.json').version)"
 
 ### `/lark:configure setup` 流程
 
-交互式引导分 3 步，每步可选择跳过或使用默认值：
+交互式引导分 5 步，每步可选择跳过或使用默认值：
 
 ```
 第 1 步：凭据
@@ -271,8 +287,16 @@ node -e "console.log(require('./package.json').version)"
 第 2 步：访问过滤（可选）
   -> LARK_ALLOWED_USER_IDS、LARK_ALLOWED_CHAT_IDS
 
-第 3 步：记忆参数调优（可选）
-  -> LARK_INACTIVITY_HOURS、LARK_MAX_SEARCH_RESULTS、LARK_MIN_SEARCH_SCORE、LARK_TEXT_CHUNK_LIMIT
+第 3 步：CronJob（可选）
+  -> LARK_CRON_TIMEZONE
+
+第 4 步：高级调优（可选）
+  -> LARK_INACTIVITY_HOURS、LARK_MAX_SEARCH_RESULTS、LARK_MIN_SEARCH_SCORE、
+     LARK_TEXT_CHUNK_LIMIT、LARK_ACK_EMOJI、LARK_BOT_MESSAGE_TRACKER_SIZE、
+     LARK_CRON_SCAN_INTERVAL
+
+第 5 步：写入配置
+  -> ~/.claude/channels/lark/.env
 ```
 
 所有配置写入 `~/.claude/channels/lark/.env`。修改后需重启 session 或 reload 插件生效。
@@ -285,27 +309,7 @@ node -e "console.log(require('./package.json').version)"
 
 lark-cli 负责：完整的飞书 API（日历、文档、表格、任务、通讯录等 21 项技能）。
 
-`scripts/start.sh` 同时加载两者。用户通过 `.env` 中的 `LARK_ENABLED_SKILLS` 配置加载哪些 lark-cli 技能：
-
-```dotenv
-LARK_ENABLED_SKILLS=lark-im,lark-contact,lark-doc,lark-calendar,lark-task,lark-wiki
-```
-
----
-
-## Token 优化
-
-`scripts/start.sh` 通过 `LARK_ENABLED_SKILLS` 过滤 Claude Code 系统提示词中的技能列表，仅加载指定技能，节省数千个 token。
-
-```bash
-# 默认加载的技能
-LARK_ENABLED_SKILLS="${LARK_ENABLED_SKILLS:-lark-im,lark-contact,lark-doc,lark-calendar,lark-task}"
-
-# 启动插件
-exec claude --dangerously-load-development-channels plugin:lark@claude-lark-plugin
-```
-
-如需增减技能，在 `.env` 文件中修改 `LARK_ENABLED_SKILLS` 即可。
+安装 lark-cli 后，其技能会由 Claude Code 与本插件一同加载。
 
 ---
 
