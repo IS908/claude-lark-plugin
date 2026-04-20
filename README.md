@@ -239,11 +239,26 @@ On every incoming message, the plugin injects relevant memory context in this or
 | `LARK_ALLOWED_CHAT_IDS` | (empty) | Comma-separated list of allowed chat IDs. Empty means all chats allowed. |
 
 > **Whitelist semantics:** when both lists are set, a message is accepted if **either** the sender is in `LARK_ALLOWED_USER_IDS` **or** the chat is in `LARK_ALLOWED_CHAT_IDS` (OR). Setting only one list gates on that list alone.
+
+### Optional -- Messaging
+
+| Variable | Default | Description |
+|---|---|---|
 | `LARK_TEXT_CHUNK_LIMIT` | `4000` | Maximum characters per message chunk |
+
+### Optional -- Acknowledgement
+
+| Variable | Default | Description |
+|---|---|---|
 | `LARK_ACK_EMOJI` | `MeMeMe` | Emoji reaction on message receive. Set to empty string to disable. |
+| `LARK_BOT_MESSAGE_TRACKER_SIZE` | `500` | Max bot-sent message IDs tracked for reaction filtering (FIFO) |
+
+### Optional -- CronJob
+
+| Variable | Default | Description |
+|---|---|---|
 | `LARK_CRON_SCAN_INTERVAL` | `60` | CronJob scheduler scan interval in seconds |
 | `LARK_CRON_TIMEZONE` | system timezone | IANA timezone for cron schedule evaluation (e.g. `Asia/Shanghai`, `UTC`). Affects how hours in cron expressions map to wall-clock time. |
-| `LARK_ENABLED_SKILLS` | `lark-im,lark-contact,lark-doc,lark-calendar,lark-task` | Comma-separated skills to load alongside the plugin |
 
 ### Optional -- Memory
 
@@ -286,8 +301,16 @@ Step 1: Credentials
 Step 2: Filtering (optional)
   -> LARK_ALLOWED_USER_IDS, LARK_ALLOWED_CHAT_IDS
 
-Step 3: Memory Tuning (optional)
-  -> LARK_INACTIVITY_HOURS, LARK_MAX_SEARCH_RESULTS, LARK_MIN_SEARCH_SCORE, LARK_TEXT_CHUNK_LIMIT
+Step 3: CronJob (optional)
+  -> LARK_CRON_TIMEZONE
+
+Step 4: Advanced tuning (optional)
+  -> LARK_INACTIVITY_HOURS, LARK_MAX_SEARCH_RESULTS, LARK_MIN_SEARCH_SCORE,
+     LARK_TEXT_CHUNK_LIMIT, LARK_ACK_EMOJI, LARK_BOT_MESSAGE_TRACKER_SIZE,
+     LARK_CRON_SCAN_INTERVAL
+
+Step 5: Write config
+  -> ~/.claude/channels/lark/.env
 ```
 
 All values are written to `~/.claude/channels/lark/.env`. Changes require a session restart or plugin reload to take effect.
@@ -296,28 +319,7 @@ All values are written to `~/.claude/channels/lark/.env`. Changes require a sess
 
 ## lark-cli Integration
 
-Install [lark-cli](https://github.com/nicepkg/lark-cli) for full Feishu API access beyond messaging -- calendar, docs, sheets, tasks, contacts, and more. The `scripts/start.sh` launcher loads a configurable set of lark-cli skills alongside the plugin.
-
-```bash
-# Default skills loaded by start.sh:
-# lark-im, lark-contact, lark-doc, lark-calendar, lark-task
-```
-
-Override with the `LARK_ENABLED_SKILLS` environment variable to add or remove skills.
-
----
-
-## Token Optimization
-
-Use `scripts/start.sh` with `LARK_ENABLED_SKILLS` to control which skills are loaded. Loading fewer skills reduces the system prompt size and token consumption per request.
-
-```bash
-# Minimal setup -- messaging only
-LARK_ENABLED_SKILLS=lark-im bash scripts/start.sh
-
-# Full setup
-LARK_ENABLED_SKILLS=lark-im,lark-contact,lark-doc,lark-calendar,lark-task,lark-sheets bash scripts/start.sh
-```
+Install [lark-cli](https://github.com/nicepkg/lark-cli) for full Feishu API access beyond messaging -- calendar, docs, sheets, tasks, contacts, and more. Once installed, lark-cli skills are loaded by Claude Code alongside this plugin.
 
 ---
 

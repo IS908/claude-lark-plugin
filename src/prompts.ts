@@ -94,7 +94,7 @@ export const mcpServerInstructions: string = [
   'Each reply targets exactly one <channel> notification: pass its message_id as reply_to and its thread_id (if present) as thread_id. Do not cross fields between different notifications.',
   'Meta image_path → Read that file. Meta attachment_file_id → call download_attachment(message_id, file_key) then Read the returned path.',
   'CronJob notifications carry source=\'cronjob\'. Dispatch to a subagent so the main thread stays responsive to Feishu messages.',
-  'Sensitive tools (save_memory, create_job, list_jobs, update_job, delete_job) authorize the caller server-side from chat_id + thread_id. Always pass BOTH verbatim from the current notification\'s metadata — never substitute sentinels like "__terminal__" for a real chat_id.',
+  'Sensitive tools (save_memory, what_do_you_know, forget_memory, create_job, list_jobs, update_job, delete_job) authorize the caller server-side from chat_id + thread_id. Always pass BOTH verbatim from the current notification\'s metadata — never substitute sentinels like "__terminal__" for a real chat_id.',
 ].join('\n');
 
 /**
