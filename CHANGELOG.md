@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.0] - 2026-04-21
+
+First stable release. This version marks the project as production-ready: the core feature set (messaging, memory, cronjobs, privacy tiers, cards, reactions, scheduled jobs) is complete, and every env var read by the codebase is now discoverable via `.env.example`, `README.md` / `README_CN.md`, and `/lark:configure` — with no remaining stale references to removed variables.
+
+### Added
+- `LARK_BOT_MESSAGE_TRACKER_SIZE` now documented in `README.md` and `README_CN.md` env-var tables (previously only in `CLAUDE.md` and `.env.example`).
+
+### Fixed
+- Config documentation drift (#37): `.env.example` and `/lark:configure` skill now document all 16 env vars actually read by the codebase (14 from `src/config.ts` plus `LARK_PRIVACY_RULES_FILE` from `src/privacy-rules.ts` and `LARK_AUDIT_LOG` from `src/audit-log.ts`). Adds Acknowledgement + CronJob sections; `/lark:configure setup` interactive flow now has 5 steps (Credentials / Filtering / CronJob timezone / Advanced tuning / Write config); `clear` command removes all 16 recognized keys (was 9). README setup-flow description also updated to mirror the 5-step flow.
+
+### Removed
+- All stale references to `LARK_ENABLED_SKILLS` from `README.md`, `README_CN.md`, `.env.example`, and `/lark:configure`. The variable was formally removed from `scripts/start.sh` in v0.5.2 but lingered in docs for 5 releases. The "Token Optimization" README section (which documented a skill-filtering feature that no longer exists) is also removed.
+
+### Changed
+- Version bumped to 1.0.0 to signal stability.
+
 ## [0.11.1] - 2026-04-20
 
 Two cleanups landed together:
@@ -273,6 +289,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.0
 [0.11.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.1
 [0.11.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.0
 [0.10.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.10.0
