@@ -25,6 +25,8 @@ export interface JobMeta {
   target_chat_id: string;
   /** Where the job was created (debug/audit). For legacy jobs, backfilled from target_chat_id. */
   origin_chat_id: string;
+  /** Optional model override for prompt-type jobs (e.g. "sonnet", "haiku"). Passed in notification meta so Claude dispatches the subagent with the specified model. */
+  model?: string;
   status: 'active' | 'paused';
   created_by: string;
   created_at: string;
