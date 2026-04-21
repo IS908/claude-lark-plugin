@@ -273,6 +273,7 @@ export class JobScheduler {
           source: 'cronjob',
           job_id: job.meta.id,
           job_name: job.meta.name,
+          ...(job.meta.model ? { model: job.meta.model } : {}),
         },
       },
     });

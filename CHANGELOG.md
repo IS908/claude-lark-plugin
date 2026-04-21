@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.1] - 2026-04-21
+
+Small follow-ups on top of 1.0.0: prompt-type CronJobs can now override which model the dispatched subagent uses, and the `reply` tool correctly threads P2P replies onto the latest inbound message even when Claude omits `reply_to`.
+
+### Added
+- **Per-job model override** (#47) — `JobMeta` gains an optional `model` field (e.g. `"sonnet"`, `"haiku"`, `"opus"`). `create_job` / `update_job` accept a `model` parameter; `update_job` with an empty string clears the override. When set, the scheduler forwards `model` in the `notifications/claude/channel` meta so the dispatched subagent executes on the specified model. Only applies to `type=prompt` jobs; `type=message` jobs ignore it. `list_jobs` owner view surfaces `Model: <name>` when set.
+
+### Fixed
+- **P2P `reply_to` auto-fill** (#48) — the `reply` tool previously only auto-filled `reply_to` from `latestMessageTracker` when `thread_id` was present, which meant private-chat replies without an explicit `reply_to` sent as standalone messages instead of threading onto the latest inbound message. The `thread_id` precondition is dropped; `LatestMessageTracker.getLatest(chat_id, thread_id?)` already handles the undefined case by keying on `chat_id` alone. Group-chat behavior unchanged; explicit `reply_to` from Claude still wins.
+
 ## [1.0.0] - 2026-04-21
 
 First stable release. This version marks the project as production-ready: the core feature set (messaging, memory, cronjobs, privacy tiers, cards, reactions, scheduled jobs) is complete, and every env var read by the codebase is now discoverable via `.env.example`, `README.md` / `README_CN.md`, and `/lark:configure` — with no remaining stale references to removed variables.

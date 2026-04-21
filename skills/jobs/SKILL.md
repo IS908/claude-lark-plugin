@@ -71,7 +71,7 @@ retrospectively if they suspect someone else used their terminal.
 ## Job Types
 
 - **message**: Send fixed content directly via Feishu API. Deterministic, no Claude involvement. Use for critical notifications.
-- **prompt**: Inject a prompt for Claude to execute. Claude thinks, may call tools, and replies to the target chat. Best-effort.
+- **prompt**: Inject a prompt for Claude to execute. Claude thinks, may call tools, and replies to the target chat. Best-effort. Optionally pass `model` (e.g. `sonnet`, `haiku`, `opus`) to override which model the dispatched subagent uses.
 
 ## Schedule Formats
 

@@ -126,14 +126,15 @@ export function registerTools(
     },
     async ({ chat_id, text, card, reply_to, thread_id, format, footer, files }) => {
       // Auto-correct reply_to from the plugin's per-thread tracker when Claude
-      // omits it but passes thread_id. Explicit reply_to from Claude always wins.
+      // omits it. Works for both threaded and non-threaded (P2P) messages.
+      // Explicit reply_to from Claude always wins.
       let effectiveReplyTo = reply_to;
-      if (!effectiveReplyTo && thread_id && latestMessageTracker) {
+      if (!effectiveReplyTo && latestMessageTracker) {
         const latest = latestMessageTracker.getLatest(chat_id, thread_id);
         if (latest) {
           effectiveReplyTo = latest.messageId;
           console.error(
-            `[tools] Auto-filled reply_to=${latest.messageId} for thread ${thread_id}`
+            `[tools] Auto-filled reply_to=${latest.messageId} for chat=${chat_id} thread=${thread_id ?? '(none)'}`
           );
         }
       }
@@ -579,6 +580,10 @@ export function registerTools(
         target_chat_id: z
           .string()
           .describe('Chat ID that receives job output. Used by scheduler delivery and list_jobs visibility filter.'),
+        model: z
+          .string()
+          .optional()
+          .describe('Model override for prompt-type jobs (e.g. "sonnet", "haiku", "opus"). When set, the subagent executing this job uses the specified model instead of the default.'),
         chat_id: z
           .string()
           .describe('Chat ID where this create_job call was triggered — used to resolve caller identity and to populate origin_chat_id'),
@@ -590,8 +595,8 @@ export function registerTools(
           ),
       }),
     },
-    async ({ name, type, schedule, prompt, content, target_chat_id, chat_id, thread_id }) => {
-      const auditArgs = { name, type, schedule, target_chat_id, chat_id, thread_id };
+    async ({ name, type, schedule, prompt, content, target_chat_id, model, chat_id, thread_id }) => {
+      const auditArgs = { name, type, schedule, target_chat_id, model, chat_id, thread_id };
       const auth = resolveCaller('create_job', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const { caller } = auth;
@@ -651,6 +656,7 @@ export function registerTools(
           schedule_human: scheduleHuman,
           ...(type === 'prompt' ? { prompt } : { content, msg_type: 'text' }),
           target_chat_id,
+          ...(model ? { model } : {}),
           origin_chat_id: chat_id,
           status: 'active',
           created_by: caller,
@@ -734,7 +740,8 @@ export function registerTools(
         if (!isPrivate && !isOwner) {
           return `${statusIcon} **${j.meta.id}** (${j.meta.type}) — ${j.meta.schedule_human}\n   By: ${j.meta.created_by} | Next: ${j.runtime.next_run_at}`;
         }
-        return `${statusIcon} **${j.meta.id}** (${j.meta.type}) — ${j.meta.schedule_human}\n   Next: ${j.runtime.next_run_at} | Last: ${lastRun} | Runs: ${j.runtime.run_count}${error}`;
+        const modelNote = j.meta.model ? ` | Model: ${j.meta.model}` : '';
+        return `${statusIcon} **${j.meta.id}** (${j.meta.type}) — ${j.meta.schedule_human}\n   Next: ${j.runtime.next_run_at} | Last: ${lastRun} | Runs: ${j.runtime.run_count}${modelNote}${error}`;
       });
 
       void audit('list_jobs', caller, auditArgs, 'ok');
@@ -762,6 +769,10 @@ export function registerTools(
         prompt: z.string().optional().describe('New prompt (type=prompt)'),
         content: z.string().optional().describe('New content (type=message)'),
         name: z.string().optional().describe('New display name'),
+        model: z
+          .string()
+          .optional()
+          .describe('Model override for prompt-type jobs (e.g. "sonnet", "haiku", "opus"). Pass empty string to clear.'),
         chat_id: z.string().describe('Chat ID where this update call is acting from'),
         thread_id: z
           .string()
@@ -771,8 +782,8 @@ export function registerTools(
           ),
       }),
     },
-    async ({ id, status, schedule, prompt, content, name, chat_id, thread_id }) => {
-      const auditArgs = { id, status, schedule, name, chat_id, thread_id };
+    async ({ id, status, schedule, prompt, content, name, model, chat_id, thread_id }) => {
+      const auditArgs = { id, status, schedule, name, model, chat_id, thread_id };
       const auth = resolveCaller('update_job', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const { caller } = auth;
@@ -820,6 +831,7 @@ export function registerTools(
       if (name !== undefined) job.meta.name = name;
       if (prompt !== undefined) job.meta.prompt = prompt;
       if (content !== undefined) job.meta.content = content;
+      if (model !== undefined) job.meta.model = model || undefined; // empty string clears
       if (expandedSchedule) {
         job.meta.schedule = expandedSchedule.cron;
         job.meta.schedule_human = expandedSchedule.human;
