@@ -18,6 +18,66 @@ function lineHash(text: string): string {
   return createHash('sha1').update(text).digest('hex').slice(0, 8);
 }
 
+/** Normalize a profile line for deduplication (not for storage). */
+function normalizeProfileLine(line: string): string {
+  return line.trim().replace(/^[-*]\s+/, '').toLowerCase();
+}
+
+/**
+ * Merge new profile lines into an existing tier file body.
+ *
+ * Dedup rules:
+ * - Case-insensitive line match after trim + leading-bullet strip.
+ * - Punctuation is **not** normalized — "prefers tea" and "prefers tea."
+ *   are kept as distinct lines to avoid silent merges.
+ *
+ * Original capitalization and punctuation are preserved in the output.
+ *
+ * Incoming lines without a `-`/`*` bullet marker are normalized on write to
+ * `- <line>` so the tier file remains a well-formed markdown bullet list.
+ *
+ * Near-duplicates (prefix containment after normalization) are logged to
+ * stderr to help operators notice redundant writes, but are still preserved.
+ */
+export function mergeProfileLines(
+  existing: string,
+  incoming: string,
+  ctx?: { userId?: string; tier?: Tier },
+): string {
+  const existingLinesRaw = existing.split('\n').filter((l) => l.trim());
+  const existingKeys = new Set(existingLinesRaw.map(normalizeProfileLine));
+  const existingNormalized = existingLinesRaw.map(normalizeProfileLine);
+
+  const newLines: string[] = [];
+  for (const raw of incoming.split('\n')) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const key = normalizeProfileLine(trimmed);
+    if (existingKeys.has(key)) continue; // exact match → skip
+    newLines.push(trimmed);
+    existingKeys.add(key); // also dedupe within the incoming batch
+
+    // Near-duplicate warning: prefix-containment either direction.
+    for (const other of existingNormalized) {
+      if (key !== other && (key.startsWith(other) || other.startsWith(key))) {
+        const where = ctx?.userId && ctx?.tier ? ` in ${ctx.userId}/${ctx.tier}.md` : '';
+        console.error(
+          `[memory] Possible near-duplicate${where}: incoming "${trimmed}" resembles existing entry "${existingLinesRaw[existingNormalized.indexOf(other)]}"`,
+        );
+        break;
+      }
+    }
+  }
+
+  if (newLines.length === 0) return existing;
+
+  const appended = newLines
+    .map((l) => (/^[-*]\s+/.test(l) ? l : `- ${l}`))
+    .join('\n');
+  const sep = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
+  return existing + sep + appended + '\n';
+}
+
 export interface Episode {
   id: string;
   content: string;
@@ -148,6 +208,12 @@ export class MemoryStore {
    * - caller !== ownerId → return public tier only
    *
    * Returns null if neither tier file has content.
+   *
+   * Output is the raw tier file bytes (bullets preserved). This is the
+   * representation the channel-side memory enricher feeds to Claude as
+   * conversational context. The display/edit representation in
+   * {@link listProfileLines} strips bullets — the two return formats are
+   * intentionally different, and their consumers are disjoint.
    */
   async getProfile(ownerId: string, caller: string): Promise<string | null> {
     await this.migrateIfNeeded(ownerId);
@@ -173,12 +239,37 @@ export class MemoryStore {
    * does not silently drop their legacy profile content. Without this call,
    * the order save → read would see dir-exists-early-return in migration and
    * throw away the legacy file without classifying it.
+   *
+   * Mode:
+   * - `'append'` (default, safe): read the existing tier, merge new lines
+   *   (exact-match deduped after `trim + strip-bullet + lowercase`), preserve
+   *   all original content. Used by one-off save_memory calls where `content`
+   *   is a single fact. Never destroys existing entries.
+   * - `'replace'`: overwrite the entire tier file. Reserved for the distiller
+   *   auto-flush path, which intentionally rewrites the full tier based on a
+   *   fresh read of recent history.
    */
-  async saveProfile(userId: string, content: string, tier: Tier): Promise<void> {
+  async saveProfile(
+    userId: string,
+    content: string,
+    tier: Tier,
+    mode: 'append' | 'replace' = 'append',
+  ): Promise<void> {
     await this.migrateIfNeeded(userId);
     const dir = this.profileDir(userId);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(this.profileTierPath(userId, tier), content, 'utf-8');
+    const filePath = this.profileTierPath(userId, tier);
+
+    if (mode === 'replace') {
+      await fs.writeFile(filePath, content, 'utf-8');
+      return;
+    }
+
+    // append mode
+    const existing = existsSync(filePath) ? await fs.readFile(filePath, 'utf-8') : '';
+    const merged = mergeProfileLines(existing, content, { userId, tier });
+    if (merged === existing) return; // all incoming lines were duplicates — skip write
+    await fs.writeFile(filePath, merged, 'utf-8');
   }
 
   /**
@@ -187,7 +278,11 @@ export class MemoryStore {
    * forget_memory tool) use the hash to identify a line without the file
    * needing a durable row id.
    *
-   * Blank lines are skipped. Leading/trailing whitespace is trimmed.
+   * Blank lines are skipped. Leading/trailing whitespace is trimmed. A leading
+   * `-`/`*` bullet marker is also stripped so `text` (and the derived hash) is
+   * storage-format-independent — a fact saved as "foo" by the distiller and
+   * later merged via append as "- foo" shares one hash and renders identically
+   * in `what_do_you_know`.
    */
   async listProfileLines(ownerId: string, tier: Tier): Promise<ProfileLine[]> {
     await this.migrateIfNeeded(ownerId);
@@ -196,7 +291,7 @@ export class MemoryStore {
     const content = await fs.readFile(p, 'utf-8');
     return content
       .split('\n')
-      .map((raw) => raw.trim())
+      .map((raw) => raw.trim().replace(/^[-*]\s+/, ''))
       .filter(Boolean)
       .map((text, index) => ({ index, hash: lineHash(text), text }));
   }
@@ -206,13 +301,17 @@ export class MemoryStore {
    * from the given tier file. Returns true if a line was removed, false if
    * nothing matched. Idempotent — removing the same hash twice returns false
    * on the second call.
+   *
+   * The rewritten file is bullet-normalized: every remaining line is written
+   * back with a `- ` prefix so the tier stays visually consistent with the
+   * append-mode storage convention.
    */
   async removeProfileLine(ownerId: string, tier: Tier, hash: string): Promise<boolean> {
     const lines = await this.listProfileLines(ownerId, tier);
     const kept = lines.filter((l) => l.hash !== hash);
     if (kept.length === lines.length) return false;
 
-    const next = kept.map((l) => l.text).join('\n') + (kept.length > 0 ? '\n' : '');
+    const next = kept.map((l) => `- ${l.text}`).join('\n') + (kept.length > 0 ? '\n' : '');
     await fs.writeFile(this.profileTierPath(ownerId, tier), next, 'utf-8');
     return true;
   }

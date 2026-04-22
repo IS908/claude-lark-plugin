@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.2] - 2026-04-22
+
+Two field-reported bug fixes on top of 1.0.1.
+
+### Fixed
+- **`save_memory` no longer overwrites existing profile content** (#51). `saveProfile` was doing an unconditional `fs.writeFile`, so a single-fact save (e.g. "记住我不吃鱼") wiped the entire tier file. Introduces a `mode` parameter: `"append"` (new default) reads the existing tier, merges incoming lines deduped case-insensitively (punctuation not normalized — `"喜欢茶"` and `"喜欢茶。"` are kept as distinct), preserves all original content, and auto-bullets lines missing a `-`/`*` prefix; `"replace"` keeps the old overwrite behavior and is now only used by the distiller auto-flush path, which intentionally rewrites the full tier from history. Near-duplicates (prefix containment either direction, normalized) emit a `[memory] Possible near-duplicate` warning to stderr.
+- **Group @bot misrouted as @other-user** (#52). Feishu text messages carry opaque placeholders (`@_user_1`, `@_user_2`, …) in the `text` field with the identity mapping in the `mentions` array. The plugin's group-mention filter already matched by `open_id` correctly, but the text forwarded to Claude still contained raw placeholders — so Claude's own reasoning, reading `@_user_1`, concluded the message was addressed to a different user and stayed silent. `extractText` results (and `parentContent` in threaded replies) are now post-processed: each `@_user_N` is replaced with `@<name>` from `mentions[N-1]`. Masked / empty names (user privacy settings) and out-of-range indices keep the placeholder verbatim. A new `bot_mentioned: "true"` field is added to the `<channel>` notification `meta` when the bot's `open_id` is present in mentions — a text-independent signal that complements the resolved names.
+
+### Changed
+- `save_memory` MCP tool gains a `mode` parameter (profile only) documented in the tool schema. The distiller flush prompt now passes `mode="replace"` explicitly.
+- `LarkMessage` gains `botMentioned?: boolean`; surfaces as `meta.bot_mentioned` on the MCP notification.
+- **Profile line storage/display is now bullet-normalized.** `listProfileLines` strips a leading `-`/`*` marker before hashing, so a fact saved by the distiller as `"foo"` and later merged via append as `"- foo"` share one hash and render identically in `what_do_you_know`. `removeProfileLine` rewrites the tier with a consistent `- ` prefix on every remaining line. Fixes a double-bullet visual artefact (`- [hash] - foo`) that would otherwise appear on content saved after 1.0.2 append-mode.
+
 ## [1.0.1] - 2026-04-21
 
 Small follow-ups on top of 1.0.0: prompt-type CronJobs can now override which model the dispatched subagent uses, and the `reply` tool correctly threads P2P replies onto the latest inbound message even when Claude omits `reply_to`.
@@ -299,6 +312,8 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.2
+[1.0.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.1
 [1.0.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.0
 [0.11.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.1
 [0.11.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v0.11.0

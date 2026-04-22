@@ -63,7 +63,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.0' },
+    { name: 'claude-lark-plugin', version: '1.0.2' },
     {
       capabilities: {
         logging: {},
@@ -139,6 +139,7 @@ async function main() {
             chat_type: message.chatType,
             ...(message.chatName ? { chat_name: message.chatName } : {}),
             ...(message.threadId ? { thread_id: message.threadId } : {}),
+            ...(message.botMentioned ? { bot_mentioned: 'true' } : {}),
             ts: new Date().toISOString(),
             ...(message.parentContent ? { parent_content: message.parentContent } : {}),
             ...(message.imagePath ? { image_path: message.imagePath } : {}),

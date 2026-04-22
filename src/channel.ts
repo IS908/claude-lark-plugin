@@ -46,10 +46,36 @@ export interface LarkMessage {
   parentContent?: string;
   threadId?: string;
   mentions?: Array<{ id: string; name: string }>;
+  /** True when this bot's open_id appears in mentions. Forwarded to Claude as meta.bot_mentioned. */
+  botMentioned?: boolean;
   attachments?: Array<{ fileKey: string; fileName: string; fileType: string }>;
   rawContent: string;
   imagePath?: string;
   imagePaths?: string[];
+}
+
+/**
+ * Resolve Feishu's @_user_N placeholders in a text body to `@<name>` using
+ * the mentions array. mentions[N-1] corresponds to @_user_N (1-indexed).
+ *
+ * If the mention has no name (user privacy settings, masked) the placeholder
+ * is kept verbatim — a synthetic alias would be misleading.
+ * Out-of-range indices (defensive) are also kept verbatim.
+ *
+ * Does NOT touch @_all or any other Feishu-specific placeholder; only matches
+ * /@_user_(\d+)/.
+ */
+export function resolveMentionPlaceholders(
+  text: string,
+  mentions: Array<{ id: string; name: string }> | undefined,
+): string {
+  if (!text || !mentions || mentions.length === 0) return text;
+  return text.replace(/@_user_(\d+)/g, (match, n) => {
+    const idx = Number(n) - 1;
+    const m = mentions[idx];
+    if (!m || !m.name) return match;
+    return `@${m.name}`;
+  });
 }
 
 type MessageHandler = (message: LarkMessage) => Promise<void>;
@@ -301,14 +327,26 @@ export class LarkChannel {
       }).catch(() => {});
     }
 
-    // Parse message text
-    const text = this.extractText(rawContent, messageType);
-
     // Parse mentions
-    const parsedMentions = (mentions ?? []).map((m: any) => ({
-      id: m.id?.open_id ?? m.id?.union_id ?? '',
-      name: m.name ?? '',
-    }));
+    const parsedMentions: Array<{ id: string; name: string }> = (mentions ?? []).map(
+      (m: any) => ({
+        id: m.id?.open_id ?? m.id?.union_id ?? '',
+        name: m.name ?? '',
+      }),
+    );
+
+    // Detect whether this bot was among the mentioned users — forwarded to
+    // Claude as meta.bot_mentioned so Claude has a text-independent signal
+    // when multiple users are @mentioned in the same message.
+    const botMentioned = this.botOpenId
+      ? parsedMentions.some((m) => m.id === this.botOpenId)
+      : parsedMentions.length > 0; // fallback: same heuristic as the group-filter
+
+    // Parse message text, resolving @_user_N placeholders to @<name>
+    const text = resolveMentionPlaceholders(
+      this.extractText(rawContent, messageType),
+      parsedMentions,
+    );
 
     // Parse attachments
     const attachments = this.extractAttachments(message);
@@ -367,6 +405,7 @@ export class LarkChannel {
       parentId,
       threadId,
       mentions: parsedMentions,
+      botMentioned,
       attachments,
       rawContent,
       imagePath,
@@ -379,10 +418,24 @@ export class LarkChannel {
         const parentMsg = await this.client.im.v1.message.get({
           path: { message_id: parentId },
         });
-        if (parentMsg?.data?.items?.[0]?.body?.content) {
-          larkMessage.parentContent = this.extractText(
-            parentMsg.data.items[0].body.content,
-            parentMsg.data.items[0].msg_type ?? 'text'
+        const parentItem = parentMsg?.data?.items?.[0];
+        if (parentItem?.body?.content) {
+          // Parent-message mentions may arrive either as the receive-event
+          // shape (`id: { open_id, union_id, user_id }`) or, in some API
+          // responses, as a flat string. Normalize both so name-based
+          // resolution works and `id` never stringifies to "[object Object]".
+          const parentMentions: Array<{ id: string; name: string }> = (
+            parentItem.mentions ?? []
+          ).map((m: any) => ({
+            id:
+              m.id?.open_id ??
+              m.id?.union_id ??
+              (typeof m.id === 'string' ? m.id : ''),
+            name: m.name ?? '',
+          }));
+          larkMessage.parentContent = resolveMentionPlaceholders(
+            this.extractText(parentItem.body.content, parentItem.msg_type ?? 'text'),
+            parentMentions,
           );
         }
       } catch {

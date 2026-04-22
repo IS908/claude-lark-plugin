@@ -498,21 +498,34 @@ export function registerTools(
           .describe(
             'Profile tier (type="profile" only). "public": safe for others to see when they @mention this user (job title, tech stack, team). "private": owner-only (preferences, ongoing work, emotional state, etc.). Defaults to "private" when omitted — err on the side of less exposure.'
           ),
+        mode: z
+          .enum(['append', 'replace'])
+          .optional()
+          .describe(
+            'Profile write mode (type="profile" only). Defaults to "append": new lines merged into the existing tier, deduped case-insensitively; existing entries are preserved. Use "replace" ONLY during distiller auto-flush when you are rewriting the full tier from a fresh read of the conversation — replace overwrites the entire file.'
+          ),
       }),
     },
-    async ({ type, content, reason, chat_id, thread_id, tier }) => {
-      const auditArgs = { type, chat_id, thread_id, tier };
+    async ({ type, content, reason, chat_id, thread_id, tier, mode }) => {
+      // Only include profile-specific params in audit args when they're
+      // actually applied — keeps chat/thread audit lines clean and avoids
+      // implying a tier/mode was honored when type !== 'profile'.
+      const auditArgs =
+        type === 'profile'
+          ? { type, chat_id, thread_id, tier, mode }
+          : { type, chat_id, thread_id };
       const auth = resolveCaller('save_memory', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const { caller } = auth;
 
       if (type === 'profile') {
         const effectiveTier = tier ?? 'private';
-        await memoryStore.saveProfile(caller, content, effectiveTier);
+        const effectiveMode = mode ?? 'append';
+        await memoryStore.saveProfile(caller, content, effectiveTier, effectiveMode);
         void audit('save_memory', caller, auditArgs, 'ok');
         return {
           content: [
-            { type: 'text' as const, text: `Saved ${effectiveTier} profile for ${caller}. Reason: ${reason}` },
+            { type: 'text' as const, text: `Saved ${effectiveTier} profile for ${caller} (mode: ${effectiveMode}). Reason: ${reason}` },
           ],
         };
       }

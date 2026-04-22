@@ -47,7 +47,7 @@ passed++;
 {
   const r = mkdtempSync(join(tmpdir(), 'profile-private-only-'));
   const s = new MemoryStore(r);
-  await s.saveProfile('ou_priv', 'top-secret content', 'private');
+  await s.saveProfile('ou_priv', 'top-secret content', 'private', 'replace');
   // Owner sees it
   const own = await s.getProfile('ou_priv', 'ou_priv');
   if (own !== 'top-secret content') fail(`3b: owner should see private, got ${JSON.stringify(own)}`);
@@ -194,13 +194,144 @@ passed++;
 // ── 9. saveProfile writes to correct tier file ──
 const writeRoot = mkdtempSync(join(tmpdir(), 'profile-write-'));
 const writeStore = new MemoryStore(writeRoot);
-await writeStore.saveProfile('ou_w', 'public content', 'public');
-await writeStore.saveProfile('ou_w', 'private content', 'private');
+await writeStore.saveProfile('ou_w', 'public content', 'public', 'replace');
+await writeStore.saveProfile('ou_w', 'private content', 'private', 'replace');
 const pubFile = readFileSync(join(writeRoot, 'profiles', 'ou_w', 'public.md'), 'utf-8');
 const privFile = readFileSync(join(writeRoot, 'profiles', 'ou_w', 'private.md'), 'utf-8');
 if (pubFile !== 'public content') fail(`9: public.md content wrong: ${pubFile}`);
 if (privFile !== 'private content') fail(`9: private.md content wrong: ${privFile}`);
 passed++;
+
+// ── 10. append mode: preserves existing, dedupes case-insensitive ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-append-'));
+  const s = new MemoryStore(r);
+  // Start with an existing tier
+  await s.saveProfile('ou_app', '- Prefers tea', 'private', 'replace');
+  // Single-fact save (default append) should add the new line, keep existing
+  await s.saveProfile('ou_app', "Doesn't eat fish", 'private');
+  const body1 = readFileSync(join(r, 'profiles', 'ou_app', 'private.md'), 'utf-8');
+  if (!body1.includes('Prefers tea')) fail('10: append dropped existing line');
+  if (!body1.includes("- Doesn't eat fish")) fail('10: append did not add new line (with auto-bullet)');
+  // Exact-duplicate save should be a no-op
+  const before = body1;
+  await s.saveProfile('ou_app', "Doesn't eat fish", 'private');
+  const body2 = readFileSync(join(r, 'profiles', 'ou_app', 'private.md'), 'utf-8');
+  if (body2 !== before) fail('10: exact duplicate should not change file');
+  // Case-insensitive dedupe
+  await s.saveProfile('ou_app', '- prefers tea', 'private');
+  const body3 = readFileSync(join(r, 'profiles', 'ou_app', 'private.md'), 'utf-8');
+  if (body3 !== before) fail('10: case-insensitive dedupe failed');
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 11. append mode: multi-line, partial dedupe ────────────────
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-append-multi-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_multi', '- existing one\n- existing two', 'private', 'replace');
+  await s.saveProfile('ou_multi', '- existing one\n- new three\n- new four', 'private');
+  const body = readFileSync(join(r, 'profiles', 'ou_multi', 'private.md'), 'utf-8');
+  const lines = body.split('\n').filter(Boolean);
+  if (lines.length !== 4) fail(`11: expected 4 lines, got ${lines.length}: ${JSON.stringify(lines)}`);
+  if (!lines.includes('- new three')) fail('11: missing new three');
+  if (!lines.includes('- new four')) fail('11: missing new four');
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 11b. append mode: dedup within a single incoming batch ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-append-batch-dedup-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_batch', '- foo\n- foo\n- FOO\n- bar', 'private');
+  const body = readFileSync(join(r, 'profiles', 'ou_batch', 'private.md'), 'utf-8');
+  const lines = body.split('\n').filter(Boolean);
+  if (lines.length !== 2) fail(`11b: expected 2 lines after intra-batch dedup, got ${lines.length}: ${JSON.stringify(lines)}`);
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 12. append mode: empty file gets first entry with auto-bullet ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-append-first-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_first', 'bare fact no bullet', 'private');
+  const body = readFileSync(join(r, 'profiles', 'ou_first', 'private.md'), 'utf-8');
+  if (body !== '- bare fact no bullet\n') fail(`12: first-entry auto-bullet wrong: ${JSON.stringify(body)}`);
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 13. listProfileLines strips bullet; hash is storage-format independent ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-list-strip-'));
+  const s = new MemoryStore(r);
+  // Private starts via `replace` with a bullet-less body — simulates the
+  // state a distiller flush would leave on disk.
+  await s.saveProfile('ou_mix', 'plain line', 'private', 'replace');
+  // Then a subsequent append adds a bulleted line — simulates a one-off
+  // save_memory call on top. File ends up bullet-mixed on disk.
+  await s.saveProfile('ou_mix', '- bulleted line', 'private');
+  const listed = await s.listProfileLines('ou_mix', 'private');
+  if (listed.length !== 2) fail(`13: expected 2 lines, got ${listed.length}`);
+  if (listed.some((l) => l.text.startsWith('- ') || l.text.startsWith('* '))) {
+    fail(`13: text should be bullet-stripped, got ${JSON.stringify(listed)}`);
+  }
+
+  // Same content saved via append in a different tier must share the hash.
+  await s.saveProfile('ou_mix', 'plain line', 'public');
+  const publicListed = await s.listProfileLines('ou_mix', 'public');
+  const plainHashPriv = listed.find((l) => l.text === 'plain line')?.hash;
+  const plainHashPub = publicListed.find((l) => l.text === 'plain line')?.hash;
+  if (!plainHashPriv || plainHashPriv !== plainHashPub) {
+    fail(`13: hash should be storage-format independent, priv=${plainHashPriv} pub=${plainHashPub}`);
+  }
+
+  // And the bulleted entry also gets a hash equal to its content saved plain.
+  await s.saveProfile('ou_mix', 'bulleted line', 'public');
+  const pubListed2 = await s.listProfileLines('ou_mix', 'public');
+  const bHashPriv = listed.find((l) => l.text === 'bulleted line')?.hash;
+  const bHashPub = pubListed2.find((l) => l.text === 'bulleted line')?.hash;
+  if (!bHashPriv || bHashPriv !== bHashPub) {
+    fail(`13: bulleted↔unbulleted hash should match, priv=${bHashPriv} pub=${bHashPub}`);
+  }
+
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 14. removeProfileLine rewrites with bullet normalization ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-remove-renorm-'));
+  const s = new MemoryStore(r);
+  // Write a mixed file via replace (some bulleted, some not)
+  await s.saveProfile('ou_rm', '- first\nsecond\n- third', 'private', 'replace');
+  const listed = await s.listProfileLines('ou_rm', 'private');
+  const secondHash = listed.find((l) => l.text === 'second')!.hash;
+  const ok = await s.removeProfileLine('ou_rm', 'private', secondHash);
+  if (!ok) fail('14: removeProfileLine should report success');
+  const body = readFileSync(join(r, 'profiles', 'ou_rm', 'private.md'), 'utf-8');
+  // Remaining lines should both carry bullets now
+  if (body !== '- first\n- third\n') fail(`14: expected bullet-normalized rewrite, got ${JSON.stringify(body)}`);
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 15. saveProfile append with empty/whitespace content is a no-op ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-empty-append-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_e', '- existing', 'private', 'replace');
+  const before = readFileSync(join(r, 'profiles', 'ou_e', 'private.md'), 'utf-8');
+  await s.saveProfile('ou_e', '', 'private');
+  await s.saveProfile('ou_e', '\n\n\n', 'private');
+  const after = readFileSync(join(r, 'profiles', 'ou_e', 'private.md'), 'utf-8');
+  if (after !== before) fail(`15: empty append should no-op, before=${JSON.stringify(before)} after=${JSON.stringify(after)}`);
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
 
 // ── parseTieredProfile: well-formed JSON ─────────────────────
 {
@@ -263,4 +394,4 @@ rmSync(legacyRoot, { recursive: true, force: true });
 rmSync(partialRoot, { recursive: true, force: true });
 rmSync(writeRoot, { recursive: true, force: true });
 
-console.log(`profile-tier smoke: ${passed}/18 PASS`);
+console.log(`profile-tier smoke: ${passed}/25 PASS`);
