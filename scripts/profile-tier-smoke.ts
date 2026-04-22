@@ -241,6 +241,18 @@ passed++;
   passed++;
 }
 
+// ── 11b. append mode: dedup within a single incoming batch ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-append-batch-dedup-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_batch', '- foo\n- foo\n- FOO\n- bar', 'private');
+  const body = readFileSync(join(r, 'profiles', 'ou_batch', 'private.md'), 'utf-8');
+  const lines = body.split('\n').filter(Boolean);
+  if (lines.length !== 2) fail(`11b: expected 2 lines after intra-batch dedup, got ${lines.length}: ${JSON.stringify(lines)}`);
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
 // ── 12. append mode: empty file gets first entry with auto-bullet ──
 {
   const r = mkdtempSync(join(tmpdir(), 'profile-append-first-'));
@@ -313,4 +325,4 @@ rmSync(legacyRoot, { recursive: true, force: true });
 rmSync(partialRoot, { recursive: true, force: true });
 rmSync(writeRoot, { recursive: true, force: true });
 
-console.log(`profile-tier smoke: ${passed}/21 PASS`);
+console.log(`profile-tier smoke: ${passed}/22 PASS`);

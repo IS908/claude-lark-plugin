@@ -55,6 +55,7 @@ export function mergeProfileLines(
     const key = normalizeProfileLine(trimmed);
     if (existingKeys.has(key)) continue; // exact match → skip
     newLines.push(trimmed);
+    existingKeys.add(key); // also dedupe within the incoming batch
 
     // Near-duplicate warning: prefix-containment either direction.
     for (const other of existingNormalized) {
