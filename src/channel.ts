@@ -420,10 +420,17 @@ export class LarkChannel {
         });
         const parentItem = parentMsg?.data?.items?.[0];
         if (parentItem?.body?.content) {
+          // Parent-message mentions may arrive either as the receive-event
+          // shape (`id: { open_id, union_id, user_id }`) or, in some API
+          // responses, as a flat string. Normalize both so name-based
+          // resolution works and `id` never stringifies to "[object Object]".
           const parentMentions: Array<{ id: string; name: string }> = (
             parentItem.mentions ?? []
           ).map((m: any) => ({
-            id: m.id ?? '',
+            id:
+              m.id?.open_id ??
+              m.id?.union_id ??
+              (typeof m.id === 'string' ? m.id : ''),
             name: m.name ?? '',
           }));
           larkMessage.parentContent = resolveMentionPlaceholders(
