@@ -272,7 +272,11 @@ export class MemoryStore {
    * forget_memory tool) use the hash to identify a line without the file
    * needing a durable row id.
    *
-   * Blank lines are skipped. Leading/trailing whitespace is trimmed.
+   * Blank lines are skipped. Leading/trailing whitespace is trimmed. A leading
+   * `-`/`*` bullet marker is also stripped so `text` (and the derived hash) is
+   * storage-format-independent — a fact saved as "foo" by the distiller and
+   * later merged via append as "- foo" shares one hash and renders identically
+   * in `what_do_you_know`.
    */
   async listProfileLines(ownerId: string, tier: Tier): Promise<ProfileLine[]> {
     await this.migrateIfNeeded(ownerId);
@@ -281,7 +285,7 @@ export class MemoryStore {
     const content = await fs.readFile(p, 'utf-8');
     return content
       .split('\n')
-      .map((raw) => raw.trim())
+      .map((raw) => raw.trim().replace(/^[-*]\s+/, ''))
       .filter(Boolean)
       .map((text, index) => ({ index, hash: lineHash(text), text }));
   }
@@ -291,13 +295,17 @@ export class MemoryStore {
    * from the given tier file. Returns true if a line was removed, false if
    * nothing matched. Idempotent — removing the same hash twice returns false
    * on the second call.
+   *
+   * The rewritten file is bullet-normalized: every remaining line is written
+   * back with a `- ` prefix so the tier stays visually consistent with the
+   * append-mode storage convention.
    */
   async removeProfileLine(ownerId: string, tier: Tier, hash: string): Promise<boolean> {
     const lines = await this.listProfileLines(ownerId, tier);
     const kept = lines.filter((l) => l.hash !== hash);
     if (kept.length === lines.length) return false;
 
-    const next = kept.map((l) => l.text).join('\n') + (kept.length > 0 ? '\n' : '');
+    const next = kept.map((l) => `- ${l.text}`).join('\n') + (kept.length > 0 ? '\n' : '');
     await fs.writeFile(this.profileTierPath(ownerId, tier), next, 'utf-8');
     return true;
   }

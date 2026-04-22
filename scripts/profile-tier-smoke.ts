@@ -264,6 +264,61 @@ passed++;
   passed++;
 }
 
+// ── 13. listProfileLines strips leading bullet in text + hash ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-list-strip-'));
+  const s = new MemoryStore(r);
+  // Mix: one bullet-stored (append) and one bullet-less (as distiller would write via replace)
+  await s.saveProfile('ou_mix', '- bulleted line', 'private');
+  await s.saveProfile('ou_mix', 'plain line\n- bulleted line', 'private', 'replace');
+  const listed = await s.listProfileLines('ou_mix', 'private');
+  if (listed.length !== 2) fail(`13: expected 2 lines, got ${listed.length}`);
+  // text should be bullet-stripped on both
+  if (listed.some((l) => l.text.startsWith('- '))) fail(`13: text should be bullet-stripped, got ${JSON.stringify(listed)}`);
+  // Same hash whether saved with or without bullet (storage-format independence)
+  const withBullet = await s.listProfileLines('ou_mix', 'private');
+  await s.saveProfile('ou_mix', 'plain line', 'public'); // same content in public
+  const publicListed = await s.listProfileLines('ou_mix', 'public');
+  const plainHashPriv = withBullet.find((l) => l.text === 'plain line')?.hash;
+  const plainHashPub = publicListed.find((l) => l.text === 'plain line')?.hash;
+  if (!plainHashPriv || plainHashPriv !== plainHashPub) {
+    fail(`13: hash should be storage-format independent, priv=${plainHashPriv} pub=${plainHashPub}`);
+  }
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 14. removeProfileLine rewrites with bullet normalization ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-remove-renorm-'));
+  const s = new MemoryStore(r);
+  // Write a mixed file via replace (some bulleted, some not)
+  await s.saveProfile('ou_rm', '- first\nsecond\n- third', 'private', 'replace');
+  const listed = await s.listProfileLines('ou_rm', 'private');
+  const secondHash = listed.find((l) => l.text === 'second')!.hash;
+  const ok = await s.removeProfileLine('ou_rm', 'private', secondHash);
+  if (!ok) fail('14: removeProfileLine should report success');
+  const body = readFileSync(join(r, 'profiles', 'ou_rm', 'private.md'), 'utf-8');
+  // Remaining lines should both carry bullets now
+  if (body !== '- first\n- third\n') fail(`14: expected bullet-normalized rewrite, got ${JSON.stringify(body)}`);
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 15. saveProfile append with empty/whitespace content is a no-op ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-empty-append-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_e', '- existing', 'private', 'replace');
+  const before = readFileSync(join(r, 'profiles', 'ou_e', 'private.md'), 'utf-8');
+  await s.saveProfile('ou_e', '', 'private');
+  await s.saveProfile('ou_e', '\n\n\n', 'private');
+  const after = readFileSync(join(r, 'profiles', 'ou_e', 'private.md'), 'utf-8');
+  if (after !== before) fail(`15: empty append should no-op, before=${JSON.stringify(before)} after=${JSON.stringify(after)}`);
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
 // ── parseTieredProfile: well-formed JSON ─────────────────────
 {
   const { public: pub, private: priv } = parseTieredProfile(
@@ -325,4 +380,4 @@ rmSync(legacyRoot, { recursive: true, force: true });
 rmSync(partialRoot, { recursive: true, force: true });
 rmSync(writeRoot, { recursive: true, force: true });
 
-console.log(`profile-tier smoke: ${passed}/22 PASS`);
+console.log(`profile-tier smoke: ${passed}/25 PASS`);

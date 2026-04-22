@@ -15,6 +15,7 @@ Two field-reported bug fixes on top of 1.0.1.
 ### Changed
 - `save_memory` MCP tool gains a `mode` parameter (profile only) documented in the tool schema. The distiller flush prompt now passes `mode="replace"` explicitly.
 - `LarkMessage` gains `botMentioned?: boolean`; surfaces as `meta.bot_mentioned` on the MCP notification.
+- **Profile line storage/display is now bullet-normalized.** `listProfileLines` strips a leading `-`/`*` marker before hashing, so a fact saved by the distiller as `"foo"` and later merged via append as `"- foo"` share one hash and render identically in `what_do_you_know`. `removeProfileLine` rewrites the tier with a consistent `- ` prefix on every remaining line. Fixes a double-bullet visual artefact (`- [hash] - foo`) that would otherwise appear on content saved after 1.0.2 append-mode.
 
 ## [1.0.1] - 2026-04-21
 
