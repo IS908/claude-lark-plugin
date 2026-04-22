@@ -507,7 +507,13 @@ export function registerTools(
       }),
     },
     async ({ type, content, reason, chat_id, thread_id, tier, mode }) => {
-      const auditArgs = { type, chat_id, thread_id, tier, mode };
+      // Only include profile-specific params in audit args when they're
+      // actually applied — keeps chat/thread audit lines clean and avoids
+      // implying a tier/mode was honored when type !== 'profile'.
+      const auditArgs =
+        type === 'profile'
+          ? { type, chat_id, thread_id, tier, mode }
+          : { type, chat_id, thread_id };
       const auth = resolveCaller('save_memory', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const { caller } = auth;
