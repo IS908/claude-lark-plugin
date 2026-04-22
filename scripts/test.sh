@@ -48,4 +48,8 @@ echo "=== Transparency unit checks ==="
 npx tsx scripts/transparency-smoke.ts
 
 echo ""
+echo "=== Mention resolver unit checks ==="
+npx tsx scripts/mention-resolver-smoke.ts
+
+echo ""
 echo "All tests passed."

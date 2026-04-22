@@ -75,7 +75,7 @@ Classification rules (apply in order; higher priority wins):
    - chatType=p2p → unknown facts default to private (never voluntarily shared beyond 1:1).
 5. When truly uncertain: choose private.
 
-Return ONLY the JSON object, no prose or code fences. Then call save_memory(type="profile", content=<public-array-as-markdown-list>, reason=<why>, chat_id=<current>, tier="public") and again with tier="private" for the private array. Skip either call if its array is empty.`;
+Return ONLY the JSON object, no prose or code fences. Then call save_memory(type="profile", content=<public-array-as-markdown-list>, reason=<why>, chat_id=<current>, tier="public", mode="replace") and again with tier="private" for the private array. Skip either call if its array is empty. mode="replace" is required — this flush rewrites the full tier from a fresh read of history, so the existing file should be overwritten rather than appended to.`;
 }
 
 /**

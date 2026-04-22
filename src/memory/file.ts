@@ -18,6 +18,65 @@ function lineHash(text: string): string {
   return createHash('sha1').update(text).digest('hex').slice(0, 8);
 }
 
+/** Normalize a profile line for deduplication (not for storage). */
+function normalizeProfileLine(line: string): string {
+  return line.trim().replace(/^[-*]\s+/, '').toLowerCase();
+}
+
+/**
+ * Merge new profile lines into an existing tier file body.
+ *
+ * Dedup rules:
+ * - Case-insensitive line match after trim + leading-bullet strip.
+ * - Punctuation is **not** normalized — "prefers tea" and "prefers tea."
+ *   are kept as distinct lines to avoid silent merges.
+ *
+ * Original capitalization and punctuation are preserved in the output.
+ *
+ * Incoming lines without a `-`/`*` bullet marker are normalized on write to
+ * `- <line>` so the tier file remains a well-formed markdown bullet list.
+ *
+ * Near-duplicates (prefix containment after normalization) are logged to
+ * stderr to help operators notice redundant writes, but are still preserved.
+ */
+export function mergeProfileLines(
+  existing: string,
+  incoming: string,
+  ctx?: { userId?: string; tier?: Tier },
+): string {
+  const existingLinesRaw = existing.split('\n').filter((l) => l.trim());
+  const existingKeys = new Set(existingLinesRaw.map(normalizeProfileLine));
+  const existingNormalized = existingLinesRaw.map(normalizeProfileLine);
+
+  const newLines: string[] = [];
+  for (const raw of incoming.split('\n')) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const key = normalizeProfileLine(trimmed);
+    if (existingKeys.has(key)) continue; // exact match → skip
+    newLines.push(trimmed);
+
+    // Near-duplicate warning: prefix-containment either direction.
+    for (const other of existingNormalized) {
+      if (key !== other && (key.startsWith(other) || other.startsWith(key))) {
+        const where = ctx?.userId && ctx?.tier ? ` in ${ctx.userId}/${ctx.tier}.md` : '';
+        console.error(
+          `[memory] Possible near-duplicate${where}: incoming "${trimmed}" resembles existing entry "${existingLinesRaw[existingNormalized.indexOf(other)]}"`,
+        );
+        break;
+      }
+    }
+  }
+
+  if (newLines.length === 0) return existing;
+
+  const appended = newLines
+    .map((l) => (/^[-*]\s+/.test(l) ? l : `- ${l}`))
+    .join('\n');
+  const sep = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
+  return existing + sep + appended + '\n';
+}
+
 export interface Episode {
   id: string;
   content: string;
@@ -173,12 +232,37 @@ export class MemoryStore {
    * does not silently drop their legacy profile content. Without this call,
    * the order save → read would see dir-exists-early-return in migration and
    * throw away the legacy file without classifying it.
+   *
+   * Mode:
+   * - `'append'` (default, safe): read the existing tier, merge new lines
+   *   (exact-match deduped after `trim + strip-bullet + lowercase`), preserve
+   *   all original content. Used by one-off save_memory calls where `content`
+   *   is a single fact. Never destroys existing entries.
+   * - `'replace'`: overwrite the entire tier file. Reserved for the distiller
+   *   auto-flush path, which intentionally rewrites the full tier based on a
+   *   fresh read of recent history.
    */
-  async saveProfile(userId: string, content: string, tier: Tier): Promise<void> {
+  async saveProfile(
+    userId: string,
+    content: string,
+    tier: Tier,
+    mode: 'append' | 'replace' = 'append',
+  ): Promise<void> {
     await this.migrateIfNeeded(userId);
     const dir = this.profileDir(userId);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(this.profileTierPath(userId, tier), content, 'utf-8');
+    const filePath = this.profileTierPath(userId, tier);
+
+    if (mode === 'replace') {
+      await fs.writeFile(filePath, content, 'utf-8');
+      return;
+    }
+
+    // append mode
+    const existing = existsSync(filePath) ? await fs.readFile(filePath, 'utf-8') : '';
+    const merged = mergeProfileLines(existing, content, { userId, tier });
+    if (merged === existing) return; // all incoming lines were duplicates — skip write
+    await fs.writeFile(filePath, merged, 'utf-8');
   }
 
   /**
