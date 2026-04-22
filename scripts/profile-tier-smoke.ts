@@ -264,26 +264,40 @@ passed++;
   passed++;
 }
 
-// ── 13. listProfileLines strips leading bullet in text + hash ──
+// ── 13. listProfileLines strips bullet; hash is storage-format independent ──
 {
   const r = mkdtempSync(join(tmpdir(), 'profile-list-strip-'));
   const s = new MemoryStore(r);
-  // Mix: one bullet-stored (append) and one bullet-less (as distiller would write via replace)
+  // Private starts via `replace` with a bullet-less body — simulates the
+  // state a distiller flush would leave on disk.
+  await s.saveProfile('ou_mix', 'plain line', 'private', 'replace');
+  // Then a subsequent append adds a bulleted line — simulates a one-off
+  // save_memory call on top. File ends up bullet-mixed on disk.
   await s.saveProfile('ou_mix', '- bulleted line', 'private');
-  await s.saveProfile('ou_mix', 'plain line\n- bulleted line', 'private', 'replace');
   const listed = await s.listProfileLines('ou_mix', 'private');
   if (listed.length !== 2) fail(`13: expected 2 lines, got ${listed.length}`);
-  // text should be bullet-stripped on both
-  if (listed.some((l) => l.text.startsWith('- '))) fail(`13: text should be bullet-stripped, got ${JSON.stringify(listed)}`);
-  // Same hash whether saved with or without bullet (storage-format independence)
-  const withBullet = await s.listProfileLines('ou_mix', 'private');
-  await s.saveProfile('ou_mix', 'plain line', 'public'); // same content in public
+  if (listed.some((l) => l.text.startsWith('- ') || l.text.startsWith('* '))) {
+    fail(`13: text should be bullet-stripped, got ${JSON.stringify(listed)}`);
+  }
+
+  // Same content saved via append in a different tier must share the hash.
+  await s.saveProfile('ou_mix', 'plain line', 'public');
   const publicListed = await s.listProfileLines('ou_mix', 'public');
-  const plainHashPriv = withBullet.find((l) => l.text === 'plain line')?.hash;
+  const plainHashPriv = listed.find((l) => l.text === 'plain line')?.hash;
   const plainHashPub = publicListed.find((l) => l.text === 'plain line')?.hash;
   if (!plainHashPriv || plainHashPriv !== plainHashPub) {
     fail(`13: hash should be storage-format independent, priv=${plainHashPriv} pub=${plainHashPub}`);
   }
+
+  // And the bulleted entry also gets a hash equal to its content saved plain.
+  await s.saveProfile('ou_mix', 'bulleted line', 'public');
+  const pubListed2 = await s.listProfileLines('ou_mix', 'public');
+  const bHashPriv = listed.find((l) => l.text === 'bulleted line')?.hash;
+  const bHashPub = pubListed2.find((l) => l.text === 'bulleted line')?.hash;
+  if (!bHashPriv || bHashPriv !== bHashPub) {
+    fail(`13: bulleted↔unbulleted hash should match, priv=${bHashPriv} pub=${bHashPub}`);
+  }
+
   rmSync(r, { recursive: true, force: true });
   passed++;
 }

@@ -208,6 +208,12 @@ export class MemoryStore {
    * - caller !== ownerId → return public tier only
    *
    * Returns null if neither tier file has content.
+   *
+   * Output is the raw tier file bytes (bullets preserved). This is the
+   * representation the channel-side memory enricher feeds to Claude as
+   * conversational context. The display/edit representation in
+   * {@link listProfileLines} strips bullets — the two return formats are
+   * intentionally different, and their consumers are disjoint.
    */
   async getProfile(ownerId: string, caller: string): Promise<string | null> {
     await this.migrateIfNeeded(ownerId);
