@@ -17,6 +17,14 @@ import {
   type JobFile,
 } from './job-store.js';
 
+/**
+ * Prefix for synthetic `thread_id` values injected into cronjob channel
+ * notifications. Used only for IdentitySession isolation per cronjob run —
+ * NOT a real Feishu thread. Consumers that route messages to Feishu threads
+ * (e.g. the `reply` tool) must exclude thread_ids with this prefix.
+ */
+export const JOB_THREAD_PREFIX = 'job-';
+
 export interface SchedulerOptions {
   server: Server;
   client: Lark.Client;
@@ -250,7 +258,7 @@ export class JobScheduler {
    * does not clobber concurrent inbound human messages in the same chat.
    */
   private async executePromptJob(job: JobFile): Promise<void> {
-    const jobThreadId = `job-${job.meta.id}-${Date.now()}`;
+    const jobThreadId = `${JOB_THREAD_PREFIX}${job.meta.id}-${Date.now()}`;
 
     // Bind the job owner as caller so tools invoked from this Claude turn
     // (e.g. save_memory, list_jobs) resolve to the job creator, not to any

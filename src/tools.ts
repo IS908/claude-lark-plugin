@@ -10,6 +10,7 @@ import type { BotMessageTracker, LatestMessageTracker, LarkChannel } from './cha
 import type { IdentitySession } from './identity-session.js';
 import { audit } from './audit-log.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
+import { JOB_THREAD_PREFIX } from './scheduler.js';
 import {
   sanitizeJobId,
   expandSchedule,
@@ -139,6 +140,44 @@ export function registerTools(
         }
       }
 
+      // Thread-aware routing: follow-up messages (text chunks 2..N, card
+      // 2..N, attachments) must stay in the same thread as the first reply.
+      // Using `message.reply(..., reply_in_thread: true)` routes into the
+      // source's thread WITHOUT rendering as a quote — unlike the bare
+      // `reply()` used for the first message which intentionally quotes.
+      //
+      // Gated on `thread_id` presence: on a non-threaded source message
+      // (P2P, non-threaded group) `reply_in_thread: true` would create a
+      // new thread — unwanted. Fall through to plain `message.create` in
+      // those cases, preserving pre-fix behavior.
+      //
+      // Also excluded: synthetic thread_ids from the cronjob dispatcher
+      // (prefix JOB_THREAD_PREFIX, see src/scheduler.ts). These values
+      // exist solely to isolate IdentitySession entries per cronjob run
+      // and do NOT correspond to a real Feishu thread. Using
+      // reply_in_thread:true against the effectiveReplyTo (which, if
+      // auto-filled or user-passed, points at a real earlier message)
+      // would incorrectly pull that message into a newly-created thread.
+      const isSyntheticThread = !!thread_id && thread_id.startsWith(JOB_THREAD_PREFIX);
+      const shouldStayInThread = !!thread_id && !isSyntheticThread && !!effectiveReplyTo;
+      async function sendFollowup(data: { content: string; msg_type: string }): Promise<any> {
+        if (shouldStayInThread) {
+          // `reply_in_thread: true` is a Feishu HTTP API field that routes the
+          // new message into the source's thread without rendering as a quote.
+          // The `@larksuiteoapi/node-sdk` type definitions currently omit it,
+          // hence the cast. Feishu docs:
+          //   https://open.feishu.cn/document/server-docs/im-v1/message/reply
+          return client.im.v1.message.reply({
+            path: { message_id: effectiveReplyTo! },
+            data: { ...data, reply_in_thread: true } as any,
+          });
+        }
+        return client.im.v1.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: { receive_id: chat_id, ...data },
+        });
+      }
+
       // Helper: record in buffer + revoke ack (shared by card & normal paths)
       function recordAndRevokeAck(replyText: string) {
         conversationBuffer?.record(chat_id, {
@@ -233,14 +272,7 @@ export function registerTools(
                 data: { content, msg_type: 'interactive' },
               });
             } else {
-              resp = await client.im.v1.message.create({
-                params: { receive_id_type: 'chat_id' },
-                data: {
-                  receive_id: chat_id,
-                  content,
-                  msg_type: 'interactive',
-                },
-              });
+              resp = await sendFollowup({ content, msg_type: 'interactive' });
             }
             const sentId = resp?.data?.message_id;
             if (sentId && botMessageTracker) botMessageTracker.add(sentId);
@@ -277,13 +309,9 @@ export function registerTools(
                 },
               });
             } else {
-              resp = await client.im.v1.message.create({
-                params: { receive_id_type: 'chat_id' },
-                data: {
-                  receive_id: chat_id,
-                  content: JSON.stringify({ text: chunks[i] }),
-                  msg_type: 'text',
-                },
+              resp = await sendFollowup({
+                content: JSON.stringify({ text: chunks[i] }),
+                msg_type: 'text',
               });
             }
             const sentId = resp?.data?.message_id;
@@ -321,14 +349,12 @@ export function registerTools(
               });
               const imageKey = (resp as any)?.data?.image_key ?? (resp as any)?.image_key;
               if (imageKey) {
-                await client.im.v1.message.create({
-                  params: { receive_id_type: 'chat_id' },
-                  data: {
-                    receive_id: chat_id,
-                    content: JSON.stringify({ image_key: imageKey }),
-                    msg_type: 'image',
-                  },
+                const sent = await sendFollowup({
+                  content: JSON.stringify({ image_key: imageKey }),
+                  msg_type: 'image',
                 });
+                const sentId = (sent as any)?.data?.message_id;
+                if (sentId && botMessageTracker) botMessageTracker.add(sentId);
               }
             } else {
               // For file uploads, use im.v1.file.create
@@ -341,17 +367,15 @@ export function registerTools(
               });
               const fileKey = (resp as any)?.data?.file_key ?? (resp as any)?.file_key;
               if (fileKey) {
-                await client.im.v1.message.create({
-                  params: { receive_id_type: 'chat_id' },
-                  data: {
-                    receive_id: chat_id,
-                    content: JSON.stringify({
-                      file_key: fileKey,
-                      file_name: path.basename(file.path),
-                    }),
-                    msg_type: 'file',
-                  },
+                const sent = await sendFollowup({
+                  content: JSON.stringify({
+                    file_key: fileKey,
+                    file_name: path.basename(file.path),
+                  }),
+                  msg_type: 'file',
                 });
+                const sentId = (sent as any)?.data?.message_id;
+                if (sentId && botMessageTracker) botMessageTracker.add(sentId);
               }
             }
           } catch (err) {
