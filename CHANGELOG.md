@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.3] - 2026-04-24
+
+### Fixed
+- **Follow-up messages in a Feishu thread are now correctly routed into the thread** (#56). In a group thread (话题), when Claude replied with text + image (or long text split into multiple chunks, or a multi-card response), the first message stayed in the thread via `message.reply()` but every follow-up escaped to the chat's root timeline via `message.create()`. Now all follow-ups use `message.reply(source, reply_in_thread: true)` when the triggering notification carries a `thread_id`, which routes into the thread without rendering as a quote-reply. P2P and non-threaded group chats are unaffected — the gate falls through to `message.create()` in those cases (setting `reply_in_thread: true` on a non-threaded source would incorrectly start a new thread).
+
+Fix applies to three call sites in `src/tools.ts`:
+- Multi-chunk text replies (chunks 2..N)
+- Multi-card replies (cards 2..N)
+- Attachments (images, files)
+
+Cronjob-synthetic `thread_id` values (prefixed `job-`, used for IdentitySession isolation, not real Feishu threads) are excluded from thread-routing. Without this carve-out, a cronjob reply with an attachment could pull an unrelated earlier user message into a fabricated Feishu thread.
+
+New `scripts/reply-thread-smoke.ts` verifies the routing via a mock Feishu client across six scenarios (thread + image, P2P + image, thread + long text, missing `reply_to` fallback, thread + file, thread + multi-card).
+
+### Changed
+- **Attachment message IDs now tracked in `BotMessageTracker`.** Pre-1.0.3 the attachment path fire-and-forgot the send and never recorded the returned message_id. Reactions on bot-sent images/files were therefore silently filtered out by the reaction-forwarding gate (which only forwards reactions on known-bot messages). Because the thread-routing fix now captures the send response anyway, the plugin also calls `BotMessageTracker.add` on attachments — user reactions to bot-generated images/files will now correctly surface to Claude.
+
 ## [1.0.2] - 2026-04-22
 
 Two field-reported bug fixes on top of 1.0.1.
@@ -312,6 +329,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.3
 [1.0.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.2
 [1.0.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.1
 [1.0.0]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.0

@@ -52,4 +52,8 @@ echo "=== Mention resolver unit checks ==="
 npx tsx scripts/mention-resolver-smoke.ts
 
 echo ""
+echo "=== Reply thread-routing unit checks ==="
+npx tsx scripts/reply-thread-smoke.ts
+
+echo ""
 echo "All tests passed."
