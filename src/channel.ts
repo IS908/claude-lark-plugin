@@ -18,6 +18,28 @@ function debugLog(msg: string) {
 }
 
 /**
+ * Build a Lark SDK logger that routes every level to stderr. The SDK's default
+ * logger writes to stdout via `console.log`, which would corrupt MCP JSON-RPC
+ * framing on the stdio transport. Every `new Lark.<Client|EventDispatcher|WSClient>(...)`
+ * MUST be constructed with this logger — enforced statically by
+ * `scripts/check-sdk-loggers.ts`.
+ *
+ * Levels implemented: info / warn / error / debug / trace — the canonical
+ * Lark SDK set. If a future SDK version introduces a new level (e.g.
+ * verbose, fatal), this factory will need to be extended; otherwise the
+ * SDK would throw a TypeError on the missing method.
+ */
+function makeSdkLogger(prefix: string) {
+  return {
+    info: (...args: any[]) => console.error(`[${prefix}]`, ...args),
+    warn: (...args: any[]) => console.error(`[${prefix}][warn]`, ...args),
+    error: (...args: any[]) => console.error(`[${prefix}][error]`, ...args),
+    debug: (...args: any[]) => console.error(`[${prefix}][debug]`, ...args),
+    trace: (...args: any[]) => console.error(`[${prefix}][trace]`, ...args),
+  };
+}
+
+/**
  * Whitelist check with OR semantics:
  * - Neither list configured → allow all
  * - Only user list → gate on user only
@@ -159,20 +181,12 @@ export class LarkChannel {
   private latestMessageTracker = new LatestMessageTracker();
 
   constructor() {
-    // Custom logger to redirect all SDK output to stderr (stdout is reserved for MCP JSON-RPC)
-    const sdkLogger = {
-      info: (...args: any[]) => console.error('[lark-sdk]', ...args),
-      warn: (...args: any[]) => console.error('[lark-sdk][warn]', ...args),
-      error: (...args: any[]) => console.error('[lark-sdk][error]', ...args),
-      debug: (...args: any[]) => console.error('[lark-sdk][debug]', ...args),
-      trace: (...args: any[]) => console.error('[lark-sdk][trace]', ...args),
-    };
     this.client = new Lark.Client({
       appId: appConfig.appId,
       appSecret: appConfig.appSecret,
       appType: Lark.AppType.SelfBuild,
       domain: Lark.Domain.Feishu,
-      logger: sdkLogger,
+      logger: makeSdkLogger('lark-sdk'),
     });
   }
 
@@ -227,7 +241,13 @@ export class LarkChannel {
     await this.fetchBotOpenId();
 
     debugLog('[channel] Registering event dispatcher...');
-    const eventDispatcher = new Lark.EventDispatcher({}).register({
+    // EventDispatcher's default logger writes to stdout, which would corrupt
+    // MCP JSON-RPC framing the moment it logs "event-dispatch is ready".
+    // Redirect to stderr like Client and WSClient.
+    const eventDispatcher = new Lark.EventDispatcher({
+      loggerLevel: Lark.LoggerLevel.info,
+      logger: makeSdkLogger('lark-events'),
+    }).register({
       'im.message.receive_v1': async (data: any) => {
         debugLog(`[channel] Event received: im.message.receive_v1`);
         try {
@@ -251,13 +271,7 @@ export class LarkChannel {
       appId: appConfig.appId,
       appSecret: appConfig.appSecret,
       loggerLevel: Lark.LoggerLevel.info,
-      logger: {
-        info: (...args: any[]) => console.error('[lark-ws]', ...args),
-        warn: (...args: any[]) => console.error('[lark-ws][warn]', ...args),
-        error: (...args: any[]) => console.error('[lark-ws][error]', ...args),
-        debug: (...args: any[]) => console.error('[lark-ws][debug]', ...args),
-        trace: (...args: any[]) => console.error('[lark-ws][trace]', ...args),
-      },
+      logger: makeSdkLogger('lark-ws'),
     });
 
     this.wsClient.start({ eventDispatcher });

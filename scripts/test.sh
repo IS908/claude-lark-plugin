@@ -20,6 +20,16 @@ fi
 echo "PASS"
 
 echo ""
+echo "=== SDK constructors have stderr logger ==="
+# Dry-run cannot catch stdout pollution from SDK constructors that only run
+# inside channel.start() (e.g. EventDispatcher). Their default logger writes
+# to stdout and would corrupt MCP JSON-RPC framing. Enforce statically that
+# each `new Lark.<Client|EventDispatcher|WSClient>(` in src/channel.ts has a
+# `logger:` option within the parens of its arg block (depth-tracked scope).
+npx tsx scripts/check-sdk-loggers.ts
+echo "PASS"
+
+echo ""
 echo "=== Card builder unit checks ==="
 npx tsx scripts/card-smoke.ts
 

@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.4] - 2026-04-24
+
+### Fixed
+- **Plugin startup crash from EventDispatcher stdout pollution.** `src/channel.ts` wired a custom stderr logger onto `Lark.Client` and `Lark.WSClient` but missed `Lark.EventDispatcher`, which therefore used the SDK's default logger. On every startup the EventDispatcher wrote `[info]: [ 'event-dispatch is ready' ]` to stdout — which the MCP stdio transport reserves for JSON-RPC framing. The non-JSON bytes corrupted the handshake and Claude Code killed the plugin subprocess. Added the same stderr-redirecting logger to the EventDispatcher constructor.
+
+  This was not caught by `scripts/test.sh`'s existing "MCP stdout clean" assertion because dry-run exits before `channel.start()`, which is where the EventDispatcher is actually constructed.
+
+### Added
+- **Static lint: `scripts/check-sdk-loggers.ts`.** Parses `src/channel.ts` and verifies every `new Lark.<Client|EventDispatcher|WSClient>(` has a `logger:` option within its argument block (paren-balanced scope, not fixed-line window). Runs as part of `npm test` — future omissions fail CI rather than manifest as a mysterious production crash.
+
 ## [1.0.3] - 2026-04-24
 
 ### Fixed
@@ -329,6 +339,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.4]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.4
 [1.0.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.3
 [1.0.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.2
 [1.0.1]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.1
