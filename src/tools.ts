@@ -11,6 +11,35 @@ import type { IdentitySession } from './identity-session.js';
 import { audit } from './audit-log.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
 import { JOB_THREAD_PREFIX } from './scheduler.js';
+import { writeSdkResource } from './sdk-resource.js';
+
+/**
+ * Sanitize and length-cap a Feishu attachment filename for safe local
+ * storage. Path-basename strips any directory prefix, regex replaces
+ * non-`\w.-` chars (including spaces, CJK, special punctuation) with
+ * underscore, then the stem is capped at `maxLen - extLength` so the
+ * extension always survives. Returns the sanitized + capped string.
+ *
+ * Exported for unit testing.
+ */
+export function capSanitizedFilename(raw: string, maxLen: number): string {
+  const sanitized = path.basename(raw).replace(/[^\w.\-]/g, '_');
+  if (sanitized.length <= maxLen) return sanitized;
+  // Find the last `.` separating stem from extension. If no dot or it's
+  // the leading char, treat the whole thing as a stem (no extension to
+  // preserve) and just truncate.
+  const dotIdx = sanitized.lastIndexOf('.');
+  if (dotIdx <= 0 || dotIdx === sanitized.length - 1) {
+    return sanitized.slice(0, maxLen);
+  }
+  const ext = sanitized.slice(dotIdx); // includes leading dot
+  // Cap extension itself to half of maxLen — pathological long extensions
+  // shouldn't crowd out the stem entirely.
+  const safeExt = ext.length > maxLen / 2 ? ext.slice(0, Math.floor(maxLen / 2)) : ext;
+  const stem = sanitized.slice(0, dotIdx);
+  const stemCap = maxLen - safeExt.length;
+  return stem.slice(0, stemCap) + safeExt;
+}
 import {
   sanitizeJobId,
   expandSchedule,
@@ -460,38 +489,90 @@ export function registerTools(
   server.registerTool(
     'download_attachment',
     {
-      description: 'Download an attachment (image, file, audio, video) from a message to local inbox.',
+      description:
+        'Download an attachment (image, file, audio, video) from a message to local inbox. Pass file_name from the inbound notification\'s meta.attachment_name so the saved file keeps its original extension — Claude Read needs the extension to infer MIME type for PDF/text.',
       inputSchema: z.object({
         message_id: z.string().describe('The message ID containing the attachment'),
         file_key: z.string().describe('The file key of the attachment'),
+        file_name: z
+          .string()
+          .optional()
+          .describe(
+            'Original filename from meta.attachment_name (e.g. "report.pdf"). When provided, the extension is preserved in the saved path so Claude Read can infer MIME. Falls back to file_key alone if omitted.',
+          ),
       }),
     },
-    async ({ message_id, file_key }) => {
+    async ({ message_id, file_key, file_name }) => {
       const inboxDir = appConfig.inboxDir;
       await fs.mkdir(inboxDir, { recursive: true });
+
+      // Route type by key prefix: img_* → image, otherwise → file.
+      // (Feishu's messageResource.get only accepts 'image' | 'file'; audio
+      //  and video are routed via 'file'.)
+      const resourceType = file_key.startsWith('img_') ? 'image' : 'file';
+
+      // Saved filename: prefer <file_key>-<original_name> when caller
+      // provides file_name — preserves the extension while keeping the
+      // file_key visible for traceability. Sanitize original name to
+      // avoid path traversal / unexpected separators, and cap length
+      // to leave room for the file_key prefix within NAME_MAX (255B on
+      // macOS/ext4). 200 bytes leaves slack for any future file_key
+      // format change without revisiting this cap.
+      //
+      // Extension preservation: cap the STEM, then reattach the ext.
+      // Required because the whole point of accepting file_name is to
+      // keep the extension so Claude `Read` can infer MIME — a naive
+      // slice(0, 200) would chop the ext off pathological-length names.
+      const sanitizedName = file_name ? capSanitizedFilename(file_name, 200) : '';
+      const savedName = sanitizedName ? `${file_key}-${sanitizedName}` : file_key;
+      const filePath = path.join(inboxDir, savedName);
+
       try {
         // Always use messageResource.get for user-uploaded resources.
         // image.get only works for images the bot itself uploaded.
-        // Route type by key prefix: img_* → image, otherwise → file.
-        const resourceType = file_key.startsWith('img_') ? 'image' : 'file';
-        const data: any = await client.im.v1.messageResource.get({
+        const data: unknown = await client.im.v1.messageResource.get({
           path: { message_id, file_key },
           params: { type: resourceType },
         });
-        if (data) {
-          const filePath = path.join(inboxDir, file_key);
-          await fs.writeFile(filePath, data as any);
-          return { content: [{ type: 'text' as const, text: `Downloaded to ${filePath}` }] };
+        if (!data) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Feishu returned empty response for file_key=${file_key} (type=${resourceType})`,
+              },
+            ],
+            isError: true,
+          };
         }
+        await writeSdkResource(data, filePath);
+        return { content: [{ type: 'text' as const, text: `Downloaded to ${filePath}` }] };
       } catch (err: any) {
         const apiError = err?.response?.data ?? err?.data;
         if (apiError?.code && apiError?.msg) {
           console.error(`[tools] download failed [${apiError.code}]: ${apiError.msg}`);
-          return { content: [{ type: 'text' as const, text: `Feishu API [${apiError.code}]: ${apiError.msg}` }], isError: true };
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Feishu API [${apiError.code}]: ${apiError.msg} (file_key=${file_key}, type=${resourceType})`,
+              },
+            ],
+            isError: true,
+          };
         }
-        console.error(`[tools] download failed:`, err?.message ?? String(err));
+        const msg = err?.message ?? String(err);
+        console.error(`[tools] download failed:`, msg);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Download failed for file_key=${file_key} (type=${resourceType}): ${msg}`,
+            },
+          ],
+          isError: true,
+        };
       }
-      return { content: [{ type: 'text' as const, text: 'Failed to download attachment' }], isError: true };
     }
   );
 

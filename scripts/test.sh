@@ -66,4 +66,8 @@ echo "=== Reply thread-routing unit checks ==="
 npx tsx scripts/reply-thread-smoke.ts
 
 echo ""
+echo "=== Download attachment unit checks ==="
+npx tsx scripts/download-attachment-smoke.ts
+
+echo ""
 echo "All tests passed."
