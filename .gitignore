@@ -5,3 +5,6 @@ docs/
 .DS_Store
 *.js.map
 *.tsbuildinfo
+
+# Local Claude Code state — not part of the plugin source
+.claude/

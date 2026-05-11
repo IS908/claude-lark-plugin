@@ -9,6 +9,7 @@ import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
 import { TERMINAL_CHAT_ID } from './identity-session.js';
+import { writeSdkResource } from './sdk-resource.js';
 
 const DEBUG_LOG = path.join(os.homedir(), '.claude', 'channels', 'lark', 'debug.log');
 function debugLog(msg: string) {
@@ -586,33 +587,16 @@ export class LarkChannel {
         path: { message_id: messageId, file_key: imageKey },
         params: { type: 'image' },
       } as any);
-      if (resp) {
-        const filename = `${Date.now()}-${imageKey}.png`;
-        const filePath = path.join(appConfig.inboxDir, filename);
-        // The SDK returns a readable stream or buffer
-        const data = resp as any;
-        if (Buffer.isBuffer(data)) {
-          writeFileSync(filePath, data);
-        } else if (data?.writeFile) {
-          await data.writeFile(filePath);
-        } else if (typeof data?.pipe === 'function') {
-          // Readable stream — collect into buffer
-          const chunks: Buffer[] = [];
-          for await (const chunk of data) {
-            chunks.push(Buffer.from(chunk));
-          }
-          writeFileSync(filePath, Buffer.concat(chunks));
-        } else {
-          debugLog(`[channel] Unexpected image response type for ${imageKey}`);
-          return undefined;
-        }
-        debugLog(`[channel] Downloaded image ${imageKey} → ${filePath}`);
-        return filePath;
-      }
+      if (!resp) return undefined;
+      const filename = `${Date.now()}-${imageKey}.png`;
+      const filePath = path.join(appConfig.inboxDir, filename);
+      await writeSdkResource(resp, filePath);
+      debugLog(`[channel] Downloaded image ${imageKey} → ${filePath}`);
+      return filePath;
     } catch (err) {
       debugLog(`[channel] Failed to download image ${imageKey}: ${err}`);
+      return undefined;
     }
-    return undefined;
   }
 
   /**
