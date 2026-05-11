@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.5] - 2026-05-12
+
+### Fixed
+- **`download_attachment` silently failed for PDF / file / audio / video** (#60). The tool's response-handling code only knew how to write a `Buffer` (or a Readable stream on newer Node). The Lark SDK returns binary resources wrapped as `{ writeFile(path): Promise<void> }` — passing that object to `fs.writeFile` either threw (caught by the outer try/catch, surfaced as the generic `"Failed to download attachment"`) or wrote `[object Object]` to disk. Images worked only because `channel.downloadImage` had separately implemented the three-shape dispatch.
+
+  Centralised the dispatch in a new `src/sdk-resource.ts` module with `writeSdkResource(data, filePath)` — handles `Buffer`, `{ writeFile }`, and `Readable` streams uniformly, and throws a descriptive error (with a shape descriptor) when the SDK returns something unexpected. Both `channel.downloadImage` and `tools.download_attachment` now route through this helper.
+
+- **Saved attachments now keep their original extension.** `download_attachment` previously saved every file as the opaque `file_key` (`file_v3_xxx`, no extension). Claude `Read` infers MIME from extension, so PDFs and text files weren't being parsed correctly even when the SDK bug above didn't bite. The tool now accepts an optional `file_name` parameter (the inbound notification's `meta.attachment_name`, e.g. `report.pdf`); saved file becomes `<file_key>-<sanitized_name>`. File names are sanitised (path-basename + non-`\w.-` replacement) to block traversal attempts.
+
+- **`download_attachment` error messages now include diagnostic context** — SDK error code + message, file_key, and routed resource type. Previous behavior collapsed all failures to the generic string `"Failed to download attachment"`, leaving Claude no signal to retry or escalate.
+
+### Added
+- `src/sdk-resource.ts` — shared module exporting `writeSdkResource(data, filePath)` and `describeSdkResource(data)` (the latter is used inside error messages so future SDK shape mismatches surface a clear "object{whatever}" descriptor).
+- `scripts/download-attachment-smoke.ts` — 15 mock-based assertions covering all three SDK response shapes, `img_*` vs `file_*` routing, file_name extension preservation, path-traversal sanitisation, SDK error diagnostic propagation, unknown-shape behaviour, and direct unit tests for the `capSanitizedFilename` helper (long stem, long extension, CJK chars stripped, leading-dot files, traversal). Wired into `npm test`.
+
 ## [1.0.4] - 2026-04-24
 
 ### Fixed
@@ -339,6 +354,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.5]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.5
 [1.0.4]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.4
 [1.0.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.3
 [1.0.2]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.2
