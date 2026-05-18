@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.6] - 2026-05-18
+
+### Fixed
+- **Cronjob duplicate execution from filename / `meta.id` mismatch** (#62). `listAllJobs()` previously trusted whatever `meta.id` each file carried, completely independent of the on-disk filename. When the two diverged — typically via hand-edits, `cp foo.json bar.json` for testing, or stale files from a prior release whose `sanitizeJobId` rules changed — the scheduler would surface multiple `JobFile` entries with the same id at every tick and execute the job once per file. `type=message` jobs sent the notification 2×/N× per cycle; `type=prompt` jobs dispatched 2×/N× subagents with all the API-call duplication that implied. Meanwhile `update_job` / `delete_job` (which locate files via `{id}.json`) silently failed for any job whose on-disk file had been renamed.
+
+  `listAllJobs()` now skips and logs a clear stderr warning when `file !== \`${meta.id}.json\``. Defensive (skip + warn) rather than auto-reconcile: operators may have deliberately renamed files, and silently mutating their on-disk state would be worse than surfacing the mismatch. The warning text points at the corrective action (rename file OR edit `meta.id`).
+
+  New smoke assertions (30/31) in `scripts/job-smoke.ts` exercise both the happy path (matched files load) and the mismatch defense (mismatched files skipped + warning emitted) by writing two fixture files into a tmp `jobsDir`.
+
 ## [1.0.5] - 2026-05-12
 
 ### Fixed
@@ -354,6 +363,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.6]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.6
 [1.0.5]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.5
 [1.0.4]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.4
 [1.0.3]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.3
