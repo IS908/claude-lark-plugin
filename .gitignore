@@ -8,3 +8,7 @@ docs/
 
 # Local Claude Code state — not part of the plugin source
 .claude/
+
+# Local agent config files used by other AI tooling (Codex, etc.) — not
+# part of the plugin source. CLAUDE.md is checked in; AGENTS.md is not.
+AGENTS.md
