@@ -7,8 +7,13 @@ import {
   expandSchedule,
   computeNextRun,
   backfillJob,
+  listAllJobs,
   type JobFile,
 } from '../src/job-store.js';
+import { appConfig } from '../src/config.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -244,5 +249,98 @@ if (typeof b3.meta.created_by !== 'string') fail(`created_by must be string: got
 // 29. backfill: non-empty created_by is preserved
 const b4 = backfillJob(makeLegacyJob({ created_by: 'ou_alice' }));
 if (b4.meta.created_by !== 'ou_alice') fail(`backfill must preserve created_by: got "${b4.meta.created_by}"`);
+
+// ── listAllJobs: filename/meta.id mismatch defense (#62) ──
+//
+// Defends against the duplicate-execution bug: if a job file's on-disk
+// name doesn't match its internal meta.id, listAllJobs must skip it
+// (rather than yield a JobFile that no readJob/deleteJob can address),
+// otherwise the scheduler would happily execute orphan files at every
+// tick. See issue #62 for the full failure path.
+
+const tmpJobsDir = mkdtempSync(join(tmpdir(), 'job-mismatch-smoke-'));
+const originalJobsDir = appConfig.jobsDir;
+// `appConfig` is declared `as const`, so TypeScript blocks direct
+// reassignment. At runtime the object is still mutable — cast-and-set
+// for the test, restore in the cleanup block below.
+(appConfig as { jobsDir: string }).jobsDir = tmpJobsDir;
+
+// Cleanup-aware fail helper: restore env + remove tmp dir before exiting.
+// fail() calls process.exit, which BYPASSES try/finally — so any assertion
+// failure inside the try block would otherwise leak the tmp dir and leave
+// appConfig pointing at a deleted path. Going through this helper makes
+// failures as tidy as success.
+function failClean(msg: string): never {
+  (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
+  try { rmSync(tmpJobsDir, { recursive: true, force: true }); } catch {}
+  fail(msg);
+}
+
+// Hoisted outside the try so the finally block can restore stderr even
+// if listAllJobs() throws before we get to the explicit restore line.
+// Without this, an uncaught rejection mid-test would leave stderr
+// overridden for any future code in the same process (harmless today
+// because npm test exits, but cheap belt-and-suspenders).
+const origStderr = process.stderr.write.bind(process.stderr);
+let stderrCapture = '';
+
+try {
+  process.stderr.write = ((chunk: any) => {
+    stderrCapture += typeof chunk === 'string' ? chunk : chunk.toString();
+    return true;
+  }) as any;
+
+  // The console.error path used by job-store goes through process.stderr,
+  // but we wrap conservatively — flush console first.
+
+  // 30. good-file: filename matches meta.id → loaded normally
+  const goodJob: JobFile = {
+    meta: {
+      id: 'job-good',
+      name: 'Good Job',
+      type: 'message',
+      schedule: '* * * * *',
+      schedule_human: 'every 1m',
+      target_chat_id: 'oc_x',
+      origin_chat_id: 'oc_x',
+      status: 'active',
+      created_by: 'ou_x',
+      created_at: '2026-01-01T00:00:00Z',
+      content: 'hi',
+      msg_type: 'text',
+    } as JobFile['meta'],
+    runtime: { last_run_at: null, next_run_at: '2099-01-01T00:00:00Z', run_count: 0, last_error: null },
+  };
+  writeFileSync(join(tmpJobsDir, 'job-good.json'), JSON.stringify(goodJob, null, 2));
+
+  // 31. bad-file: filename does NOT match meta.id → skipped + warning
+  // Simulates `cp job-good.json renamed.json` or a hand-edit gone wrong.
+  const badJob: JobFile = { ...goodJob, meta: { ...goodJob.meta, id: 'job-original' } };
+  writeFileSync(join(tmpJobsDir, 'renamed.json'), JSON.stringify(badJob, null, 2));
+
+  const listed = await listAllJobs();
+
+  // Restore stderr before assertions so failures print normally.
+  process.stderr.write = origStderr;
+
+  if (listed.length !== 1) {
+    failClean(`30/31: expected 1 job (mismatched file skipped), got ${listed.length}: ${listed.map((j) => j.meta.id).join(',')}`);
+  }
+  if (listed[0].meta.id !== 'job-good') {
+    failClean(`30: expected job-good, got ${listed[0].meta.id}`);
+  }
+  if (!stderrCapture.includes('Skipping renamed.json')) {
+    failClean(`31: warning not emitted for mismatched filename. Captured stderr:\n${stderrCapture}`);
+  }
+  if (!stderrCapture.includes('meta.id="job-original"')) {
+    failClean(`31: warning missing meta.id detail. Captured stderr:\n${stderrCapture}`);
+  }
+} finally {
+  // Restore even on failure so later tests / processes don't inherit
+  // overridden stderr, a deleted tmp dir, or a stale appConfig pointer.
+  process.stderr.write = origStderr;
+  (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
+  rmSync(tmpJobsDir, { recursive: true, force: true });
+}
 
 console.log('PASS');

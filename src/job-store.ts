@@ -226,7 +226,29 @@ export async function listAllJobs(): Promise<JobFile[]> {
     for (const file of files.filter(f => f.endsWith('.json'))) {
       try {
         const data = await fs.readFile(path.join(dir, file), 'utf-8');
-        jobs.push(backfillJob(JSON.parse(data) as JobFile));
+        const job = backfillJob(JSON.parse(data) as JobFile);
+        // Defensive: the rest of the job-store (readJob/writeJob/deleteJob)
+        // locates files via `{meta.id}.json`. If the on-disk filename
+        // diverges from meta.id, two failure modes follow:
+        //   (a) update_job / delete_job by id silently fail (the looked-up
+        //       file doesn't exist), and
+        //   (b) if a second file later lands at `{meta.id}.json`, BOTH
+        //       files surface from listAllJobs with the same meta.id and
+        //       the scheduler executes the job once per file (duplicate
+        //       message sends / duplicate prompt subagent dispatches).
+        // See #62 for the full failure analysis. Skip-and-warn rather than
+        // auto-reconcile: operators may have deliberately renamed files,
+        // and silently mutating their on-disk state would be worse than
+        // surfacing the mismatch.
+        if (file !== `${job.meta.id}.json`) {
+          console.error(
+            `[job-store] Skipping ${file}: meta.id="${job.meta.id}" doesn't match filename. ` +
+            `Either rename the file to ${job.meta.id}.json or edit meta.id to match. ` +
+            `Skipping prevents duplicate execution if a matching ${job.meta.id}.json also exists.`,
+          );
+          continue;
+        }
+        jobs.push(job);
       } catch (err) {
         console.error(`[job-store] Skipping corrupt job file ${file}:`, err);
       }
