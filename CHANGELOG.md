@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.7] - 2026-05-19
+
+Three small `job-store` hygiene improvements from #64. No behaviour change for operators whose jobs directory is healthy.
+
+### Changed
+- **`listAllJobs` reads job files in parallel.** Was sequential `await fs.readFile` in a for-loop — O(N × per-file latency). Switched to `Promise.all`. Negligible at typical operator scale (<10 jobs), linear-bad once cronjob counts grow.
+- **`listAllJobs` distinguishes ENOENT / corrupt / unreadable.** Pre-1.0.7 lumped all read failures under `Skipping corrupt job file <file>: <err>`. Three real failure modes now route differently:
+  - **ENOENT** (file vanished between `readdir` and `readFile` — a benign race with concurrent `deleteJob`) → silent skip. The file is legitimately gone, which is the desired state.
+  - **SyntaxError** (JSON parse failed) → `Skipping corrupt job file <file> (invalid JSON): <msg>`.
+  - **Other** (EACCES, EISDIR, ...) → `Skipping unreadable job file <file>: <msg>`. Operator should investigate.
+
+### Fixed
+- **`writeJob` invariant documented.** v1.0.6 fixed the read-side dual-file orphan path (#62). v1.0.7 documents the symmetric write-side invariant in the `writeJob` JSDoc — if a future feature ever lets users rename a job, the caller MUST `deleteJob(oldId)` first. No code change today; every current caller (create_job / update_job / scheduler) keeps `meta.id` stable.
+
+### Added
+- Smoke tests 32–34 in `scripts/job-smoke.ts`: corrupt JSON file labelled correctly (not "unreadable"); a corrupt sibling doesn't break loading of valid jobs alongside; 20 valid jobs all load via the parallel path.
+
+Closes #64
+
 ## [1.0.6] - 2026-05-18
 
 ### Fixed
@@ -363,6 +382,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.7]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.7
 [1.0.6]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.6
 [1.0.5]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.5
 [1.0.4]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.4
