@@ -204,6 +204,20 @@ export async function readJob(id: string): Promise<JobFile | null> {
   }
 }
 
+/**
+ * Persist a JobFile to disk under `{jobsDir}/{job.meta.id}.json`.
+ *
+ * **Invariant for callers**: a job's `meta.id` is stable across its
+ * lifetime. If a future feature ever lets users rename a job, the caller
+ * MUST call `deleteJob(oldId)` BEFORE this with the new id — otherwise
+ * the old file is orphaned. listAllJobs (since v1.0.6, #62) will skip
+ * the orphan with a filename/meta.id-mismatch warning so duplicate
+ * execution won't happen, but the orphan still wastes inode + appears
+ * confusingly in `ls`. Track at #64.
+ *
+ * Today every caller (create_job / update_job / scheduler runtime
+ * persistence) keeps the id stable, so writeJob is a pure overwrite.
+ */
 export async function writeJob(job: JobFile): Promise<void> {
   await ensureJobsDir();
   await fs.writeFile(jobPath(job.meta.id), JSON.stringify(job, null, 2), 'utf-8');
@@ -220,10 +234,22 @@ export async function deleteJob(id: string): Promise<boolean> {
 
 export async function listAllJobs(): Promise<JobFile[]> {
   const dir = appConfig.jobsDir;
+  let files: string[];
   try {
-    const files = await fs.readdir(dir);
-    const jobs: JobFile[] = [];
-    for (const file of files.filter(f => f.endsWith('.json'))) {
+    files = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+  const jsonFiles = files.filter(f => f.endsWith('.json'));
+
+  // Read all files in parallel — was sequential awaits in v1.0.6 and
+  // earlier, which made list_jobs / scheduler tick O(N × per-file latency).
+  // Negligible at typical scale (<10 jobs) but linear-bad once cronjob
+  // counts grow. Promise.all with Promise.allSettled-style per-file
+  // error handling preserves the "one bad file doesn't break the rest"
+  // semantics of the original loop. See #64.
+  const results = await Promise.all(
+    jsonFiles.map(async (file): Promise<JobFile | null> => {
       try {
         const data = await fs.readFile(path.join(dir, file), 'utf-8');
         const job = backfillJob(JSON.parse(data) as JobFile);
@@ -246,17 +272,30 @@ export async function listAllJobs(): Promise<JobFile[]> {
             `Either rename the file to ${job.meta.id}.json or edit meta.id to match. ` +
             `Skipping prevents duplicate execution if a matching ${job.meta.id}.json also exists.`,
           );
-          continue;
+          return null;
         }
-        jobs.push(job);
-      } catch (err) {
-        console.error(`[job-store] Skipping corrupt job file ${file}:`, err);
+        return job;
+      } catch (err: any) {
+        // Distinguish three failure modes so the operator's log signal
+        // matches the actual cause (#64):
+        //   - ENOENT: file vanished between readdir and readFile (benign
+        //     race with concurrent deleteJob). Silent skip — the file is
+        //     legitimately gone, which is the desired state.
+        //   - SyntaxError: JSON parse failed. Genuinely corrupt.
+        //   - Other (EACCES, EISDIR, etc.): unreadable for an unexpected
+        //     reason. Operator should investigate.
+        if (err?.code === 'ENOENT') return null;
+        if (err instanceof SyntaxError) {
+          console.error(`[job-store] Skipping corrupt job file ${file} (invalid JSON):`, err.message);
+        } else {
+          console.error(`[job-store] Skipping unreadable job file ${file}:`, err?.message ?? err);
+        }
+        return null;
       }
-    }
-    return jobs;
-  } catch {
-    return [];
-  }
+    }),
+  );
+
+  return results.filter((j): j is JobFile => j !== null);
 }
 
 export async function jobExists(id: string): Promise<boolean> {

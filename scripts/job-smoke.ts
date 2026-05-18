@@ -343,4 +343,127 @@ try {
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }
 
+// ── listAllJobs: corrupt vs unreadable vs ENOENT distinction (#64) ──
+//
+// v1.0.6 lumped all read failures under "Skipping corrupt job file".
+// v1.0.7 distinguishes: ENOENT (silent — benign delete race), SyntaxError
+// (truly corrupt), other (unreadable).
+
+const tmpJobsDir2 = mkdtempSync(join(tmpdir(), 'job-errkind-smoke-'));
+const originalJobsDir2 = appConfig.jobsDir;
+(appConfig as { jobsDir: string }).jobsDir = tmpJobsDir2;
+
+const origStderr2 = process.stderr.write.bind(process.stderr);
+let stderrCapture2 = '';
+
+function failClean2(msg: string): never {
+  process.stderr.write = origStderr2;
+  (appConfig as { jobsDir: string }).jobsDir = originalJobsDir2;
+  try { rmSync(tmpJobsDir2, { recursive: true, force: true }); } catch {}
+  fail(msg);
+}
+
+try {
+  process.stderr.write = ((chunk: any) => {
+    stderrCapture2 += typeof chunk === 'string' ? chunk : chunk.toString();
+    return true;
+  }) as any;
+
+  // 32. corrupt-JSON file is labelled "corrupt", not "unreadable"
+  writeFileSync(join(tmpJobsDir2, 'broken.json'), 'not-valid-json{');
+  // 33. one good job alongside the broken one — should still load
+  const goodJob: JobFile = {
+    meta: {
+      id: 'job-alongside',
+      name: 'Alongside Good',
+      type: 'message',
+      schedule: '* * * * *',
+      schedule_human: 'every 1m',
+      target_chat_id: 'oc_x',
+      origin_chat_id: 'oc_x',
+      status: 'active',
+      created_by: 'ou_x',
+      created_at: '2026-01-01T00:00:00Z',
+      content: 'hi',
+      msg_type: 'text',
+    } as JobFile['meta'],
+    runtime: { last_run_at: null, next_run_at: '2099-01-01T00:00:00Z', run_count: 0, last_error: null },
+  };
+  writeFileSync(join(tmpJobsDir2, 'job-alongside.json'), JSON.stringify(goodJob, null, 2));
+
+  const listed = await listAllJobs();
+
+  process.stderr.write = origStderr2;
+
+  // 32a. corrupt file warning fires with the correct label
+  if (!stderrCapture2.includes('corrupt job file broken.json')) {
+    failClean2(`32: expected "corrupt job file broken.json" in stderr. Got:\n${stderrCapture2}`);
+  }
+  // 32b. corrupt file warning does NOT use the unreadable label.
+  // Intentionally tautological with 32a today: job-store emits exactly
+  // ONE log line per file via either branch, so once 32a passes, 32b
+  // cannot fail. Kept as regression scaffolding — if a future refactor
+  // reorders the `instanceof SyntaxError` check below the generic `else`
+  // (and the same file got mis-routed through both), this would fire.
+  // Do not "clean up" this check.
+  if (stderrCapture2.includes('unreadable job file broken.json')) {
+    failClean2(`32: corrupt file shouldn't be labelled "unreadable". Got:\n${stderrCapture2}`);
+  }
+  // 33. good job survives the corrupt sibling
+  if (listed.length !== 1 || listed[0].meta.id !== 'job-alongside') {
+    failClean2(`33: expected only job-alongside, got ${listed.map((j) => j.meta.id).join(',')}`);
+  }
+} finally {
+  process.stderr.write = origStderr2;
+  (appConfig as { jobsDir: string }).jobsDir = originalJobsDir2;
+  rmSync(tmpJobsDir2, { recursive: true, force: true });
+}
+
+// ── listAllJobs: parallel reads complete (smoke for #64 perf change) ──
+// 34. 20 valid jobs all load via the parallel Promise.all path
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'job-parallel-smoke-'));
+  const origDir = appConfig.jobsDir;
+  (appConfig as { jobsDir: string }).jobsDir = tmp;
+
+  // Cleanup-aware fail mirrors failClean / failClean2 — fail() calls
+  // process.exit which bypasses the finally below.
+  function failClean3(msg: string): never {
+    (appConfig as { jobsDir: string }).jobsDir = origDir;
+    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+    fail(msg);
+  }
+
+  try {
+    for (let i = 0; i < 20; i++) {
+      const id = `parallel-${String(i).padStart(2, '0')}`;
+      const job: JobFile = {
+        meta: {
+          id,
+          name: `Parallel ${i}`,
+          type: 'message',
+          schedule: '* * * * *',
+          schedule_human: 'every 1m',
+          target_chat_id: 'oc_x',
+          origin_chat_id: 'oc_x',
+          status: 'active',
+          created_by: 'ou_x',
+          created_at: '2026-01-01T00:00:00Z',
+          content: 'hi',
+          msg_type: 'text',
+        } as JobFile['meta'],
+        runtime: { last_run_at: null, next_run_at: '2099-01-01T00:00:00Z', run_count: 0, last_error: null },
+      };
+      writeFileSync(join(tmp, `${id}.json`), JSON.stringify(job, null, 2));
+    }
+    const listed = await listAllJobs();
+    if (listed.length !== 20) {
+      failClean3(`34: parallel read missed jobs. expected 20, got ${listed.length}`);
+    }
+  } finally {
+    (appConfig as { jobsDir: string }).jobsDir = origDir;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 console.log('PASS');
