@@ -13,13 +13,15 @@
  * profileDistillationPrompt path where the target user is unambiguous.
  */
 export function flushPrompt(chatId: string, conversation: string, messageCount: number): string {
-  return `[Auto-memory-flush]
+  return `[Auto-memory-flush — system-initiated]
+This is a buffer flush triggered by inactivity, not a user message. The plugin has bound a system caller for this turn, so save_memory(type="chat", ...) will succeed even though no real user invoked it.
+
 The following is a conversation from chat ${chatId} (${messageCount} messages).
 Please:
 1. Write a 3-5 sentence summary focusing on: what was discussed, what was decided, what was resolved, and any open items.
-2. Call save_memory(type="chat", content=<summary>, reason=<why>, chat_id="${chatId}") to persist it.
+2. Call save_memory(type="chat", content=<summary>, reason=<why>, chat_id="${chatId}") to persist it. Do not output a reply — this is system, not user.
 
-Do NOT call save_memory(type="profile", ...) in this turn — profile writes require a specific caller identity, which an auto-flush does not have. Individual profile updates are handled by a separate distillation stage.
+Do NOT call save_memory(type="profile", ...) in this turn — profile writes are user-scoped (they persist into a specific user's profile directory), and a system caller has no user identity to attribute private-tier data to. The server-side gate will reject any profile write attempt here. Individual profile updates are handled by a separate distillation stage.
 
 --- Conversation ---
 ${conversation}

@@ -10,7 +10,7 @@ import { registerTools } from './tools.js';
 import { ConversationBuffer } from './memory/buffer.js';
 import { buildFlushPrompt } from './memory/distiller.js';
 import { MemoryStore } from './memory/file.js';
-import { IdentitySession } from './identity-session.js';
+import { IdentitySession, SYSTEM_FLUSH_CALLER } from './identity-session.js';
 import { JobScheduler } from './scheduler.js';
 import { mcpServerInstructions } from './prompts.js';
 
@@ -63,7 +63,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.7' },
+    { name: 'claude-lark-plugin', version: '1.0.8' },
     {
       capabilities: {
         logging: {},
@@ -87,6 +87,22 @@ async function main() {
     // In auto-flush, we inject the prompt as if it were a message
     // The channel's message handler will forward it to Claude
     console.error(`[distiller] Auto-flush for chat ${chatId}: ${messages.length} messages`);
+
+    // Bind a system-flush caller BEFORE notifying Claude (#66). Without
+    // this, save_memory(type=chat) inside the flush turn fails caller
+    // resolution because:
+    //   - User entries are stored by IdentitySession under (chatId, threadId).
+    //   - The flush notification carries chatId only (no threadId, since the
+    //     buffer is chat-scoped, not thread-scoped).
+    //   - getCaller(chatId, undefined) falls back to a chat-level entry,
+    //     which is only present in non-threaded chats. Threaded chats miss.
+    //
+    // Chat episodes are stored by (chatId, threadId?), NOT by caller, so a
+    // sentinel caller doesn't change WHERE the data goes — only WHAT the
+    // audit log records. Mirrors scheduler.executePromptJob's pattern of
+    // binding job.meta.created_by before the cronjob notification.
+    identitySession.setCaller(chatId, undefined, SYSTEM_FLUSH_CALLER);
+
     // Forward flush prompt through the normal message handler
     if (channel['messageHandler']) {
       await channel['messageHandler']({

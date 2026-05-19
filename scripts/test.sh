@@ -70,4 +70,8 @@ echo "=== Download attachment unit checks ==="
 npx tsx scripts/download-attachment-smoke.ts
 
 echo ""
+echo "=== Auto-flush caller binding unit checks ==="
+npx tsx scripts/auto-flush-smoke.ts
+
+echo ""
 echo "All tests passed."

@@ -25,6 +25,35 @@
 
 export const TERMINAL_CHAT_ID = '__terminal__';
 
+/**
+ * Sentinel caller for buffer auto-flush turns (#66). The flush is a
+ * system-initiated, chat-level distillation — no user triggered it. We
+ * bind this synthetic caller before the flush notification so the
+ * server-side `resolveCaller` gate passes and `save_memory(type=chat|thread)`
+ * can persist.
+ *
+ * NOT a valid profile owner — `save_memory(type=profile)` rejects this
+ * sentinel server-side (system has no user identity to attribute private
+ * data to). The flush prompt also instructs Claude not to attempt profile
+ * writes during flush turns; this constant is the second line of defense.
+ *
+ * `resolveCaller` in tools.ts further restricts the sentinel to only
+ * `save_memory` — any other sensitive tool (`create_job`, `forget_memory`,
+ * etc.) is denied to prevent sentinel-attributed records that no real
+ * user could later address.
+ *
+ * Audit log entries for system-flush writes carry caller=`__system_flush__`,
+ * making the data lineage greppable.
+ *
+ * Operator constraint: `LARK_OWNER_OPEN_ID` MUST NOT equal this value.
+ * If it did, terminal invocations would resolve through `ownerFallback()`
+ * to the sentinel and inherit the sentinel's restrictive guard — the
+ * operator would be locked out of every sensitive tool except save_memory.
+ * Realistic risk near zero (Feishu open_ids are `ou_*`), but documented
+ * for completeness.
+ */
+export const SYSTEM_FLUSH_CALLER = '__system_flush__';
+
 interface SessionEntry {
   userId: string;
   updatedAt: number;
