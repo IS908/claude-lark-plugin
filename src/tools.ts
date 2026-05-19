@@ -8,6 +8,7 @@ import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { BotMessageTracker, LatestMessageTracker, LarkChannel } from './channel.js';
 import type { IdentitySession } from './identity-session.js';
+import { SYSTEM_FLUSH_CALLER } from './identity-session.js';
 import { audit } from './audit-log.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
 import { JOB_THREAD_PREFIX } from './scheduler.js';
@@ -102,6 +103,33 @@ export function registerTools(
             {
               type: 'text' as const,
               text: `No active identity session for chat ${chat_id}. This tool requires an inbound Feishu message to establish caller identity, or a terminal invocation with LARK_OWNER_OPEN_ID set.`,
+            },
+          ],
+        },
+      };
+    }
+    // SYSTEM_FLUSH_CALLER is bound by buffer.setFlushHandler (#66) to let
+    // save_memory persist chat-level distillations without a real user
+    // identity. It must NOT authorize anything else — a sentinel-attributed
+    // `create_job` would produce a job with `created_by=__system_flush__`
+    // that no real operator could update/delete (owner mismatch); a
+    // sentinel-attributed `forget_memory` couldn't address any user's
+    // profile. The save_memory handler itself further restricts the
+    // sentinel to type=chat|thread (rejecting type=profile).
+    //
+    // The sentinel binding can outlive the flush turn (sticky in
+    // IdentitySession until the next real user message overwrites it),
+    // so this guard is also defense against any later tool call that
+    // happens to land on the leftover entry.
+    if (caller === SYSTEM_FLUSH_CALLER && toolName !== 'save_memory') {
+      void audit(toolName, caller, args, 'denied');
+      return {
+        error: {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `${toolName} is not authorized for the system-flush caller. Only save_memory can authorize under this caller (and save_memory itself further restricts to type=chat|thread). The sentinel exists to let buffer flushes persist chat episodes without a real user — not to act on behalf of one.`,
             },
           ],
         },
@@ -622,6 +650,30 @@ export function registerTools(
       const auth = resolveCaller('save_memory', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const { caller } = auth;
+
+      // Defense in depth (#66): the auto-flush turn binds SYSTEM_FLUSH_CALLER
+      // as the caller so save_memory(type=chat|thread) can persist
+      // chat-level distillations without a real user identity. That sentinel
+      // MUST NOT be allowed to write profile tiers — profiles are
+      // user-scoped (saveProfile writes to profiles/<callerId>/...), and a
+      // sentinel "writer" has no user identity to legitimately own
+      // private-tier data. The flush prompt already forbids type=profile,
+      // this is the server-side guard against Claude going off-script.
+      if (type === 'profile' && caller === SYSTEM_FLUSH_CALLER) {
+        void audit('save_memory', caller, auditArgs, 'denied');
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                'save_memory(type=profile) denied: caller is the system-flush sentinel. ' +
+                'Profile writes need a real user identity. If you reached this in an ' +
+                'auto-flush turn, restrict to type=chat or type=thread.',
+            },
+          ],
+          isError: true,
+        };
+      }
 
       if (type === 'profile') {
         const effectiveTier = tier ?? 'private';

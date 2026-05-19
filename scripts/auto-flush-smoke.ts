@@ -1,0 +1,229 @@
+/**
+ * Auto-flush caller-binding smoke test — runs as part of `npm test`.
+ *
+ * Verifies the v1.0.8 fix for #66:
+ *   - SYSTEM_FLUSH_CALLER sentinel is exported with the documented value.
+ *   - setCaller(chatId, undefined, SYSTEM_FLUSH_CALLER) followed by
+ *     save_memory(type='chat') succeeds end-to-end (the bug being fixed:
+ *     pre-1.0.8 this denied because resolveCaller returned null in
+ *     threaded contexts).
+ *   - The server-side guard rejects save_memory(type='profile') when the
+ *     caller is the sentinel, even though resolveCaller succeeds — system
+ *     has no user identity to attribute private-tier data to.
+ */
+import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
+
+function fail(msg: string): never {
+  console.error(`FAIL: ${msg}`);
+  process.exit(1);
+}
+
+// Route audit log to a tmpdir BEFORE importing audit-log.js (it reads env at import).
+const tmp = mkdtempSync(join(tmpdir(), 'auto-flush-smoke-'));
+process.env.LARK_AUDIT_LOG = join(tmp, 'audit.log');
+process.env.LARK_PRIVACY_RULES_FILE = join(tmp, 'privacy-rules.md');
+
+const { IdentitySession, SYSTEM_FLUSH_CALLER } = await import('../src/identity-session.js');
+const { MemoryStore } = await import('../src/memory/file.js');
+const { registerTools } = await import('../src/tools.js');
+import type { LarkChannel } from '../src/channel.js';
+
+let passed = 0;
+
+// ── 1. SYSTEM_FLUSH_CALLER constant value ──
+if (SYSTEM_FLUSH_CALLER !== '__system_flush__') {
+  fail(`1: SYSTEM_FLUSH_CALLER should be "__system_flush__", got "${SYSTEM_FLUSH_CALLER}"`);
+}
+passed++;
+
+// ── 2. setCaller + getCaller roundtrips the sentinel ──
+{
+  const s = new IdentitySession(() => null);
+  s.setCaller('oc_x', undefined, SYSTEM_FLUSH_CALLER);
+  if (s.getCaller('oc_x') !== SYSTEM_FLUSH_CALLER) {
+    fail(`2: roundtrip failed, got ${s.getCaller('oc_x')}`);
+  }
+  passed++;
+}
+
+// ── Setup for tool-integration tests ──
+
+const memRoot = join(tmp, 'memory');
+const memoryStore = new MemoryStore(memRoot);
+
+const handlers = new Map<string, (args: any) => Promise<any>>();
+const fakeServer = {
+  registerTool(name: string, _config: any, handler: any) {
+    handlers.set(name, handler);
+  },
+};
+
+const identitySession = new IdentitySession(() => null);
+const fakeChannel = { isPrivateChat: () => false } as unknown as LarkChannel;
+
+// Minimal mock Lark client — save_memory doesn't actually use it but
+// registerTools signature requires one.
+const mockClient = {
+  im: {
+    v1: {
+      message: { create: async () => ({}), reply: async () => ({}) },
+      messageReaction: { create: async () => {}, delete: async () => {} },
+      image: { create: async () => ({}), get: async () => Buffer.from('') },
+      file: { create: async () => ({}) },
+      messageResource: { get: async () => Readable.from([]) },
+    },
+  },
+};
+
+registerTools(
+  fakeServer as any,
+  mockClient as any,
+  memoryStore,
+  identitySession,
+  fakeChannel,
+  { record() {}, flush: async () => {}, startAutoFlush: () => {}, stopAutoFlush: () => {} } as any,
+  new Map<string, string>(),
+  { ids: new Set(), add() {}, has: () => false } as any,
+  undefined,
+);
+
+const saveMemory = handlers.get('save_memory');
+if (!saveMemory) fail('save_memory handler not registered');
+
+// ── 3. save_memory(type=chat) succeeds with SYSTEM_FLUSH_CALLER ──
+// This is the actual #66 bug: pre-1.0.8, resolveCaller returned null for
+// (chat, no threadId) when user's entry was at (chat, threadId), and the
+// call was denied. With v1.0.8's flush-handler setCaller, the call now
+// resolves to the sentinel and the episode persists.
+{
+  identitySession.setCaller('oc_thread_chat', undefined, SYSTEM_FLUSH_CALLER);
+  const r = await saveMemory!({
+    type: 'chat',
+    content: 'distilled summary of the conversation',
+    reason: 'auto-flush after inactivity',
+    chat_id: 'oc_thread_chat',
+    // no thread_id — mirrors what the flush notification provides
+  });
+  if (r.isError) {
+    fail(`3: save_memory(type=chat) should succeed with system caller, got error: ${JSON.stringify(r.content)}`);
+  }
+  // Episode file actually written?
+  const episodesDir = join(memRoot, 'episodes', 'oc_thread_chat');
+  if (!existsSync(episodesDir)) {
+    fail(`3: episode directory not created at ${episodesDir}`);
+  }
+  const files = readdirSync(episodesDir).filter((f) => f.endsWith('.md'));
+  if (files.length !== 1) fail(`3: expected 1 episode file, got ${files.length}`);
+  const content = readFileSync(join(episodesDir, files[0]), 'utf-8');
+  if (!content.includes('distilled summary')) fail(`3: episode content lost`);
+  passed++;
+}
+
+// ── 4. save_memory(type=profile) DENIED with SYSTEM_FLUSH_CALLER ──
+// Defense in depth: even if Claude goes off-script and tries to write a
+// profile during a flush turn, the server rejects.
+{
+  identitySession.setCaller('oc_thread_chat', undefined, SYSTEM_FLUSH_CALLER);
+  const r = await saveMemory!({
+    type: 'profile',
+    content: 'user likes tea',
+    reason: 'inferred during flush',
+    chat_id: 'oc_thread_chat',
+    tier: 'private',
+  });
+  if (!r.isError) fail(`4: save_memory(type=profile) must be denied for system caller`);
+  const txt = r.content[0].text as string;
+  if (!/system-flush sentinel/.test(txt)) {
+    fail(`4: error must mention sentinel, got: ${txt}`);
+  }
+  // No profile written to disk for the sentinel "user"
+  const sentinelProfileDir = join(memRoot, 'profiles', SYSTEM_FLUSH_CALLER);
+  if (existsSync(sentinelProfileDir)) {
+    fail(`4: sentinel must not have a profile directory`);
+  }
+  passed++;
+}
+
+// Audit log writes are fire-and-forget (`void audit(...)` inside tools.ts).
+// Wait briefly for the queued appendFile calls to land before reading.
+// Retry-loop up to 1s — should land in <50ms on a healthy disk.
+async function waitForAuditLog(): Promise<string> {
+  const auditPath = process.env.LARK_AUDIT_LOG!;
+  for (let i = 0; i < 20; i++) {
+    if (existsSync(auditPath)) {
+      const contents = readFileSync(auditPath, 'utf-8');
+      if (contents.includes('denied') && contents.includes('ok')) return contents;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const final = existsSync(auditPath) ? readFileSync(auditPath, 'utf-8') : '(file missing)';
+  fail(`audit log never reached expected state. Last contents:\n${final}`);
+}
+
+const auditLog = await waitForAuditLog();
+
+// ── 5. Audit log records the denial ──
+{
+  if (!auditLog.includes('denied')) fail(`5: audit log should record denial`);
+  if (!auditLog.includes(SYSTEM_FLUSH_CALLER)) {
+    fail(`5: audit log should record the sentinel caller`);
+  }
+  passed++;
+}
+
+// ── 6. save_memory(type=chat) audit shows sentinel as caller (operator can grep) ──
+{
+  const okLine = auditLog.split('\n').find((l) => l.includes('ok') && l.includes(SYSTEM_FLUSH_CALLER));
+  if (!okLine) fail(`6: audit log should record ok save with sentinel caller. Got:\n${auditLog}`);
+  passed++;
+}
+
+// ── 7. Other sensitive tools are denied for SYSTEM_FLUSH_CALLER ──
+// Defense: the sentinel is bound only to let save_memory persist chat
+// episodes during a flush. It must not authorize create_job /
+// forget_memory / etc. — any such call would produce records owned by
+// or addressing the sentinel, which no real user can later
+// update/delete/inspect. resolveCaller centralises this guard.
+{
+  const createJob = handlers.get('create_job');
+  if (!createJob) fail('7: create_job handler not registered');
+
+  identitySession.setCaller('oc_thread_chat', undefined, SYSTEM_FLUSH_CALLER);
+  const r = await createJob!({
+    name: 'rogue-job',
+    type: 'message',
+    schedule: 'every 5m',
+    content: 'hi',
+    target_chat_id: 'oc_thread_chat',
+    chat_id: 'oc_thread_chat',
+    // no thread_id — mirrors what a flush turn would have
+  });
+  if (!r.isError) fail(`7: create_job must be denied for system caller, got: ${JSON.stringify(r.content)}`);
+  const txt = r.content[0].text as string;
+  if (!/system-flush caller|sentinel/i.test(txt)) {
+    fail(`7: error should explain sentinel restriction, got: ${txt}`);
+  }
+  passed++;
+}
+
+// ── 8. forget_memory also denied for SYSTEM_FLUSH_CALLER ──
+{
+  const forgetMemory = handlers.get('forget_memory');
+  if (!forgetMemory) fail('8: forget_memory handler not registered');
+
+  identitySession.setCaller('oc_thread_chat', undefined, SYSTEM_FLUSH_CALLER);
+  const r = await forgetMemory!({
+    hash: 'deadbeef',
+    tier: 'private',
+    chat_id: 'oc_thread_chat',
+  });
+  if (!r.isError) fail(`8: forget_memory must be denied for system caller, got: ${JSON.stringify(r.content)}`);
+  passed++;
+}
+
+rmSync(tmp, { recursive: true, force: true });
+
+console.log(`auto-flush smoke: ${passed}/8 PASS`);
