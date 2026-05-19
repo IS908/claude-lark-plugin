@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.8] - 2026-05-19
+
+### Fixed
+- **Auto-flush `save_memory` was silently denied in threaded group chats** (#66). After the inactivity-triggered buffer flush, Claude tried to call `save_memory(type="chat", chat_id=X)` to persist the distilled summary, but `resolveCaller(X, undefined)` returned null and the call was denied — Claude printed a "no caller, giving up" diagnostic to stderr and the episode was lost. Pre-1.0.8 the `CLAUDE.md` note called this "flaky"; the actual cause is structural, not transient:
+
+  Identity binding uses key `(chatId, threadId)`. In a threaded group chat, user messages bind under `(chat, thread)`. The flush notification carries `chatId` only (the buffer is chat-scoped, no thread). `getCaller(chat, undefined)` falls back to chat-level entries — which exist only for non-threaded chats. **Threaded group chats failed every flush.**
+
+  Fix: in `buffer.setFlushHandler`, bind a sentinel caller `SYSTEM_FLUSH_CALLER = '__system_flush__'` before notifying Claude — mirrors `scheduler.executePromptJob`'s pattern of binding `job.meta.created_by` before a cronjob notification. Chat episodes are stored by `(chatId, threadId?)` only (not by caller), so the sentinel only affects audit-log attribution — the data itself goes to the same `episodes/<chatId>/` directory it always did. Audit log entries for system-flush writes carry `caller=__system_flush__`, making system-distilled episodes greppable.
+
+### Added
+- `SYSTEM_FLUSH_CALLER` constant exported from `src/identity-session.ts`.
+- Server-side guard in `resolveCaller`: when caller resolves to `SYSTEM_FLUSH_CALLER`, only `save_memory` is authorized — all other sensitive tools (`create_job`, `update_job`, `delete_job`, `list_jobs`, `what_do_you_know`, `forget_memory`) are denied. Reason: the sentinel exists solely to let buffer flushes persist chat episodes without a real user. A sentinel-attributed `create_job` would produce a job no real operator could later update/delete (owner mismatch); a sentinel-attributed `forget_memory` couldn't address any user's profile. The guard is also defense for the sticky-binding window: `IdentitySession` entries outlive the flush turn until the next real user message overwrites them.
+- Server-side guard in `save_memory`: when caller is `SYSTEM_FLUSH_CALLER`, `type="profile"` is rejected with an explanatory error. Profile writes are user-scoped (`saveProfile` writes to `profiles/<callerId>/`), and the sentinel has no user identity to legitimately own private-tier data.
+- `scripts/auto-flush-smoke.ts` — 8 assertions covering: sentinel value; `setCaller`/`getCaller` roundtrip; end-to-end `save_memory(type=chat)` success with episode file written to disk; `save_memory(type=profile)` rejection; audit log records both `denied` and `ok` with the sentinel caller (operator-greppable); `create_job` denied for the sentinel; `forget_memory` denied for the sentinel.
+
+### Changed
+- The auto-flush prompt (`src/prompts.ts`) now explicitly tells Claude the turn is system-initiated, that the plugin has bound a system caller, and that profile writes will be rejected server-side. Stops Claude from second-guessing and emitting the "no caller, giving up" diagnostic on threaded chats.
+
+Closes #66
+
 ## [1.0.7] - 2026-05-19
 
 Three small `job-store` hygiene improvements from #64. No behaviour change for operators whose jobs directory is healthy.
@@ -382,6 +402,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.8]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.8
 [1.0.7]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.7
 [1.0.6]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.6
 [1.0.5]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.5
