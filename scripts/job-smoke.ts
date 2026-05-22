@@ -8,6 +8,7 @@ import {
   computeNextRun,
   backfillJob,
   listAllJobs,
+  readJob,
   type JobFile,
 } from '../src/job-store.js';
 import { appConfig } from '../src/config.js';
@@ -250,15 +251,15 @@ if (typeof b3.meta.created_by !== 'string') fail(`created_by must be string: got
 const b4 = backfillJob(makeLegacyJob({ created_by: 'ou_alice' }));
 if (b4.meta.created_by !== 'ou_alice') fail(`backfill must preserve created_by: got "${b4.meta.created_by}"`);
 
-// ── listAllJobs: filename/meta.id mismatch defense (#62) ──
+// ── listAllJobs / readJob: meta.id is filename-derived (#68) ──
 //
-// Defends against the duplicate-execution bug: if a job file's on-disk
-// name doesn't match its internal meta.id, listAllJobs must skip it
-// (rather than yield a JobFile that no readJob/deleteJob can address),
-// otherwise the scheduler would happily execute orphan files at every
-// tick. See issue #62 for the full failure path.
+// The on-disk filename is the SINGLE source of truth for the job id.
+// Whatever meta.id the JSON carries is overwritten with the file stem on
+// every read. This replaces the pre-v1.0.9 skip-on-mismatch logic (#62):
+// a hand-edited or copied file no longer silently disappears — it loads
+// with meta.id derived from its filename.
 
-const tmpJobsDir = mkdtempSync(join(tmpdir(), 'job-mismatch-smoke-'));
+const tmpJobsDir = mkdtempSync(join(tmpdir(), 'job-id-smoke-'));
 const originalJobsDir = appConfig.jobsDir;
 // `appConfig` is declared `as const`, so TypeScript blocks direct
 // reassignment. At runtime the object is still mutable — cast-and-set
@@ -276,28 +277,11 @@ function failClean(msg: string): never {
   fail(msg);
 }
 
-// Hoisted outside the try so the finally block can restore stderr even
-// if listAllJobs() throws before we get to the explicit restore line.
-// Without this, an uncaught rejection mid-test would leave stderr
-// overridden for any future code in the same process (harmless today
-// because npm test exits, but cheap belt-and-suspenders).
-const origStderr = process.stderr.write.bind(process.stderr);
-let stderrCapture = '';
-
 try {
-  process.stderr.write = ((chunk: any) => {
-    stderrCapture += typeof chunk === 'string' ? chunk : chunk.toString();
-    return true;
-  }) as any;
-
-  // The console.error path used by job-store goes through process.stderr,
-  // but we wrap conservatively — flush console first.
-
-  // 30. good-file: filename matches meta.id → loaded normally
-  const goodJob: JobFile = {
+  const baseJob: JobFile = {
     meta: {
-      id: 'job-good',
-      name: 'Good Job',
+      id: 'placeholder',
+      name: 'Job',
       type: 'message',
       schedule: '* * * * *',
       schedule_human: 'every 1m',
@@ -311,34 +295,60 @@ try {
     } as JobFile['meta'],
     runtime: { last_run_at: null, next_run_at: '2099-01-01T00:00:00Z', run_count: 0, last_error: null },
   };
-  writeFileSync(join(tmpJobsDir, 'job-good.json'), JSON.stringify(goodJob, null, 2));
 
-  // 31. bad-file: filename does NOT match meta.id → skipped + warning
-  // Simulates `cp job-good.json renamed.json` or a hand-edit gone wrong.
-  const badJob: JobFile = { ...goodJob, meta: { ...goodJob.meta, id: 'job-original' } };
-  writeFileSync(join(tmpJobsDir, 'renamed.json'), JSON.stringify(badJob, null, 2));
+  // 30. matched file: filename == meta.id → loads, id correct
+  writeFileSync(
+    join(tmpJobsDir, 'job-good.json'),
+    JSON.stringify({ ...baseJob, meta: { ...baseJob.meta, id: 'job-good' } }, null, 2),
+  );
+
+  // 31. mismatched file: filename "renamed.json" but internal meta.id is
+  //     "job-original" (simulates a hand-edit or `cp`). Pre-v1.0.9 this was
+  //     skipped and the job silently vanished. Now it loads with
+  //     meta.id derived from the filename.
+  writeFileSync(
+    join(tmpJobsDir, 'renamed.json'),
+    JSON.stringify({ ...baseJob, meta: { ...baseJob.meta, id: 'job-original' } }, null, 2),
+  );
 
   const listed = await listAllJobs();
 
-  // Restore stderr before assertions so failures print normally.
-  process.stderr.write = origStderr;
+  // 30 — both files load; nothing is skipped
+  if (listed.length !== 2) {
+    failClean(`30: expected 2 jobs (no skip), got ${listed.length}: ${listed.map((j) => j.meta.id).join(',')}`);
+  }
+  const ids = listed.map((j) => j.meta.id).sort();
+  if (ids[0] !== 'job-good' || ids[1] !== 'renamed') {
+    failClean(`30/31: expected ids [job-good, renamed], got [${ids.join(', ')}]`);
+  }
 
-  if (listed.length !== 1) {
-    failClean(`30/31: expected 1 job (mismatched file skipped), got ${listed.length}: ${listed.map((j) => j.meta.id).join(',')}`);
+  // 31 — the mismatched file's meta.id is the FILENAME stem, not the
+  //      stale internal value "job-original"
+  const renamed = listed.find((j) => j.meta.id === 'renamed');
+  if (!renamed) failClean('31: renamed.json did not load');
+  if ((renamed!.meta as any).id === 'job-original') {
+    failClean('31: meta.id should be filename-derived, not the stale internal value');
   }
-  if (listed[0].meta.id !== 'job-good') {
-    failClean(`30: expected job-good, got ${listed[0].meta.id}`);
-  }
-  if (!stderrCapture.includes('Skipping renamed.json')) {
-    failClean(`31: warning not emitted for mismatched filename. Captured stderr:\n${stderrCapture}`);
-  }
-  if (!stderrCapture.includes('meta.id="job-original"')) {
-    failClean(`31: warning missing meta.id detail. Captured stderr:\n${stderrCapture}`);
+  // 31a — withFilenameId touches ONLY meta.id; all sibling fields and
+  //       runtime survive intact (regression guard against a future
+  //       canonicaliser that over-reaches).
+  if (renamed!.meta.schedule !== '* * * * *') failClean('31a: schedule corrupted');
+  if (renamed!.meta.type !== 'message') failClean('31a: type corrupted');
+  if ((renamed!.meta as any).content !== 'hi') failClean('31a: content corrupted');
+  if (renamed!.meta.target_chat_id !== 'oc_x') failClean('31a: target_chat_id corrupted');
+  if (renamed!.runtime.next_run_at !== '2099-01-01T00:00:00Z') failClean('31a: runtime corrupted');
+
+  // 31b — readJob path canonicalizes too: readJob("renamed") returns a
+  //       job whose meta.id is "renamed" even though the JSON says
+  //       "job-original".
+  const viaRead = await readJob('renamed');
+  if (!viaRead) failClean('31b: readJob("renamed") returned null');
+  if (viaRead!.meta.id !== 'renamed') {
+    failClean(`31b: readJob should canonicalize meta.id to filename, got "${viaRead!.meta.id}"`);
   }
 } finally {
-  // Restore even on failure so later tests / processes don't inherit
-  // overridden stderr, a deleted tmp dir, or a stale appConfig pointer.
-  process.stderr.write = origStderr;
+  // Restore even on failure so later tests / processes don't inherit a
+  // deleted tmp dir or a stale appConfig pointer.
   (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }

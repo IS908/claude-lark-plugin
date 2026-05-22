@@ -38,6 +38,10 @@ echo "=== Job store unit checks ==="
 npx tsx scripts/job-smoke.ts
 
 echo ""
+echo "=== Scheduler unit checks ==="
+npx tsx scripts/scheduler-smoke.ts
+
+echo ""
 echo "=== Reply raw-card unit checks ==="
 npx tsx scripts/reply-card-smoke.ts
 
