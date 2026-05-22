@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.9] - 2026-05-22
+
+### Changed
+- **A cronjob's `meta.id` is now derived from its filename — the single source of truth** (#68). Previously a job's identity was stored in two independent, writable places: the on-disk filename (`{id}.json`) and the internal `meta.id` field. They could diverge — via hand-edits, `cp`, or a prior release's `sanitizeJobId` rule change — and the v1.0.6 skip-on-mismatch protection (#62) then **silently skipped the file**: `list_jobs` couldn't see it, the scheduler never ran it. One operator's `premarket-news` job sat dead for 3 days this way (run_count 0, found only by manually inspecting files).
+
+  `readJob` and `listAllJobs` now overwrite `meta.id` with the filename stem on every read. Divergence is structurally impossible, so the skip-on-mismatch logic is **removed**. A hand-edited `meta.id` is silently ignored — the job keeps running under its filename id (graceful degradation) instead of vanishing.
+
+  **Contract:** to rename a job, rename its file. Editing `meta.id` inside the JSON has no effect.
+
+  This also handles the `cp foo.json bar.json` case more honestly than the old skip: the copy becomes a genuinely distinct job `bar` (its own filename id), fully addressable by `update_job` / `delete_job` — not the #62 duplicate-execution bug (which required both files to claim the *same* id).
+
+- **Crash recovery skips stale missed runs, and tells the job's chat** (follow-up from the #68 audit). `recoverMissedJobs` runs once on startup and catches up jobs whose scheduled time passed while the plugin was down. It now skips a missed run that is more than **6 hours** late — the run is dropped and `next_run_at` advanced to the next future occurrence. Crash recovery is meant for outages (restart / reboot / deploy, or a laptop closed for an afternoon); a job recovered much later delivers wrong-time content (a market pre-open briefing fired the next morning). Directly relevant on upgrade: a job wrongly skipped for days under v1.0.6–v1.0.8 would otherwise fire a multi-day-stale run the moment 1.0.9 makes it visible again — now it just resumes its schedule cleanly.
+
+  When a stale run is skipped, the plugin posts a short notice (`⏭️ Scheduled job "…" missed a run … next run: …`) — two-tier delivery: first to the job's `target_chat_id`, and if that send fails (the chat may be gone — bot kicked, group dissolved) it falls back to a direct message to the job owner (`created_by`). Previously the skip was a stderr line only — invisible to the operator. The notice is best-effort: `next_run_at` is advanced and persisted before it is sent, so a failed notice never causes a re-skip/re-notify loop; if both channels are unreachable a final stderr line is the last resort.
+- **Startup logs the job inventory** (follow-up from the #68 audit). The scheduler now logs `Loaded N job(s): <id>, <id>, …` on start. The #68 incident was hard to diagnose partly because a dead job was invisible — the inventory line gives the operator immediate visibility, and a surprising name (e.g. a `premarket-news.bak` next to `premarket-news`) flags a stray `*.json` that became a live job.
+
+### Removed
+- The filename/meta.id skip-on-mismatch check in `listAllJobs` (added in v1.0.6 for #62). No longer needed — with filename as the single source of truth there is nothing to mismatch. The v1.0.7 (#64) ENOENT / corrupt / unreadable distinction is retained.
+
+### Upgrade notes
+- **Every `*.json` file in `~/.claude/channels/lark/jobs/` is a live job.** Because the filename is now the job id, parking a backup copy there — `cp premarket.json premarket.bak.json` — creates a *second* active job (`premarket.bak`) that delivers alongside the original. Keep backups outside the jobs directory. The new startup inventory log surfaces this if it happens.
+- A job that was filename/meta.id-mismatched (silently skipped under v1.0.6–v1.0.8) becomes visible again on upgrade. If its missed run is more than 6 hours stale — usually the case — the crash-recovery staleness guard skips the catch-up and resumes the normal schedule; no mistimed delivery. A job missed by under 6 hours is still caught up once, as before.
+
 ## [1.0.8] - 2026-05-19
 
 ### Fixed
@@ -402,6 +425,7 @@ Precondition for the privacy redesign (#35). A pluggable abstraction made every 
 - Score-based filtering (`LARK_MIN_SEARCH_SCORE`)
 - HealthCheck for memory provider connectivity
 
+[1.0.9]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.9
 [1.0.8]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.8
 [1.0.7]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.7
 [1.0.6]: https://github.com/IS908/claude-lark-plugin/releases/tag/v1.0.6

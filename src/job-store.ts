@@ -195,10 +195,28 @@ export function backfillJob(job: JobFile): JobFile {
   return job;
 }
 
+/**
+ * Canonicalize a job's identity: the on-disk filename is the SINGLE source
+ * of truth for `meta.id`. Whatever value the JSON file carries for
+ * `meta.id` is overwritten with `id` (the filename stem).
+ *
+ * This makes filename/meta.id divergence structurally impossible (#68).
+ * Consequences:
+ *   - A hand-edited `meta.id` is silently ignored — the job keeps running
+ *     under its filename id (graceful degradation, vs. the pre-v1.0.9
+ *     skip-on-mismatch which silently killed the job).
+ *   - To rename a job, rename its file. Editing `meta.id` in the JSON has
+ *     no effect.
+ */
+function withFilenameId(job: JobFile, id: string): JobFile {
+  job.meta.id = id;
+  return job;
+}
+
 export async function readJob(id: string): Promise<JobFile | null> {
   try {
     const data = await fs.readFile(jobPath(id), 'utf-8');
-    return backfillJob(JSON.parse(data) as JobFile);
+    return withFilenameId(backfillJob(JSON.parse(data) as JobFile), id);
   } catch {
     return null;
   }
@@ -207,16 +225,16 @@ export async function readJob(id: string): Promise<JobFile | null> {
 /**
  * Persist a JobFile to disk under `{jobsDir}/{job.meta.id}.json`.
  *
- * **Invariant for callers**: a job's `meta.id` is stable across its
- * lifetime. If a future feature ever lets users rename a job, the caller
- * MUST call `deleteJob(oldId)` BEFORE this with the new id — otherwise
- * the old file is orphaned. listAllJobs (since v1.0.6, #62) will skip
- * the orphan with a filename/meta.id-mismatch warning so duplicate
- * execution won't happen, but the orphan still wastes inode + appears
- * confusingly in `ls`. Track at #64.
+ * Since v1.0.9 (#68) `meta.id` is filename-derived: every read
+ * canonicalizes `job.meta.id` to the file stem via {@link withFilenameId}.
+ * So a JobFile that came from `readJob` / `listAllJobs` always has
+ * `meta.id` equal to its filename, and `writeJob` round-trips to the same
+ * file. `create_job` sets `meta.id` from `sanitizeJobId(name)` and writes
+ * once — consistent by construction.
  *
- * Today every caller (create_job / update_job / scheduler runtime
- * persistence) keeps the id stable, so writeJob is a pure overwrite.
+ * To rename a job, rename the file (then the next read re-derives the id).
+ * There is no in-place rename API and `meta.id` carries no independent
+ * authority.
  */
 export async function writeJob(job: JobFile): Promise<void> {
   await ensureJobsDir();
@@ -252,29 +270,14 @@ export async function listAllJobs(): Promise<JobFile[]> {
     jsonFiles.map(async (file): Promise<JobFile | null> => {
       try {
         const data = await fs.readFile(path.join(dir, file), 'utf-8');
-        const job = backfillJob(JSON.parse(data) as JobFile);
-        // Defensive: the rest of the job-store (readJob/writeJob/deleteJob)
-        // locates files via `{meta.id}.json`. If the on-disk filename
-        // diverges from meta.id, two failure modes follow:
-        //   (a) update_job / delete_job by id silently fail (the looked-up
-        //       file doesn't exist), and
-        //   (b) if a second file later lands at `{meta.id}.json`, BOTH
-        //       files surface from listAllJobs with the same meta.id and
-        //       the scheduler executes the job once per file (duplicate
-        //       message sends / duplicate prompt subagent dispatches).
-        // See #62 for the full failure analysis. Skip-and-warn rather than
-        // auto-reconcile: operators may have deliberately renamed files,
-        // and silently mutating their on-disk state would be worse than
-        // surfacing the mismatch.
-        if (file !== `${job.meta.id}.json`) {
-          console.error(
-            `[job-store] Skipping ${file}: meta.id="${job.meta.id}" doesn't match filename. ` +
-            `Either rename the file to ${job.meta.id}.json or edit meta.id to match. ` +
-            `Skipping prevents duplicate execution if a matching ${job.meta.id}.json also exists.`,
-          );
-          return null;
-        }
-        return job;
+        // The filename is the single source of truth for the job id (#68).
+        // withFilenameId overwrites whatever meta.id the JSON carries with
+        // the file stem — divergence is structurally impossible, so the
+        // pre-v1.0.9 skip-on-mismatch check (#62) is gone. A hand-edited
+        // meta.id is simply ignored (job keeps running under its filename
+        // id) instead of silently disappearing.
+        const id = file.replace(/\.json$/, '');
+        return withFilenameId(backfillJob(JSON.parse(data) as JobFile), id);
       } catch (err: any) {
         // Distinguish three failure modes so the operator's log signal
         // matches the actual cause (#64):

@@ -36,6 +36,36 @@ export interface SchedulerOptions {
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [30_000, 60_000, 120_000]; // 30s, 60s, 120s
 
+// ─── Crash-recovery staleness ───────────────────────────────
+
+/**
+ * Catch-up grace for `recoverMissedJobs`. A job whose scheduled run was
+ * missed by more than this is treated as stale: the run is skipped and
+ * `next_run_at` advanced to the next future occurrence instead.
+ *
+ * Rationale: crash recovery exists for outages (restart / reboot / deploy,
+ * or a laptop closed for a few hours). A job recovered much later delivers
+ * wrong-time content — a market pre-open briefing fired the next morning,
+ * say. This was sharpened by the #68 incident: a job wrongly skipped for 3
+ * days would, without this guard, fire a 3-day-stale run the moment it
+ * became visible again. 6 hours covers a normal restart and a typical
+ * laptop-closed-for-the-afternoon gap while still rejecting day-plus
+ * staleness.
+ */
+const RECOVERY_STALE_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+/**
+ * True when a missed scheduled run is too stale to be worth catching up.
+ * Pure function — exported for unit testing.
+ */
+export function isMissedRunStale(
+  nextRunAtMs: number,
+  nowMs: number,
+  thresholdMs: number = RECOVERY_STALE_THRESHOLD_MS,
+): boolean {
+  return nowMs - nextRunAtMs > thresholdMs;
+}
+
 /** Network/transient error codes that warrant a retry. */
 const RETRYABLE_NETWORK_ERRORS = new Set([
   'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED',
@@ -97,8 +127,23 @@ export class JobScheduler {
     if (this.running) return;
     this.running = true;
 
-    // Crash recovery — execute missed jobs once
-    await this.recoverMissedJobs();
+    // Load the job inventory once and log it. Gives the operator immediate
+    // visibility into what jobs exist — the #68 incident was hard to
+    // diagnose partly because a dead job was invisible. A surprising name
+    // here (e.g. a "premarket-news.bak" sitting next to "premarket-news")
+    // is the operator's cue that a stray *.json — a backup copy? — in the
+    // jobs dir has become a live job (every *.json is one, since v1.0.9).
+    const jobs = await listAllJobs();
+    if (jobs.length > 0) {
+      console.error(
+        `[scheduler] Loaded ${jobs.length} job(s): ${jobs.map((j) => j.meta.id).join(', ')}`,
+      );
+    } else {
+      console.error('[scheduler] No jobs configured');
+    }
+
+    // Crash recovery — execute missed jobs once (skipping stale ones)
+    await this.recoverMissedJobs(jobs);
 
     // Start periodic scan
     const intervalMs = appConfig.cronScanInterval * 1000;
@@ -124,11 +169,18 @@ export class JobScheduler {
   }
 
   /**
-   * On startup, find active jobs whose next_run_at is in the past
-   * and execute them once (most recent missed execution only).
+   * On startup, find active jobs whose next_run_at is in the past and
+   * execute them once (most recent missed execution only).
+   *
+   * A missed run more than {@link RECOVERY_STALE_THRESHOLD_MS} old is
+   * considered stale: the run is skipped and `next_run_at` advanced to the
+   * next future occurrence, so the job resumes its normal schedule without
+   * delivering wrong-time content. See {@link isMissedRunStale}.
+   *
+   * Takes the already-loaded job list from {@link start} to avoid a second
+   * `listAllJobs` read.
    */
-  private async recoverMissedJobs(): Promise<void> {
-    const jobs = await listAllJobs();
+  private async recoverMissedJobs(jobs: JobFile[]): Promise<void> {
     const now = Date.now();
 
     for (const job of jobs) {
@@ -136,9 +188,36 @@ export class JobScheduler {
       if (!job.runtime.next_run_at) continue;
 
       const nextRun = new Date(job.runtime.next_run_at).getTime();
-      if (nextRun < now) {
+      if (nextRun >= now) continue; // not missed
+
+      // Per-job try/catch — matches tick()'s pattern. The stale path's
+      // computeNextRun (throws on a malformed cron) and writeJob (throws
+      // on an FS error) would otherwise propagate to start() → main() and
+      // abort plugin startup. One bad job must not kill recovery for the
+      // rest, nor the whole process.
+      try {
+        if (isMissedRunStale(nextRun, now)) {
+          const lateHours = ((now - nextRun) / 3_600_000).toFixed(1);
+          console.error(
+            `[scheduler] Skipping stale missed job ${job.meta.id}: ${lateHours}h late ` +
+            `(> ${RECOVERY_STALE_THRESHOLD_MS / 3_600_000}h threshold). Rescheduling to next occurrence.`,
+          );
+          // Advance the schedule FIRST so the job is no longer stale on the
+          // next startup — must happen regardless of whether the notice
+          // below succeeds.
+          job.runtime.next_run_at = computeNextRun(job.meta.schedule);
+          await writeJob(job);
+          // Then tell the job's chat (best-effort) — a stderr line alone
+          // is invisible to the operator (#68 follow-up). notifyStaleSkip
+          // never throws.
+          await this.notifyStaleSkip(job, lateHours);
+          continue;
+        }
+
         console.error(`[scheduler] Recovering missed job: ${job.meta.id}`);
         await this.executeJob(job);
+      } catch (err) {
+        console.error(`[scheduler] Failed to recover job ${job.meta.id}:`, err);
       }
     }
   }
@@ -232,6 +311,83 @@ export class JobScheduler {
     console.error(`[scheduler] Job ${job.meta.id} failed${retryNote}: ${job.runtime.last_error}`);
 
     await writeJob(job);
+  }
+
+  /**
+   * Best-effort: notify the operator that a stale missed run was skipped.
+   *
+   * Delivery is two-tier:
+   *   1. `target_chat_id` — where the job normally delivers, so all
+   *      messages about a job stay in one place.
+   *   2. If that send fails (the chat may be gone — bot kicked, group
+   *      dissolved), fall back to a direct message to the job owner
+   *      (`created_by` open_id). The owner's DM with the bot is a
+   *      different, usually-still-reachable channel.
+   *
+   * A stderr line alone (the pre-v1.0.9 behavior) is invisible to the
+   * operator; this surfaces the skip where they actually watch (#68
+   * follow-up). If BOTH channels fail, a final stderr line is the last
+   * resort.
+   *
+   * Never throws — a failed notice must not abort recovery. `next_run_at`
+   * is already advanced + persisted by the caller before this runs, so a
+   * failure here does not cause a re-skip / re-notify loop on next startup.
+   */
+  private async notifyStaleSkip(job: JobFile, lateHours: string): Promise<void> {
+    let nextRunLocal: string;
+    try {
+      nextRunLocal = new Date(job.runtime.next_run_at).toLocaleString('en-US', {
+        timeZone: appConfig.cronTimezone,
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      });
+    } catch {
+      nextRunLocal = job.runtime.next_run_at; // fall back to raw ISO
+    }
+    const text =
+      `⏭️ Scheduled job "${job.meta.id}" missed a run — it was ${lateHours}h stale ` +
+      `(beyond the ${RECOVERY_STALE_THRESHOLD_MS / 3_600_000}h crash-recovery window), ` +
+      `so the catch-up was skipped. The job resumes normally — next run: ${nextRunLocal}.`;
+    const content = JSON.stringify({ text });
+
+    // Tier 1 — the job's chat.
+    try {
+      await this.client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: job.meta.target_chat_id, content, msg_type: 'text' },
+      });
+      return; // delivered
+    } catch (err) {
+      console.error(
+        `[scheduler] Stale-skip notice to chat ${job.meta.target_chat_id} failed for ${job.meta.id}:`,
+        err,
+      );
+    }
+
+    // Tier 2 — direct message to the job owner. created_by may be empty
+    // for a legacy job with no resolvable owner; skip the fallback then.
+    if (job.meta.created_by) {
+      try {
+        await this.client.im.v1.message.create({
+          params: { receive_id_type: 'open_id' },
+          data: { receive_id: job.meta.created_by, content, msg_type: 'text' },
+        });
+        console.error(
+          `[scheduler] Stale-skip notice for ${job.meta.id} delivered to owner DM (target chat unreachable).`,
+        );
+        return;
+      } catch (err) {
+        console.error(
+          `[scheduler] Stale-skip owner-DM fallback also failed for ${job.meta.id}:`,
+          err,
+        );
+      }
+    }
+
+    // Both channels unreachable — stderr is the last resort.
+    console.error(
+      `[scheduler] Stale-skip notice for ${job.meta.id} could not be delivered to any channel.`,
+    );
   }
 
   /**
