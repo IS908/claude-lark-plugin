@@ -76,6 +76,7 @@ The `/lark:configure` skill (in `skills/configure/SKILL.md`) provides interactiv
 - **User display names**: Resolved via contact API → cached. Falls back to stable aliases (`user_` + last 7 chars of open_id). Memory keys always use raw open_id/chat_id.
 - **Group chat filtering**: Only messages with @bot mentions are processed (precise match via bot open_id fetched at startup). P2P messages are always processed.
 - **Reaction events**: Subscribed to `im.message.reaction.created_v1`. Filtered: ignores bot's own reactions, non-bot messages, and respects whitelists.
+- **Stop hook enforces reply (v1.0.10+)**: `hooks/enforce-lark-reply.mjs` runs on every Claude `Stop` event. If a `<channel source="plugin:lark:lark">` message in the current turn was not answered by `reply` / `edit_message` / `react` targeting the same `message_id`, the hook exits `2` and Claude is forced to remediate before ending the turn. To intentionally bypass (async handling / non-actionable event), put the literal sentinel `[LARK_DEFER]` or `[LARK_NO_REPLY]` on **its own line** in the turn's text output (inline echo is rejected — the line-only requirement guards against user-content echo attacks). Audit trail at `~/.claude/channels/lark/hook-audit.log` (override path with `LARK_HOOK_AUDIT_LOG`). Fail-safe: any hook error exits `0`, never blocks.
 
 ## Debugging
 
