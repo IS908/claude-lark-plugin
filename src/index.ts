@@ -171,7 +171,14 @@ async function main() {
             ...(message.threadId ? { thread_id: message.threadId } : {}),
             ...(message.botMentioned ? { bot_mentioned: 'true' } : {}),
             ts: new Date().toISOString(),
-            ...(message.parentContent ? { parent_content: message.parentContent } : {}),
+            // R2-audit followup on #115: `parent_content` is the body of
+            // the quoted message — author-controlled by a potentially-
+            // different user. Pre-followup it was sent as a raw `meta`
+            // attribute on the notification, bypassing the
+            // <memory_context> envelope that enrichWithMemory adds
+            // INSIDE the prompt text. Drop it from meta — the envelope-
+            // wrapped copy in `content` is the only render path Claude
+            // sees, and it's the trust-bounded one.
             ...(message.imagePath ? { image_path: message.imagePath } : {}),
             ...(message.imagePaths?.length ? { image_paths: message.imagePaths.join(',') } : {}),
             ...(message.attachments?.length === 1
