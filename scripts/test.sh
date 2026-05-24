@@ -86,6 +86,10 @@ echo "=== Skill ownership unit checks ==="
 npx tsx scripts/skill-ownership-smoke.ts
 
 echo ""
+echo "=== Single-instance lock unit checks ==="
+npx tsx scripts/lock-smoke.ts
+
+echo ""
 echo "=== Path-traversal defense unit checks ==="
 npx tsx scripts/path-traversal-smoke.ts
 

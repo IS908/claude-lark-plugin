@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.23] - 2026-05-25
+
+### Fixed
+- **Single-instance lock now disambiguates PID reuse via process start time AND cleans up on every signal/exception path** (#101 — **HIGH — bot refuses to start forever after PID recycle; lock leak on common signals**). Two compounding pre-v1.0.23 failures:
+  1. **PID-reuse false positive**: lock contained only a PID. After an unclean shutdown the stale lock survived. macOS/Linux recycle PIDs within hours — once the stored PID was reused by ANY unrelated process (bash, launchd child, python), `process.kill(pid, 0)` succeeded and the new bot startup refused with "Another instance is running (PID …) — Exiting." Recovery required manual `rm /tmp/claude-lark-*.lock`.
+  2. **Lock leak on SIGPIPE / SIGHUP / SIGQUIT / uncaughtException / unhandledRejection**: cleanup hooks were only registered for `exit` / SIGINT / SIGTERM. Every Claude-Code stdio peer-close hit SIGPIPE → bot died → lock leaked → next startup hit Case 1.
+
+  Fix:
+  - **PID + start-time disambiguation**: lock file now contains `<pid>|<start-time>` (start-time from POSIX `ps -p PID -o lstart=`). On startup, if the lock's PID exists, the bot reads its current start-time via `ps` and compares against the recorded one. Match → real instance, refuse. Mismatch (PID has been recycled) → overwrite. Legacy PID-only lock files (pre-v1.0.23) parse with empty start-time and fall to the overwrite path on first run — automatic upgrade with no manual intervention.
+  - **Exhaustive signal/exception cleanup**: handlers added for SIGHUP, SIGQUIT, SIGPIPE, uncaughtException, unhandledRejection. Signal-handler exit code follows the conventional `128 + signal-number` shell convention via `os.constants.signals`.
+  - **Shell-injection safety**: helper uses `execFileSync` (argv-array, no shell interpolation) instead of `execSync`. PID is additionally asserted to be a positive integer before the call.
+
+  New module `src/lock.ts` holds the pure helpers (`getProcessStartTime`, `buildLockToken`, `parseLockToken`) so unit tests can exercise them without importing `src/index.ts` (which would trigger `main()` and connect to Feishu).
+
+### Added
+- 9 smoke assertions in new `scripts/lock-smoke.ts` covering: malformed-input rejection, legacy PID-only parse → empty start-time, well-formed pid|start-time round-trip, whitespace tolerance, invalid-pid rejection in `getProcessStartTime`, self-PID start-time non-empty (skipped on platforms without `ps`), definitely-dead PID returns null, `buildLockToken` round-trips through `parseLockToken`, LC_ALL pinning consistency under non-English outer LANG (R1-audit followup).
+- New exports from `src/lock.ts`: `getProcessStartTime`, `buildLockToken`, `parseLockToken`.
+
+### R1-audit followups (closed in this PR)
+- **Startup-race TOCTOU**: two bots starting simultaneously could both hit EEXIST, both read the same stale token, both decide stale, and both overwrite — the last writer wins on the FILE but BOTH processes proceeded past `acquireLock`. Fix: after writing, re-read and confirm the file contents equal `myToken`; mismatch means another bot won, exit cleanly.
+- **`process.kill(pid, 0)` EPERM on Linux**: the bare `catch` swallowed EPERM (process exists but we lack permission to signal — e.g. cross-uid) as "process gone", which would overwrite a legitimate other-user lock. Fix: distinguish `err.code === 'EPERM'` (exists) from ESRCH (gone). When EPERM is paired with unreadable start-time (cross-uid `ps` also typically returns nothing), refuse with a clear "manually delete the lock after confirming the other instance is stopped" message rather than silently overwriting.
+- **`ps -o lstart=` locale instability**: the output is locale-formatted (`Sun May 25 02:30:00 2026` under en_US vs `日 5月/25 02:30:00 2026` under zh_CN). A writer under default LANG and a reader under sudo/systemd (which often clears LANG → C, or sets non-English) would compare DIFFERENT strings for the SAME live process → false stale → overwrite. Fix: `execFileSync` env now pins `LC_ALL=C` and `LANG=C` so output is stable across operator environments.
+
+### R2-audit followups (closed in this PR)
+- **EACCES-on-read silently overwrote cross-uid lock** — pre-followup `fs.readFile(LOCK_FILE)` failures (file owned by another uid with restrictive mode 0600) caused `parsed === null` → fall to overwrite path. On Linux that `writeFile` then either succeeded silently (race condition) or threw EACCES uncaught (operator saw a stack trace instead of the polished refuse message). Now `readError.code === 'EACCES'` is explicitly handled with the same "manually delete the lock" guidance as the EPERM-on-kill path.
+- **`acquireLock` now runs BEFORE `server.connect(transport)`** — pre-followup the 3 refuse paths called `process.exit(1)` with a live MCP transport already handshaking, leaving the operator with a half-handshaked server. Moving lock-acquire ahead of transport-connect keeps the exit clean.
+- **Windows / `ps`-missing degraded mode documented in `src/lock.ts`** — on platforms without `ps`, the start-time component is empty, so the cross-uid refuse path doesn't fire and PID-reuse protection degrades to "PID exists → refuse" (pre-v1.0.23 behavior). The signal-cleanup fix still applies. Linux/macOS (the primary supported platforms) always have `ps` so this is theoretical.
+
+### Operator notes
+- After upgrading, a stale legacy lock file is auto-overwritten on first startup with a `[lock] Stale lock for PID N (legacy pre-v1.0.23 lock file) — overwriting.` stderr line. No manual cleanup needed.
+- The shell-out to `ps` adds <5ms to startup — negligible. On platforms without `ps` (Windows, minimal containers) the PID-reuse protection silently degrades to "no protection" (helper returns null, equality check falls through to overwrite); the signal-cleanup fix still applies.
+
 ## [1.0.22] - 2026-05-25
 
 ### Fixed

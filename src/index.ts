@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import fs from 'node:fs/promises';
 import { unlinkSync } from 'node:fs';
+import { getProcessStartTime, buildLockToken, parseLockToken } from './lock.js';
 import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
@@ -17,30 +18,166 @@ import { mcpServerInstructions } from './prompts.js';
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
 
 async function acquireLock(): Promise<void> {
+  const myToken = buildLockToken(process.pid);
   try {
     // Try to create lock file exclusively
-    await fs.writeFile(LOCK_FILE, String(process.pid), { flag: 'wx' });
+    await fs.writeFile(LOCK_FILE, myToken, { flag: 'wx' });
   } catch {
-    // Lock file exists — check if the process is still alive
+    // Lock file exists — check if the process is still alive AND is
+    // the same process that wrote the lock (#101). Pre-v1.0.23 only
+    // `process.kill(pid, 0)` was used, which says "some process with
+    // this PID exists" but cannot distinguish the original lock-
+    // holder from a recycled-PID bash/python/launchd child. After
+    // an unclean shutdown + PID reuse, the bot would refuse to start
+    // forever and need manual `rm /tmp/claude-lark-*.lock`.
+    let parsed: { pid: number; startTime: string } | null = null;
+    let readError: NodeJS.ErrnoException | null = null;
     try {
-      const pid = parseInt(await fs.readFile(LOCK_FILE, 'utf-8'), 10);
+      parsed = parseLockToken(await fs.readFile(LOCK_FILE, 'utf-8'));
+    } catch (err: any) {
+      readError = err;
+    }
+    // R2-audit followup: distinguish a permission error (EACCES —
+    // file exists but owned by another uid in /tmp with restrictive
+    // mode) from genuine missing/malformed content. Pre-followup
+    // EACCES fell through to overwrite → writeFile then threw EACCES
+    // uncaught → main() saw stack trace instead of the polished
+    // "manually delete the lock" message we provide for the EPERM
+    // path below. Treat EACCES the same way: refuse with operator
+    // guidance.
+    if (readError && readError.code === 'EACCES') {
+      console.error(
+        `[lock] Lock file ${LOCK_FILE} exists but is not readable by this process ` +
+        `(likely owned by another user's bot). Refusing to overwrite — manually delete the ` +
+        `lock after confirming the other instance is stopped.`,
+      );
+      process.exit(1);
+    }
+    if (parsed === null) {
+      // Malformed / empty lock OR read failed for some other reason
+      // (ENOENT shouldn't happen since wx-create just hit EEXIST) —
+      // overwrite. writeFile may STILL fail with EACCES on cross-uid
+      // /tmp + restrictive parent; we let that propagate to main()'s
+      // fatal handler since it's an environment-level problem.
+      await fs.writeFile(LOCK_FILE, myToken);
+    } else {
+      const { pid: recordedPid, startTime: recordedStart } = parsed;
+      // Distinguish "process gone" (ESRCH) from "process exists but
+      // I can't signal it" (EPERM, cross-uid). R1-audit followup on
+      // PR #124: pre-fix the catch swallowed both, so a Linux bot
+      // started under a different uid would see the lock holder's
+      // EPERM as "gone" and overwrite → two bots running.
+      let pidExists = false;
       try {
-        process.kill(pid, 0); // Check if process exists
-        console.error(`[lock] Another instance is running (PID ${pid}). Exiting.`);
-        process.exit(1);
-      } catch {
-        // Process is dead — stale lock, overwrite
-        await fs.writeFile(LOCK_FILE, String(process.pid));
+        process.kill(recordedPid, 0);
+        pidExists = true;
+      } catch (err: any) {
+        if (err?.code === 'EPERM') {
+          // Process exists but we lack permission to signal it. Treat
+          // as alive — the recorded start-time check below still
+          // applies for identity disambiguation.
+          pidExists = true;
+        }
+        // ESRCH (or any other code) → process is gone.
       }
-    } catch {
-      await fs.writeFile(LOCK_FILE, String(process.pid));
+      if (pidExists) {
+        const currentStart = getProcessStartTime(recordedPid);
+        // Compare ps-reported start time against the recorded one.
+        // If they match (and recorded is non-empty), it's truly the
+        // same process that wrote the lock → refuse. Otherwise PID
+        // has been recycled OR the recorded value is from a legacy
+        // pre-v1.0.23 PID-only lock → overwrite.
+        //
+        // EPERM edge: if `process.kill` failed with EPERM, `ps -p`
+        // also typically returns no rows for the cross-uid PID, so
+        // currentStart is null → falls through to overwrite. That's
+        // wrong (the lock holder IS alive); but the legitimate
+        // recovery path is "another user owns the lock — refuse",
+        // not "overwrite". Tighten by also refusing when pidExists
+        // is true AND currentStart is null AND recordedStart is
+        // non-empty (means: we know the process is alive but can't
+        // verify start-time, so err on the side of refusing).
+        if (currentStart !== null && currentStart === recordedStart && recordedStart !== '') {
+          console.error(
+            `[lock] Another instance is running (PID ${recordedPid}, started ${recordedStart}). Exiting.`,
+          );
+          process.exit(1);
+        }
+        if (currentStart === null && recordedStart !== '') {
+          console.error(
+            `[lock] Lock holder PID ${recordedPid} exists but its start-time is unreadable ` +
+            `(likely owned by a different user). Refusing to overwrite — manually delete ` +
+            `${LOCK_FILE} after confirming the other instance is stopped.`,
+          );
+          process.exit(1);
+        }
+        console.error(
+          `[lock] Stale lock for PID ${recordedPid} ` +
+          (recordedStart === ''
+            ? '(legacy pre-v1.0.23 lock file)'
+            : '(PID has been recycled to a different process)') +
+          ' — overwriting.',
+        );
+      }
+      await fs.writeFile(LOCK_FILE, myToken);
     }
   }
-  // Clean up lock on exit
-  const cleanup = () => { try { unlinkSync(LOCK_FILE); } catch {} };
+
+  // TOCTOU verify-after-write (R1-audit followup on PR #124): two
+  // bots starting simultaneously can both hit EEXIST, both read the
+  // same stale token, both decide stale, both overwrite — last
+  // writer wins but BOTH proceed past acquireLock. Re-read the file
+  // and confirm we're the winner; if not, exit cleanly.
+  try {
+    const persisted = await fs.readFile(LOCK_FILE, 'utf-8');
+    if (persisted.trim() !== myToken.trim()) {
+      console.error(
+        `[lock] Lost the startup race (another instance wrote the lock ` +
+        `between our read and our write). Exiting.`,
+      );
+      process.exit(1);
+    }
+  } catch {
+    // Lock file disappeared between our write and our verify (very
+    // unusual — would require an external rm). Treat as a refusal
+    // so we don't proceed without a valid lock.
+    console.error(
+      `[lock] Lock file vanished after we wrote it — refusing to start.`,
+    );
+    process.exit(1);
+  }
+
+  // Cleanup runs on every path that can take down the process —
+  // pre-v1.0.23 only `exit` / SIGINT / SIGTERM were covered, which
+  // leaked the lock on SIGPIPE (very common when Claude Code closes
+  // the child's stdio), SIGHUP (terminal disconnect), SIGQUIT, and
+  // uncaught exceptions / unhandled rejections (#101 Case B).
+  const cleanup = () => {
+    try { unlinkSync(LOCK_FILE); } catch { /* best-effort */ }
+  };
   process.on('exit', cleanup);
-  process.on('SIGINT', () => { cleanup(); process.exit(0); });
-  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+  // 128 + signal-number is the conventional shell exit code for
+  // signal-induced termination. Looked up via os.constants.signals
+  // so a custom Node build with non-standard numbers still works.
+  const exitOnSignal = (sig: NodeJS.Signals) => {
+    cleanup();
+    const code = (os.constants.signals as Record<string, number | undefined>)[sig];
+    process.exit(typeof code === 'number' ? 128 + code : 1);
+  };
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT', 'SIGPIPE'] as const) {
+    process.on(sig, () => exitOnSignal(sig));
+  }
+  // Fatal error handlers — last-chance cleanup before crash.
+  process.on('uncaughtException', (err) => {
+    console.error('[fatal] uncaughtException:', err);
+    cleanup();
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[fatal] unhandledRejection:', reason);
+    cleanup();
+    process.exit(1);
+  });
 }
 
 async function main() {
@@ -72,7 +209,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.22' },
+    { name: 'claude-lark-plugin', version: '1.0.23' },
     {
       capabilities: {
         logging: {},
@@ -204,13 +341,22 @@ async function main() {
     process.exit(0);
   }
 
-  // 7. Connect MCP server via stdio
+  // 7. Acquire single-instance lock BEFORE the MCP transport is
+  //    connected (R2-audit followup on #101). Pre-followup acquireLock
+  //    ran after server.connect, so any of the 3 acquireLock refuse
+  //    paths (legacy-lock collision, EPERM cross-uid, lost startup
+  //    race) would call process.exit(1) with a live stdio transport
+  //    already handshaking with Claude Code — operator saw a half-
+  //    connected server. Moving the lock up to before the transport
+  //    keeps the exit clean.
+  await acquireLock();
+
+  // 8. Connect MCP server via stdio
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('[index] MCP server connected via stdio');
 
-  // 8. Acquire single-instance lock and start Lark WebSocket
-  await acquireLock();
+  // 9. Start Lark WebSocket
   await channel.start();
 
   // 9. Re-arm flush timers from persisted episodes
