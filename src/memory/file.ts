@@ -36,10 +36,16 @@ function lineHash(text: string): string {
  * apply it anyway to keep the storage layer's contract self-defending.
  */
 function assertSafeKey(key: string, field: string): void {
+  // Length cap 255 matches POSIX NAME_MAX / macOS HFS+/APFS per-component
+  // limit. Beyond that, `fs.mkdir`/`writeFile` would throw ENAMETOOLONG —
+  // we'd rather surface a clear "Invalid <field>" upstream than a syscall
+  // error. Tool-boundary `LARK_ID_REGEX` caps at 128 (well within NAME_MAX),
+  // so the larger 255 here is reachable only from non-tool callers and
+  // serves as a final storage-layer guard.
   if (
     !key ||
     typeof key !== 'string' ||
-    key.length > 256 ||
+    key.length > 255 ||
     key.includes('/') ||
     key.includes('\\') ||
     key.includes('..') ||
@@ -48,7 +54,7 @@ function assertSafeKey(key: string, field: string): void {
     /[\x00-\x1f]/.test(key)
   ) {
     throw new Error(
-      `Invalid ${field}: "${key.slice(0, 64)}${key.length > 64 ? '…' : ''}" — must not contain '/', '\\', '..', null/control bytes, and must be 1-256 chars.`,
+      `Invalid ${field}: "${key.slice(0, 64)}${key.length > 64 ? '…' : ''}" — must not contain '/', '\\', '..', null/control bytes, and must be 1-255 chars.`,
     );
   }
 }

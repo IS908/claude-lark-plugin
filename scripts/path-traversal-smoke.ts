@@ -47,7 +47,7 @@ const BAD_IDS = [
   'foo\rbar',
   '\x01ctrl',
   '', // empty
-  'a'.repeat(257), // too long
+  'a'.repeat(129), // exceeds Layer-1 (tool boundary) cap of 128
 ];
 
 const GOOD_IDS = [
@@ -238,6 +238,39 @@ let testNum = 0;
 
   const del = await deleteJob('../../etc/passwd');
   if (del !== false) fail('deleteJob must return false on traversal id');
+}
+
+// 10. Boundary check: regex accepts exactly 128 chars, rejects 129.
+//     Catches off-by-one regressions on the upper cap.
+{
+  testNum++;
+  const exact128 = 'a'.repeat(128);
+  const exact129 = 'a'.repeat(129);
+  if (!LARK_ID_REGEX.test(exact128)) fail('LARK_ID_REGEX must accept exactly 128 chars');
+  if (LARK_ID_REGEX.test(exact129)) fail('LARK_ID_REGEX must reject 129 chars');
+}
+
+// 11. assertSafeKey storage-layer cap is NAME_MAX (255), looser than the
+//     Layer-1 cap (128). Catches a future regression that tightens the
+//     storage layer below Layer-1 (would break legitimate non-tool callers).
+{
+  testNum++;
+  const { store } = freshStore();
+  const exact255 = 'a'.repeat(255); // safe alphanumerics, no traversal
+  // saveEpisode internally calls assertSafeKey(chatId) which permits up to 255.
+  // We don't actually want to write a 255-char directory in /tmp on every
+  // test run — just verify the assertion path does NOT throw for 255 by
+  // invoking listEpisodes which calls assertSafeKey then fs.readdir (which
+  // returns [] for nonexistent paths, so no .md side effects either way).
+  let threw = false;
+  try { await store.listEpisodes(exact255); } catch { threw = true; }
+  if (threw) fail('assertSafeKey must accept exactly 255 chars');
+
+  // 256 chars must reject.
+  const exact256 = 'a'.repeat(256);
+  let rejected = false;
+  try { await store.listEpisodes(exact256); } catch { rejected = true; }
+  if (!rejected) fail('assertSafeKey must reject 256 chars');
 }
 
 console.log(`path-traversal smoke: ${testNum}/${testNum} PASS`);

@@ -557,7 +557,7 @@ export function registerTools(
         'Download an attachment (image, file, audio, video) from a message to local inbox. Pass file_name from the inbound notification\'s meta.attachment_name so the saved file keeps its original extension — Claude Read needs the extension to infer MIME type for PDF/text.',
       inputSchema: z.object({
         message_id: larkIdSchema('message_id').describe('The message ID containing the attachment'),
-        file_key: z.string().describe('The file key of the attachment'),
+        file_key: larkIdSchema('file_key').describe('The file key of the attachment'),
         file_name: z
           .string()
           .optional()
@@ -986,7 +986,7 @@ export function registerTools(
       description:
         'Update a cronjob — change schedule, content, pause, or resume. Only the job owner can mutate a job.',
       inputSchema: z.object({
-        id: z.string().describe('Job ID'),
+        id: larkIdSchema('id').describe('Job ID'),
         status: z.enum(['active', 'paused']).optional().describe('Set status'),
         schedule: z.string().optional().describe('New cron expression or alias'),
         prompt: z.string().optional().describe('New prompt (type=prompt)'),
@@ -1087,7 +1087,7 @@ export function registerTools(
     {
       description: 'Delete a cronjob permanently. Only the job owner can delete.',
       inputSchema: z.object({
-        id: z.string().describe('Job ID to delete'),
+        id: larkIdSchema('id').describe('Job ID to delete'),
         chat_id: larkIdSchema('chat_id').describe('Chat ID where this delete call is acting from'),
         thread_id: larkIdSchema('thread_id')
           .optional()

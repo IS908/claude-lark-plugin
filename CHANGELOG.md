@@ -16,8 +16,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   The two layers are independent: a future code path that bypasses Zod (e.g. internal cronjob plumbing) still cannot land bytes outside `baseDir`. Tests cover both layers.
 
 ### Added
-- 9 smoke assertions in `scripts/path-traversal-smoke.ts` covering: `LARK_ID_REGEX` rejects every documented traversal vector + accepts realistic Feishu shapes; `saveEpisode` rejects bad `chatId` and bad `threadId` before any file write; happy-path `saveEpisode` still writes inside `baseDir`; `searchEpisodes` / `listEpisodes` / `deleteEpisodes` reject bad keys; `getProfile` rejects bad `userId`; `writeJob` throws on traversal id, `readJob` returns null, `deleteJob` returns false (catch-internal contract preserved).
+- 11 smoke assertions in `scripts/path-traversal-smoke.ts` covering: `LARK_ID_REGEX` rejects every documented traversal vector + accepts realistic Feishu shapes; `saveEpisode` rejects bad `chatId` and bad `threadId` before any file write; happy-path `saveEpisode` still writes inside `baseDir`; `searchEpisodes` / `listEpisodes` / `deleteEpisodes` reject bad keys; `getProfile` rejects bad `userId`; `writeJob` throws on traversal id, `readJob` returns null, `deleteJob` returns false (catch-internal contract preserved); off-by-one boundary checks at 128 chars (Layer-1 regex) and 255 chars (Layer-2 storage cap = POSIX NAME_MAX).
 - `LARK_ID_REGEX` exported from `src/tools.ts` for downstream test reuse.
+
+### R1-audit followups (closed in this PR)
+- **`update_job.id` / `delete_job.id` / `download_attachment.file_key` now use `larkIdSchema`** — pre-R1-fix these were still plain `z.string()`. Layer 2 (`assertSafeJobId` / inbox-side defenses) already caught the traversal so the gap was design-inconsistency rather than a vulnerability, but a Layer-1 rejection produces a clear `Invalid <field>` error instead of a downstream Feishu-API failure or silent `false` return.
+- **`assertSafeKey` length cap lowered from 256 to 255** to match POSIX `NAME_MAX` / macOS HFS+/APFS per-component limit. Beyond 255 the syscalls would throw `ENAMETOOLONG`; clearer to reject upstream.
 
 ### Operator notes
 - Legitimate IDs are unaffected — every observed Feishu ID shape (group chat, P2P chat, thread, message, user open_id, cronjob synthetic thread) matches the new regex.
