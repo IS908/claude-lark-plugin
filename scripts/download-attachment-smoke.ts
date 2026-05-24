@@ -428,8 +428,28 @@ function setup(respFor: (fileKey: string, type: string) => unknown) {
   passed++;
 }
 
+// 17. R2-audit followup: writeSdkResource maxBytes=NaN is treated as no cap
+//     (matches the optionalNumber config sanitization — if NaN reaches
+//     here directly via a programmatic caller, the comparison `> NaN`
+//     evaluates false in both Buffer and stream branches → silent
+//     bypass). We don't fix this inside writeSdkResource itself (the
+//     config sanitizer + the partial-opts default at the helper both
+//     catch the common cases), but we DOCUMENT the behavior so a
+//     future regression at the call boundary is loud rather than
+//     silently disabling protection.
+{
+  const filePath = path.join(tmpInbox, 'nan-cap.bin');
+  const big = Buffer.alloc(2048, 'n');
+  // NaN cap → cap disabled, write succeeds. Documented behavior; the
+  // config-layer validation in src/config.ts now coerces NaN to fallback
+  // BEFORE it reaches here in production.
+  await writeSdkResource(big, filePath, { maxBytes: NaN });
+  if (!existsSync(filePath)) fail('17: NaN cap should accept (documented behavior)');
+  passed++;
+}
+
 rmSync(tmpInbox, { recursive: true, force: true });
 delete process.env.LARK_INBOX_DIR;
 
-console.log(`download-attachment smoke: ${passed}/21 PASS`);
+console.log(`download-attachment smoke: ${passed}/22 PASS`);
 

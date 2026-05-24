@@ -22,7 +22,18 @@ function optionalList(key: string): string[] {
 
 function optionalNumber(key: string, fallback: number): number {
   const val = process.env[key];
-  return val ? Number(val) : fallback;
+  if (!val) return fallback;
+  const n = Number(val);
+  // R2-audit followup on #108: reject NaN/non-finite so a misconfigured
+  // env var (e.g. LARK_MAX_DOWNLOAD_BYTES="abc") falls back to the
+  // safe default rather than silently disabling the consumer's
+  // numeric guard. Pre-fix, NaN propagated to `length > NaN === false`,
+  // identical to the partial-opts footgun R1 just closed.
+  if (!Number.isFinite(n)) {
+    console.error(`[config] ${key}="${val}" is not a finite number — using fallback ${fallback}.`);
+    return fallback;
+  }
+  return n;
 }
 
 /**
