@@ -18,7 +18,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - 1 new transparency-smoke assertion (#5b) covering the multi-delete path: two normalized-equal lines pre-populated via `mode='replace'` (bypasses `mergeProfileLines` dedup), `removeProfileLine` reports `removed: 2`, file ends empty, `allTexts` carries both originals.
 - Existing transparency tests updated to assert the new return shape (`result.removed === N` instead of `if (!ok)`).
 - Existing profile-tier test 14 updated to the new shape.
-- Transparency suite total: 9 → 10.
+- Transparency suite total: 9 → 11.
+
+### R1-audit followups (closed in this PR)
+- **Plural reply now lists every removed text inline** with a numbered list, so the operator can copy-paste any unintended losses back via `save_memory(mode='append')`. Pre-followup the reply named the count + sample but the recovery hint ("run what_do_you_know and re-add the others") was misleading — `what_do_you_know` cannot show texts that were just deleted.
+- **`promote_to_rule=true` + multi-delete now emits a warning** in the tail: "rule seeded from the sample text only; multiple lines were removed, so review whether other variants should also be added manually." Prevents the operator from accidentally over-broadening L2 rules based on collision-driven multi-deletes.
+- **Audit log records `removed` count** in the args dict, so the audit trail shows the actual scope of each `forget_memory` invocation (not just ok/denied).
+- **Tool description updated** to surface the possible multi-delete and the recovery path. Claude reads tool descriptions; this lets it warn proactively rather than confronting an unexpected plural reply post-hoc.
+- **Extracted `formatForgetMemoryReply` as a pure exported function** so the singular/plural branch logic is unit-testable without standing up the MCP server. New transparency test #5a-tool covers the formatter directly.
 
 ### Operator notes
 - Existing on-disk profiles MAY contain hash collisions from past `save_memory` patterns. Calling `forget_memory` on a colliding hash now reports the count and a sample — if more than 1 was unintentionally swept, the operator can spot it in the reply text and recover via `save_memory(type='profile', tier, mode='append', content=...)` for the lost lines.

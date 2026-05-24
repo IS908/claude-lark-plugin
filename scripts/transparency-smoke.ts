@@ -94,6 +94,63 @@ let passed = 0;
   passed++;
 }
 
+// ── 5a-tool. formatForgetMemoryReply singular vs plural (#88 R1) ──
+//   Pure-function test of the reply-text branch logic the tool handler
+//   uses. Pre-extraction, the singular/plural split was inline in the
+//   handler and untested at unit level; a future regression flipping
+//   the branches would not have been caught by the storage-layer tests.
+{
+  const { formatForgetMemoryReply } = await import('../src/tools.js');
+
+  // Singular path: removed=1, no tail.
+  const singular = formatForgetMemoryReply(
+    { removed: 1, sample: 'likes Python', allTexts: ['likes Python'] },
+    'abc12345',
+    'public',
+    '',
+  );
+  if (!singular.startsWith('Removed "likes Python" from public profile.')) {
+    fail(`tool-fmt singular: got ${JSON.stringify(singular)}`);
+  }
+  if (singular.includes('lines sharing hash')) {
+    fail(`tool-fmt singular leaked plural wording: ${singular}`);
+  }
+
+  // Plural path: removed=3, all texts listed numbered, recovery hint
+  // names the tier and append mode.
+  const plural = formatForgetMemoryReply(
+    {
+      removed: 3,
+      sample: 'prefers tea',
+      allTexts: ['prefers tea', 'prefers tea', 'prefers tea'],
+    },
+    'deadbeef',
+    'private',
+    '',
+  );
+  if (!plural.includes('Removed 3 lines sharing hash "deadbeef" from private profile:')) {
+    fail(`tool-fmt plural header missing: ${plural}`);
+  }
+  if (!plural.includes('  1) "prefers tea"') || !plural.includes('  3) "prefers tea"')) {
+    fail(`tool-fmt plural numbered list missing: ${plural}`);
+  }
+  if (!plural.includes('save_memory(type="profile", tier="private", mode="append"')) {
+    fail(`tool-fmt plural recovery hint wrong tier/mode: ${plural}`);
+  }
+
+  // Tail append: singular + promote_to_rule tail.
+  const singularTail = formatForgetMemoryReply(
+    { removed: 1, sample: 'foo', allTexts: ['foo'] },
+    'h',
+    'private',
+    ' Also appended to privacy-rules.md.',
+  );
+  if (!singularTail.endsWith(' Also appended to privacy-rules.md.')) {
+    fail(`tool-fmt singular tail not preserved: ${singularTail}`);
+  }
+  passed++;
+}
+
 // ── 5b. removeProfileLine reports count when multiple lines share a hash (#88) ──
 //   Two lines with normalized-identical text ("prefers tea" with and
 //   without leading bullet, after listProfileLines strips bullets)
@@ -172,4 +229,4 @@ let passed = 0;
 }
 
 rmSync(tmp, { recursive: true, force: true });
-console.log(`transparency smoke: ${passed}/10 PASS`);
+console.log(`transparency smoke: ${passed}/11 PASS`);
