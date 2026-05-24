@@ -228,5 +228,65 @@ let passed = 0;
   passed++;
 }
 
+// ── 12. addL2Rule validation gate (#90, v1.0.26) ──
+//   Pre-fix, addL2Rule wrote any text to privacy-rules.md. A 3-char
+//   common word like "工程师" or "the" would then poison the substring
+//   matcher in extractL2PrivatePhrases for years — every distillation
+//   line containing those chars would be marked private.
+//   Post-fix, addL2Rule validates: trim length >= 6 AND has a 4+-
+//   letter/digit run. Rejected rules return {added: false, reason}.
+{
+  const { validateL2Rule } = await import('../src/privacy-rules.js');
+
+  // Valid: >=6 chars, has substantive run
+  const goodCases: string[] = [
+    'salary at acme',           // 14, plenty of run
+    '涉及人际冲突的表述',          // 8 chars all CJK
+    'medical history',          // 15
+    'work email kevin@acme.io', // 24, mixed
+  ];
+  for (const text of goodCases) {
+    const r = validateL2Rule(text);
+    if (!r.ok) fail(`12-good: "${text}" should validate, got reason ${(r as any).reason}`);
+  }
+
+  // Invalid: too short OR no substantive word
+  const badCases: Array<[string, 'too-short' | 'no-substantive-word']> = [
+    ['工程师', 'too-short'],    // 3 chars
+    ['the', 'too-short'],       // 3
+    ['了', 'too-short'],        // 1
+    ['salary', 'no-substantive-word'], // 6 chars but the only run is 6 letters — wait, that IS >=4. Should pass.
+    ['!@#$%^&*', 'no-substantive-word'], // 8 chars, no letters/digits
+    ['a a a a', 'no-substantive-word'],  // 7 chars but no run >=4
+  ];
+  // Adjust salary case — actually 'salary' is 6 chars, single 6-letter run, valid.
+  // Replace with a real failure case.
+  badCases[3] = ['x x x x x x x', 'no-substantive-word']; // 13 chars but no 4+ run
+  for (const [text, expectedReason] of badCases) {
+    const r = validateL2Rule(text);
+    if (r.ok) fail(`12-bad: "${text}" should be rejected`);
+    if (r.reason !== expectedReason) {
+      fail(`12-bad: "${text}" expected reason=${expectedReason}, got ${r.reason}`);
+    }
+  }
+
+  // End-to-end: addL2Rule honors the validation (write side-effect
+  // does not happen for bad input).
+  const { addL2Rule, loadL2Rules } = await import('../src/privacy-rules.js');
+  const before = await loadL2Rules();
+  const badResult = await addL2Rule('工程师', 'Always private');
+  if (badResult.added) fail('12-e2e: addL2Rule must reject 工程师');
+  if (badResult.reason !== 'too-short') fail(`12-e2e: reason mismatch: ${badResult.reason}`);
+  const after = await loadL2Rules();
+  if (after !== before) fail(`12-e2e: file was modified despite rejection`);
+
+  // Good case still works.
+  const goodResult = await addL2Rule('salary information', 'Always private');
+  if (!goodResult.added) fail('12-e2e: good rule must be added');
+  const afterGood = await loadL2Rules();
+  if (!afterGood.includes('- salary information')) fail(`12-e2e: rule not written: ${afterGood}`);
+  passed++;
+}
+
 rmSync(tmp, { recursive: true, force: true });
-console.log(`transparency smoke: ${passed}/11 PASS`);
+console.log(`transparency smoke: ${passed}/12 PASS`);

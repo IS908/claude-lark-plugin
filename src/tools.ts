@@ -1607,11 +1607,29 @@ export function registerTools(
       if (promote_to_rule) {
         try {
           const { addL2Rule } = await import('./privacy-rules.js');
-          await addL2Rule(result.sample ?? '', 'Always private');
-          tail = ' Also appended to privacy-rules.md under "Always private" — future distillations will classify similar content accordingly.';
-          if (result.removed > 1) {
-            tail +=
-              ' Note: rule seeded from the sample text only; multiple lines were removed, so review whether other variants should also be added manually.';
+          const ruleResult = await addL2Rule(result.sample ?? '', 'Always private');
+          if (ruleResult.added) {
+            tail = ' Also appended to privacy-rules.md under "Always private" — future distillations will classify similar content accordingly.';
+            if (result.removed > 1) {
+              tail +=
+                ' Note: rule seeded from the sample text only; multiple lines were removed, so review whether other variants should also be added manually.';
+            }
+          } else {
+            // #90 fix: validate at the L2 boundary. A 3-char common
+            // word like "工程师" or a length-borderline phrase would
+            // poison the substring matcher (extractL2PrivatePhrases)
+            // for years — every line containing those characters
+            // would be marked private. Reject explicitly so the
+            // operator sees the failure mode instead of silently
+            // accumulating a polluted ruleset.
+            const reasonText =
+              ruleResult.reason === 'too-short'
+                ? 'too short (< 6 chars) — would substring-match too many unrelated lines'
+                : 'too generic (no substantive word) — would over-match';
+            tail =
+              ` Rule promotion SKIPPED: "${result.sample}" is ${reasonText}. ` +
+              `To force-add anyway, edit ~/.claude/channels/lark/privacy-rules.md directly. ` +
+              `Removal of the profile line above succeeded; only the auto-rule was rejected.`;
           }
         } catch (err) {
           tail = ` (Warning: removal succeeded but failed to append rule to privacy-rules.md: ${err instanceof Error ? err.message : String(err)}. You can add the rule manually.)`;
