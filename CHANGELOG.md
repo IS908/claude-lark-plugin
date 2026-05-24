@@ -16,8 +16,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Manual operator edits to `privacy-rules.md` are NOT gated by this validation — operators authoring rules deliberately remain in control. The gate sits only at the programmatic `addL2Rule` write boundary.
 
 ### Added
-- 1 new transparency-smoke assertion (suite 11 → 12) covering: 4 valid rule shapes accepted; 6 invalid shapes rejected with correct `reason`; end-to-end addL2Rule write-side-effect SKIPS the file mutation on rejection (verifies file content unchanged); end-to-end good case still writes correctly.
+- 1 new transparency-smoke assertion (suite 11 → 12) covering: 4 valid rule shapes accepted; 7 invalid shapes rejected with correct `reason`; end-to-end addL2Rule write-side-effect SKIPS the file mutation on rejection (verifies file content unchanged); end-to-end good case still writes correctly. Test #6 also tightened to check `addL2Rule`'s tagged result explicitly so future signature regressions are caught immediately.
 - New exports from `src/privacy-rules.ts`: `validateL2Rule`, `L2RuleValidationResult` type, `AddL2RuleResult` type.
+
+### R2-audit followups (closed in this PR)
+- **`audit.log` records `promote_result`**: previously the audit line only carried `promote_to_rule=true|false` (the REQUEST). Operators couldn't distinguish "rule was added" from "rule was rejected by validation" from "addL2Rule threw" when scanning logs. New field values: `not-requested` / `added` / `skipped:too-short` / `skipped:no-substantive-word` / `error:<msg>`.
+- **`forget_memory` tool description mentions the validation gate** so Claude reading the schema isn't surprised by the SKIPPED reply.
+- **Test #6 tightened**: pre-followup the test only checked the file CONTENT after `addL2Rule`; a signature regression that silently rejected the rule would have passed (the assertion happens to still find the rule from a prior test run in the same file). Now explicitly asserts `r.added === true`.
 
 ### Operator notes
 - A `forget_memory(promote_to_rule=true)` on a short or generic phrase now returns the line "Rule promotion SKIPPED" with a hint pointing to manual editing of `privacy-rules.md`. The profile-line removal itself still succeeds — only the auto-rule is rejected.

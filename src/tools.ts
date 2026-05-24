@@ -1540,7 +1540,7 @@ export function registerTools(
     'forget_memory',
     {
       description:
-        "Remove profile lines by 8-char hash from caller's profile. Always caller-scoped. If multiple lines share the hash (duplicates or rare birthday-paradox collision), ALL of them are removed in one call — the tool reply lists every removed text by index so the operator can re-add unintended losses via save_memory(mode='append'). Optionally promotes the (sample) removed text to a persistent L2 rule.",
+        "Remove profile lines by 8-char hash from caller's profile. Always caller-scoped. If multiple lines share the hash (duplicates or rare birthday-paradox collision), ALL of them are removed in one call — the tool reply lists every removed text by index so the operator can re-add unintended losses via save_memory(mode='append'). Optionally promotes the (sample) removed text to a persistent L2 rule. Auto-promotion validates the text (>=6 chars + has a 4+ Letter/Number run); short or generic text is REJECTED with a SKIPPED message in the reply (the line removal still succeeds) to prevent substring-matcher pollution (#90).",
       inputSchema: z.object({
         chat_id: larkIdSchema('chat_id').describe('Chat ID where this call is acting from'),
         thread_id: larkIdSchema('thread_id')
@@ -1604,11 +1604,23 @@ export function registerTools(
       // emit a "review whether you want all variants treated as
       // private" warning so the operator catches the over-broad rule.
       let tail = '';
+      // promote_result distinguishes requested-vs-applied for the
+      // audit trail (R2-audit followup on #90). Pre-followup the audit
+      // log only saw `promote_to_rule=true` (the request) — operators
+      // couldn't tell whether it landed, was rejected by validation,
+      // or threw. Values:
+      //   'not-requested' — promote_to_rule was false/unset
+      //   'added'         — rule wrote to privacy-rules.md
+      //   'skipped:too-short' / 'skipped:no-substantive-word'
+      //                   — validation rejected at the L2 boundary
+      //   'error:...'     — addL2Rule threw (disk failure etc)
+      let promoteResult: string = 'not-requested';
       if (promote_to_rule) {
         try {
           const { addL2Rule } = await import('./privacy-rules.js');
           const ruleResult = await addL2Rule(result.sample ?? '', 'Always private');
           if (ruleResult.added) {
+            promoteResult = 'added';
             tail = ' Also appended to privacy-rules.md under "Always private" — future distillations will classify similar content accordingly.';
             if (result.removed > 1) {
               tail +=
@@ -1622,6 +1634,7 @@ export function registerTools(
             // would be marked private. Reject explicitly so the
             // operator sees the failure mode instead of silently
             // accumulating a polluted ruleset.
+            promoteResult = `skipped:${ruleResult.reason}`;
             const reasonText =
               ruleResult.reason === 'too-short'
                 ? 'too short (< 6 chars) — would substring-match too many unrelated lines'
@@ -1632,6 +1645,7 @@ export function registerTools(
               `Removal of the profile line above succeeded; only the auto-rule was rejected.`;
           }
         } catch (err) {
+          promoteResult = `error:${err instanceof Error ? err.message.slice(0, 40) : String(err).slice(0, 40)}`;
           tail = ` (Warning: removal succeeded but failed to append rule to privacy-rules.md: ${err instanceof Error ? err.message : String(err)}. You can add the rule manually.)`;
         }
       }
@@ -1639,7 +1653,10 @@ export function registerTools(
       // Audit log includes the removed count for forensic visibility
       // (R1-audit followup #12 — pre-fix only ok/denied was recorded,
       // hiding that a multi-delete had happened from the audit trail).
-      void audit('forget_memory', caller, { ...auditArgs, removed: result.removed }, 'ok');
+      // promote_result added in v1.0.26 R2-audit followup so operators
+      // can distinguish a successful auto-promote from a validation-
+      // skipped one when scanning audit.log.
+      void audit('forget_memory', caller, { ...auditArgs, removed: result.removed, promote_result: promoteResult }, 'ok');
 
       // #88 fix: faithful confirmation that names the count AND lists
       // every removed text (so the operator can copy-paste back any

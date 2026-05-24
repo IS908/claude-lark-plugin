@@ -176,8 +176,13 @@ let passed = 0;
 }
 
 // ── 6. L2 rule append round-trip (what forget_memory(promote_to_rule=true) drives) ──
+//   v1.0.26 (R2-audit followup): check the tagged result explicitly so
+//   a future signature regression that silently rejects valid rules
+//   is caught immediately rather than detected via the loadL2Rules
+//   readback only.
 {
-  await addL2Rule('涉及人际冲突的表述', 'Always private');
+  const r = await addL2Rule('涉及人际冲突的表述', 'Always private');
+  if (!r.added) fail(`6: valid rule should be added; got reason=${(r as any).reason}`);
   const rules = await loadL2Rules();
   if (!rules.includes('## Always private')) fail('6: section header missing');
   if (!rules.includes('- 涉及人际冲突的表述')) fail('6: rule missing');
