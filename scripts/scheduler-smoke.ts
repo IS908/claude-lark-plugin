@@ -8,6 +8,14 @@
  *   Tier 1 = the job's chat; tier 2 = a DM to the owner if the chat send
  *   fails (chat may be gone — bot kicked / group dissolved).
  */
+// Pin cron tz to UTC so slot lattice for `0 * * * *` aligns to UTC
+// hour boundaries regardless of CI runner's local tz (R2-audit
+// followup on PR #123 — half-hour-offset tz like Asia/Kolkata would
+// otherwise shift hourly slots by 30 minutes vs the UTC-anchored
+// expectations in tests 19a/19c). Must be set BEFORE importing
+// config.js, which captures the env once at module load.
+process.env.LARK_CRON_TIMEZONE = 'UTC';
+
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
