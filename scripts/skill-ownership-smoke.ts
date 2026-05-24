@@ -368,4 +368,47 @@ let testNum = 0;
   if (stragglers.length > 0) fail(`tmp files left behind after normal save: ${stragglers.join(', ')}`);
 }
 
+// 18. migrateLegacySkills — rethrows non-ENOENT readdir errors so a
+//     permission/IO problem is loud and operator-visible, not silently
+//     reported as "0 legacy skills" (R2-audit F3). Simulated with chmod
+//     000 on the skills dir; we expect the await to throw.
+//     Skipped on platforms where chmod doesn't restrict the test process
+//     (root/Windows).
+{
+  testNum++;
+  const { store, baseDir } = freshStore();
+  const dir = path.join(baseDir, 'skills');
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'locked.md'), '# locked\nd\n\nbody', 'utf-8');
+  if (process.getuid?.() === 0 || process.platform === 'win32') {
+    // Skip — chmod 000 is bypassed for root, and Windows permission model differs.
+  } else {
+    await fs.chmod(dir, 0o000);
+    let threw = false;
+    try {
+      await store.migrateLegacySkills('ou_owner');
+    } catch {
+      threw = true;
+    } finally {
+      await fs.chmod(dir, 0o755); // restore so the temp dir can be cleaned
+    }
+    if (!threw) fail('migrateLegacySkills must rethrow EACCES on the skills dir');
+  }
+}
+
+// 19. migrateLegacySkills — ENOENT on the skills dir is silent / safe.
+//     Path: fresh install with no skills written yet.
+{
+  testNum++;
+  const { store, baseDir } = freshStore();
+  // No skills dir.
+  await store.migrateLegacySkills('ou_owner'); // must NOT throw
+  // And calling listLegacySlugs (via subsequent migrate) is still fine.
+  await store.migrateLegacySkills(null); // also must NOT throw
+  // And the skills dir is still absent (migration did not eagerly create).
+  if (existsSync(path.join(baseDir, 'skills'))) {
+    fail('migration on fresh install should not create skills/');
+  }
+}
+
 console.log(`skill ownership smoke: ${testNum}/${testNum} PASS`);

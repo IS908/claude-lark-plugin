@@ -711,7 +711,9 @@ export class MemoryStore {
       return;
     }
     const slugs = await this.listLegacySlugs();
+    if (slugs.length === 0) return; // nothing to claim, no summary needed
     let claimed = 0;
+    const failures: string[] = [];
     for (const slug of slugs) {
       let createdAt = new Date().toISOString();
       try {
@@ -726,18 +728,65 @@ export class MemoryStore {
         claimed++;
       } catch (err) {
         console.error(`[migrate] skill ownership: failed to write sidecar for "${slug}":`, err);
+        failures.push(slug);
       }
     }
+    // Always emit a summary when there were legacy slugs (R2-audit F4) — a
+    // total-failure case previously left the operator with only per-slug
+    // error lines buried among other startup noise. The summary is what
+    // operators grep for after upgrade.
+    console.error(
+      `[migrate] skill ownership: claimed ${claimed}/${slugs.length} legacy skill(s) for OWNER ${ownerOpenId}` +
+        (failures.length > 0 ? ` (failed: ${failures.join(', ')})` : ''),
+    );
+    // Operator-visibility line for the just-claimed names + descriptions
+    // (R2-audit F2 minimal). Migration only gates the WRITE channel; legacy
+    // .md content was created by anyone-could-write-anything pre-v1.0.14
+    // and may carry prompt-injection payloads in `# name` or the description
+    // line — those continue to flow into Claude's memory enrichment after
+    // migration, but now under the operator's name. Surfacing the claimed
+    // names+descs gives the operator a one-time chance to spot anything
+    // they didn't write. Full content sanitization is a separate followup.
     if (claimed > 0) {
-      console.error(`[migrate] skill ownership: claimed ${claimed} legacy skill(s) for OWNER ${ownerOpenId}`);
+      for (const slug of slugs) {
+        if (failures.includes(slug)) continue;
+        try {
+          const body = await fs.readFile(this.skillFilePath(slug), 'utf-8');
+          const lines = body.split('\n');
+          const name = (lines[0] ?? '').replace(/^#\s*/, '').trim();
+          const desc = (lines[1] ?? '').trim();
+          console.error(`[migrate] skill ownership:   - ${slug}  ←  "${name}" — ${desc}`);
+        } catch {
+          console.error(`[migrate] skill ownership:   - ${slug}  ←  (content unreadable)`);
+        }
+      }
+      console.error(
+        '[migrate] skill ownership: ^ review the above for any skill you did NOT author. ' +
+        'Pre-v1.0.14 writes had no caller authorization (#84); migrated content is now attributed to OWNER. ' +
+        'Delete unwanted entries with: rm ~/.claude/channels/lark/memories/skills/<slug>.{md,meta.json}',
+      );
     }
   }
 
-  /** List slugs (sans .md extension) of every skill file lacking a sidecar. */
+  /**
+   * List slugs (sans .md extension) of every skill file lacking a sidecar.
+   *
+   * Distinguishes the no-skills-dir case (ENOENT → []) from
+   * permission/IO failures (rethrow), so the caller doesn't silently
+   * report "no legacy skills" when migration is actually blocked
+   * (R2-audit F3).
+   */
   private async listLegacySlugs(): Promise<string[]> {
     const dir = this.skillsDir();
     let files: string[];
-    try { files = await fs.readdir(dir); } catch { return []; }
+    try {
+      files = await fs.readdir(dir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return []; // skills dir not created yet
+      console.error(`[migrate] skill ownership: cannot read ${dir} (${code ?? 'unknown error'}) — migration aborted. Fix permissions and restart.`);
+      throw err;
+    }
     const out: string[] = [];
     for (const f of files) {
       if (!f.endsWith('.md')) continue;
