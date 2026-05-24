@@ -11,8 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
   Fix:
   - `MemoryStore.removeProfileLine(ownerId, tier, hash)` now returns `{ removed: number, sample: string | null, allTexts: string[] }` instead of a bare boolean.
-  - `forget_memory` tool reply branches on `removed`: singular `Removed "<text>" from ${tier} profile.` when 1, plural `Removed N lines sharing hash "${hash}" from ${tier} profile (sample: "<text>"). If only one of these was the intended target, run what_do_you_know and re-add the others with save_memory.` when ≥2.
-  - `promote_to_rule=true` uses the sample text for the L2 rule append (the colliding texts are normalized-equal so the sample is representative — operator is told the count and can manually add other variants if needed).
+  - `forget_memory` tool reply (via the new pure `formatForgetMemoryReply` helper) branches on `removed`: singular `Removed "<text>" from ${tier} profile.` when 1; plural lists every removed text inline as a numbered list followed by a `save_memory(type="profile", tier=..., mode="append", content=...)` recovery hint, so the operator can copy-paste any unintended losses back. R1 audit caught that the intermediate format (count + sample only) had a misleading recovery hint pointing at `what_do_you_know` — which can't show texts that were just deleted.
+  - `promote_to_rule=true` uses the sample text for the L2 rule append (the colliding texts are normalized-equal so the sample is representative); when `removed > 1`, the tail also warns "rule seeded from the sample text only; multiple lines were removed, so review whether other variants should also be added manually." If `addL2Rule` itself throws, the L2 warning takes precedence (single warning per reply).
+  - Audit log records the actual `removed` count so the trail shows the scope of every invocation, not just ok/denied.
 
 ### Added
 - 1 new transparency-smoke assertion (#5b) covering the multi-delete path: two normalized-equal lines pre-populated via `mode='replace'` (bypasses `mergeProfileLines` dedup), `removeProfileLine` reports `removed: 2`, file ends empty, `allTexts` carries both originals.
