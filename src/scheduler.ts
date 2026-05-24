@@ -404,22 +404,39 @@ export class JobScheduler {
     const rawContent = job.meta.content ?? '';
     const msgType = job.meta.msg_type ?? 'text';
 
+    // create_job (src/tools.ts) hardcodes `msg_type: 'text'` for type=
+    // message jobs — non-text is reachable only via a hand-edited job
+    // file. R1-audit followup on #96 flagged that Feishu's `post` rich-
+    // text payload ALSO supports `<at>` tags, so a hand-edited job
+    // file with `msg_type='post'` and an `<at>` inside the post body
+    // would bypass the sanitizer below. Defense: refuse non-text
+    // msg_types here. Operator who has a legitimate post/interactive
+    // cronjob need can extend executeMessageJob explicitly with a
+    // per-format sanitizer.
+    if (msgType !== 'text') {
+      console.error(
+        `[scheduler] executeMessageJob: refusing job "${job.meta.id}" with msg_type=${msgType} ` +
+        `(only 'text' is supported by message-type jobs; non-text payloads bypass <at>-tag sanitization #96). ` +
+        `Edit the job file to msg_type='text' or convert to a prompt-type job.`,
+      );
+      return;
+    }
+
     // Cronjob message-type bodies are author-controlled at create_job
     // time, NOT runtime user input — but a `create_job` call itself
     // is reachable from a prompt-injected Claude (e.g. user asks Claude
     // to schedule a "polite reminder" and quietly slips `<at user_id="all">`
     // into the content). The content lives in the job file forever,
     // firing on every scheduled tick. Sanitize on send to defang any
-    // such payload that landed before #96 shipped, and to keep the
-    // contract that "bot's outbound text never @-mentions on its own".
-    const content = msgType === 'text' ? sanitizeOutboundText(rawContent) : rawContent;
+    // such payload that landed before #96 shipped.
+    const content = sanitizeOutboundText(rawContent);
 
     await this.client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: {
         receive_id: job.meta.target_chat_id,
-        content: JSON.stringify(msgType === 'text' ? { text: content } : { content }),
-        msg_type: msgType,
+        content: JSON.stringify({ text: content }),
+        msg_type: 'text',
       },
     });
   }

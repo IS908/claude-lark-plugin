@@ -48,27 +48,40 @@ import { writeSdkResource } from './sdk-resource.js';
  * Exported for unit testing.
  */
 export function sanitizeOutboundText(text: string): string {
-  // Paired form: <at ...>label</at>  →  keep `label`
-  // Self-closing: <at .../>           →  drop entirely
-  // The `[\s\S]*?` makes the label match cross-line non-greedily.
+  // Match either:
+  //   <at>   (no attrs — Feishu's current renderer requires user_id so
+  //          this is harmless today, but defense in depth against a
+  //          future renderer leniency. R1-audit followup on #96.)
+  //   <at attrs...>label</at>
+  //   <at attrs.../>
+  // The `(?:\s[^>]*)?` makes the attribute tail optional so bare `<at>`
+  // is caught without false-positiving on `<atom>` / `<athletics>` —
+  // those start with `at` followed by more letters, not `>` or `\s`.
+  //
+  // Self-closing replace runs first so a mixed-form payload like
+  //   `<at id="x"/>foo</at>`
+  // becomes `foo</at>` after self-close strip, then the orphan-tail
+  // sweep at the end drops the dangling `</at>` so output stays clean.
   //
   // Loop to a fixed point because a single pass leaves NESTED tags
   // exposed: input `<at id="a">outer <at id="b">inner</at> tail</at>`
   // → first pass removes the OUTER tag and yields
   // `outer <at id="b">inner tail</at>`, which is still a valid Feishu
   // @-mention payload. Iterate until the string stops shrinking. Hard
-  // cap at 8 iterations as a belt-and-braces against a pathological
-  // input that could otherwise trigger expensive backtracking; 8 levels
-  // of nesting is far beyond anything an LLM would emit.
+  // cap at 8 iterations as a backtracking guard; 8 levels of nesting
+  // is far beyond anything an LLM would emit.
   let out = text;
   for (let i = 0; i < 8; i++) {
     const next = out
-      .replace(/<at\s+[^>]*?\/>/gi, '')
-      .replace(/<at\s+[^>]*>([\s\S]*?)<\/at>/gi, '$1');
-    if (next === out) return out;
+      .replace(/<at(?:\s[^>]*)?\/>/gi, '')
+      .replace(/<at(?:\s[^>]*)?>([\s\S]*?)<\/at>/gi, '$1');
+    if (next === out) break;
     out = next;
   }
-  return out;
+  // Orphan-tail sweep: any leftover `</at>` (e.g. from a mixed
+  // self-closing+paired input, or a malformed half-tag) is purely
+  // cosmetic noise — keep the output clean.
+  return out.replace(/<\/at>/gi, '');
 }
 
 /**

@@ -18,8 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   4. Scheduler `executeMessageJob` text path (defangs any `<at>` payload that landed in a job file via a prompt-injected `create_job` before this fix shipped — message-type jobs persist their content across restarts)
 
 ### Added
-- 12 smoke assertions in `scripts/at-tag-sanitization-smoke.ts` covering: paired tags with various labels, @-all attack, self-closing form, empty paired tags, multiple tags in one string, case insensitivity (`<AT>` / `<At>`), cross-line bodies, non-`<at>` tags (`<atom>`, `<athletics>`, `<a>`) untouched, bare `<at>` (no attrs) left alone (harmless — Feishu requires `user_id`), plain-text passthrough, nested tags collapsed to fixed point, HTML-entity-encoded form left as literal text (harmless).
+- 18 smoke assertions in `scripts/at-tag-sanitization-smoke.ts` covering: paired tags with various labels, @-all attack, self-closing form, empty paired tags, multiple tags in one string, case insensitivity (`<AT>` / `<At>`), cross-line bodies, non-`<at>` tags (`<atom>`, `<athletics>`, `<a>`) untouched, bare `<at>` (no attrs) stripped (R1-audit defense-in-depth), plain-text passthrough, nested tags collapsed to fixed point, HTML-entity-encoded form left as literal text (harmless), single-quoted and unquoted attribute variants, triply-nested collapse, mixed self-closing + stray paired-close cleaned via orphan-tail sweep, whitespace-only passthrough, Cyrillic lookalike untouched (Feishu also won't render it), 1000-unclosed-tag backtracking-safety check.
 - `sanitizeOutboundText` exported from `src/tools.ts` for downstream test reuse and to let `src/scheduler.ts` import the canonical sanitizer rather than reimplement.
+
+### R1-audit followups (closed in this PR)
+- **Bare `<at>` (no attrs) now stripped too** — pre-followup the regex required `\s` after `at`, leaving `<at>x</at>` intact. Defense-in-depth against a future Feishu renderer leniency.
+- **Orphan `</at>` tail sweep** — a mixed-form input like `<at user_id="x"/>foo</at>` previously left a dangling `</at>` in the output. Cosmetic but worth fixing.
+- **`executeMessageJob` refuses non-`text` `msg_type`** — `post` rich-text payload also supports `<at>` and would have bypassed the sanitizer. `create_job` hardcodes text, so this is purely a defense against hand-edited job files. Refused jobs log a stderr message naming the file.
 
 ### Operator notes
 - Legitimate `<at>`-shaped content in bot replies (e.g. Claude explaining what an `<at>` tag IS) loses the angle-bracket wrapping. If you need to discuss `<at>` syntactically without it being processed as a mention, wrap the example differently (escape the brackets, or use a code fence and accept that the inner `<at>` is also stripped). A future release may add a fence-aware variant.
