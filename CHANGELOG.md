@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.25] - 2026-05-25
+
+### Fixed
+- **Bot `@`-mention detection fails safely when `botOpenId` is unknown** (#86, #55 — **HIGH — spammy unsolicited replies in every group during startup race / fetch failure**). Pre-v1.0.25 two fallback paths in `src/channel.ts` accepted ANY mention as if it addressed the bot when `botOpenId` was empty (transient `fetchBotOpenId` failure, network blip, or startup race window):
+  - Group filter (`handleMessageEvent`, line 313 area): fell through to "no filter — accept any group mention" → every `@User B 请评审` was forwarded to Claude.
+  - `bot_mentioned` meta flag (line 357 area): fell through to `mentions.length > 0` → biased Claude toward replying even when bot wasn't actually addressed.
+
+  Combined effect: in any group with active @mentions during the startup window, the bot would inject unsolicited replies into unrelated conversations. The user's documented operating principle ("if a group message reaches you, the user expects a reply") amplified the noise.
+
+  Fix: both decisions extracted as pure helpers (`shouldAcceptGroupMention`, `computeBotMentioned`) with deny-by-default semantics when `botOpenId === ''`. Better silent during startup than spammy.
+
+- **`fetchBotOpenId` now retries on startup AND re-fetches in background on persistent failure** (#86 hardening). Pre-v1.0.25 a single attempt that failed (network blip, Feishu 5xx, transient permission issue) silenced group @-mentions until next process restart. Now: 5 startup attempts with 2s linear backoff, then a background re-fetch every 5 minutes for up to 1 hour. Logs at the right level — last startup attempt and background retries log at ERROR, intermediates at debug. Caps at 1 hour total so a permanently-broken setup doesn't burn quota indefinitely.
+
+### Added
+- 10 smoke assertions in new `scripts/bot-mention-failsafe-smoke.ts`: happy path for both helpers, deny-by-default on empty botOpenId, no-mentions / null / undefined handling, `union_id` fallback when `open_id` missing, combined startup-race reproducer (#86's exact scenario).
+- New exports from `src/channel.ts`: `shouldAcceptGroupMention`, `computeBotMentioned`.
+
+### Operator notes
+- After upgrade, expect a brief startup window (up to ~10s for 5 retries × 2s) where group @-mentions are silently ignored before `botOpenId` resolves. This is correct fail-safe behavior. P2P chats are unaffected.
+- If you see `[channel] WARNING: botOpenId not resolved after 5 startup attempts` in stderr after upgrade, check Feishu app permissions (`im:bot` scope) — the background re-fetch will keep trying every 5 minutes for up to an hour but the bot will be silent in groups during that window.
+- This release also closes #55 (same root cause — both group filter and bot_mentioned flag now share the fail-safe `shouldAcceptGroupMention` / `computeBotMentioned` helpers).
+
 ## [1.0.24] - 2026-05-25
 
 ### Fixed
