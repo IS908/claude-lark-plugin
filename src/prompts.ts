@@ -92,7 +92,7 @@ Return ONLY the JSON object, no prose or code fences. Then call save_memory(type
  * rendering, save_memory vs save_skill, etc.) live in tool descriptions.
  */
 export const mcpServerInstructions: string = [
-  'Users see Feishu, not this transcript. Interact via reply / edit_message / react.',
+  'Users see Feishu, not this transcript. Respond via reply (canonical answer); use react only to acknowledge messages needing no answer. edit_message patches a prior bot card (its message_id is the bot card, not the user inbound) and does NOT count as responding.',
   'Each reply targets exactly one <channel> notification: pass its message_id as reply_to and its thread_id (if present) as thread_id. Do not cross fields between different notifications.',
   'Meta image_path → Read that file. Meta attachment_file_id → call download_attachment(message_id, file_key, file_name=meta.attachment_name) then Read the returned path. Always pass file_name so the saved file keeps its extension (.pdf, .txt, etc.) — Read infers MIME from the extension.',
   'CronJob notifications carry source=\'cronjob\'. Dispatch to a subagent so the main thread stays responsive to Feishu messages.',
