@@ -229,7 +229,13 @@ async function main() {
   // 4. Create conversation buffer + wire flush handler
   const buffer = new ConversationBuffer();
   buffer.setFlushHandler(async (chatId, messages) => {
-    const flushPrompt = buildFlushPrompt(chatId, messages);
+    // Generate flushKey FIRST so it can be interpolated into the
+    // prompt (Claude is then told to pass it as `thread_id` in the
+    // save_memory call — R1-audit followup on #87, closes the prompt
+    // gap where Claude could omit thread_id and fall back to the
+    // chat-level slot which resolves to the last real user).
+    const flushKey = `flush-${Date.now()}`;
+    const flushPrompt = buildFlushPrompt(chatId, messages, flushKey);
     // In auto-flush, we inject the prompt as if it were a message
     // The channel's message handler will forward it to Claude
     console.error(`[distiller] Auto-flush for chat ${chatId}: ${messages.length} messages`);
@@ -262,8 +268,9 @@ async function main() {
     // pattern of binding job.meta.created_by before the cronjob
     // notification. The thread-key `flush-<ts>` matches LARK_ID_REGEX
     // (alphanumeric + dash) so save_memory's tool-boundary regex
-    // accepts it.
-    const flushKey = `flush-${Date.now()}`;
+    // accepts it. flushKey was generated above (used to interpolate
+    // into the prompt's `thread_id="${flushKey}"` instruction so
+    // Claude reliably passes it back — R1-audit followup on #87).
     identitySession.setCaller(chatId, flushKey, SYSTEM_FLUSH_CALLER);
 
     // Forward flush prompt through the normal message handler

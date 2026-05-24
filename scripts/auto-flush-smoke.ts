@@ -274,6 +274,34 @@ const auditLog = await waitForAuditLog();
   passed++;
 }
 
+// ── 10. R1-audit followup on #87: the flushPrompt template now
+//        interpolates the flushKey into Claude's save_memory call
+//        instruction, so Claude doesn't need to remember to surface
+//        thread_id from notification meta. Pre-followup, the prompt
+//        omitted thread_id → if Claude followed the explicit template
+//        literally (no thread_id), save_memory's resolveCaller would
+//        fall back to the chat-level slot → return the LAST REAL USER
+//        instead of the sentinel → audit log falsely attributes the
+//        save to that user.
+{
+  const { buildFlushPrompt } = await import('../src/memory/distiller.js');
+  const flushKey = 'flush-1748000000000';
+  const prompt = buildFlushPrompt(
+    'oc_test',
+    [{ role: 'user', senderId: 'ou_alice', text: 'hi', timestamp: '2026-05-25T00:00:00Z' }],
+    flushKey,
+  );
+  // The prompt MUST tell Claude to pass thread_id="<flushKey>".
+  if (!prompt.includes(`thread_id="${flushKey}"`)) {
+    fail(`10: prompt must instruct Claude to pass thread_id="${flushKey}"; got:\n${prompt.slice(0, 500)}`);
+  }
+  // And it must explain WHY (so a future prompt edit doesn't accidentally drop it).
+  if (!/audit log will falsely attribute/i.test(prompt) && !/required/i.test(prompt)) {
+    fail(`10: prompt should explain WHY thread_id is required; got:\n${prompt.slice(0, 500)}`);
+  }
+  passed++;
+}
+
 rmSync(tmp, { recursive: true, force: true });
 
-console.log(`auto-flush smoke: ${passed}/9 PASS`);
+console.log(`auto-flush smoke: ${passed}/10 PASS`);
