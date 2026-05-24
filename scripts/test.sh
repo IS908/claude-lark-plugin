@@ -78,4 +78,8 @@ echo "=== Auto-flush caller binding unit checks ==="
 npx tsx scripts/auto-flush-smoke.ts
 
 echo ""
+echo "=== Skill ownership unit checks ==="
+npx tsx scripts/skill-ownership-smoke.ts
+
+echo ""
 echo "All tests passed."

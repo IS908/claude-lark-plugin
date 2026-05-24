@@ -93,6 +93,19 @@ export class IdentitySession {
     return null;
   }
 
+  /**
+   * Return the configured operator OWNER (`LARK_OWNER_OPEN_ID`), or null.
+   *
+   * Consumers (e.g. save_skill — #84) use this when they need the OWNER
+   * identity independent of the per-message caller — for instance, to
+   * include in an error hint about restarting for legacy-skill migration.
+   * Does NOT consult the session map; this is the static fallback, not
+   * the current caller.
+   */
+  getOwner(): string | null {
+    return this.ownerFallback();
+  }
+
   /** Drop entries older than maxAgeMs. Safe to call periodically. */
   cleanup(): void {
     for (const [k, v] of this.map.entries()) {

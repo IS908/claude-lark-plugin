@@ -25,6 +25,41 @@ function optionalNumber(key: string, fallback: number): number {
   return val ? Number(val) : fallback;
 }
 
+/**
+ * Read and validate `LARK_OWNER_OPEN_ID`.
+ *
+ * Trims whitespace, treats empty after trim as unset, and refuses values
+ * that collide with a reserved sentinel — both `__terminal__` and
+ * `__system_flush__` have special meaning elsewhere in the identity
+ * pipeline and would create absurd downstream states (terminal-chat
+ * lookups returning the sentinel back, save_memory authorization for the
+ * flush sentinel auto-passing, etc). Invalid values are dropped to null
+ * with a stderr warning rather than crashing the boot, so a misconfigured
+ * .env still produces a runnable bot — just without OWNER privileges.
+ *
+ * Treating an invalid OWNER as null also keeps `migrateLegacySkills`
+ * (v1.0.14+, #84) safe: it would have written `created_by: "   "` or
+ * `created_by: "__terminal__"` into every legacy sidecar, locking the
+ * real owner out forever (the owner check is exact string equality).
+ */
+function ownerOpenId(): string | null {
+  const raw = process.env.LARK_OWNER_OPEN_ID;
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    console.error('[config] LARK_OWNER_OPEN_ID is whitespace-only — treating as unset.');
+    return null;
+  }
+  if (trimmed === '__terminal__' || trimmed === '__system_flush__') {
+    console.error(
+      `[config] LARK_OWNER_OPEN_ID="${trimmed}" collides with a reserved sentinel — treating as unset. ` +
+      `Use the real Feishu open_id (typically starts with "ou_").`,
+    );
+    return null;
+  }
+  return trimmed;
+}
+
 export const appConfig = {
   // Required
   appId: required('LARK_APP_ID'),
@@ -45,7 +80,7 @@ export const appConfig = {
   inactivityHours: optionalNumber('LARK_INACTIVITY_HOURS', 3),
 
   // Identity / privacy
-  ownerOpenId: process.env.LARK_OWNER_OPEN_ID || null,
+  ownerOpenId: ownerOpenId(),
   /**
    * Session entry TTL. Must comfortably exceed the buffer auto-flush window
    * (LARK_INACTIVITY_HOURS) so that save_memory / save_skill calls triggered

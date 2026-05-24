@@ -342,7 +342,7 @@ tmux kill-session -t lark
 | `react` | `(message_id, emoji)` | 对消息添加表情回复 |
 | `download_attachment` | `(message_id, file_key)` | 下载消息中的附件到本地收件箱 |
 | `save_memory` | `(type, content, reason, chat_id, thread_id?, tier?)` | 保存用户画像、会话情景或话题情景。画像写入总是针对调用者本人（v0.9.0 起）；v0.10.0 起可选 `tier` 参数（`public` / `private`，默认 `private`）决定归属哪一档 |
-| `save_skill` | `(name, description, content, chat_id?)` | 保存可复用的操作流程为全局技能 |
+| `save_skill` | `(name, description, content, chat_id, thread_id?)` | 保存可复用的操作流程为全局技能。Slug = name 规范化后；首次写入者为 owner，后续仅 owner 可覆盖（v1.0.14+）|
 | `create_job` | `(name, type, schedule, prompt?, content?, target_chat_id, chat_id, thread_id?)` | 创建定时任务。创建者由 session 派生，不再接受 `created_by`；`chat_id` 用于派生调用者身份并填充 `origin_chat_id` |
 | `list_jobs` | `(status?, chat_id, thread_id?)` | 列出当前 chat 可见的 job。私聊返回 caller 自己建的；群里返回 `target_chat_id` 为本群的（非 owner 视图脱敏 prompt）|
 | `update_job` | `(id, status?, schedule?, prompt?, content?, name?, chat_id, thread_id?)` | 修改 job。仅 owner 可操作 |

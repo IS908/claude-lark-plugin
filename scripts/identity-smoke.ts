@@ -68,4 +68,21 @@ function fail(msg: string): never {
   if (s.getCaller('chat_A') !== 'ou_bob') fail('overwrite');
 }
 
-console.log('identity smoke: 8/8 PASS');
+// 9. getOwner returns the static ownerFallback (v1.0.14, for save_skill #84).
+//    Independent of any session entries — pure passthrough of the fallback.
+{
+  const s = new IdentitySession(() => 'ou_owner_static');
+  if (s.getOwner() !== 'ou_owner_static') fail('getOwner returns ownerFallback');
+  // Session entries do NOT influence getOwner — it's the OWNER, not the
+  // current caller for some chat.
+  s.setCaller('chat_X', undefined, 'ou_someone_else');
+  if (s.getOwner() !== 'ou_owner_static') fail('getOwner ignores session entries');
+}
+
+// 10. getOwner returns null when no OWNER configured.
+{
+  const s = new IdentitySession(() => null);
+  if (s.getOwner() !== null) fail('getOwner null when ownerFallback returns null');
+}
+
+console.log('identity smoke: 10/10 PASS');

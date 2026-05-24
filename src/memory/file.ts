@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { appConfig } from '../config.js';
 import { applyL1, loadL2Rules, extractL2PrivatePhrases } from '../privacy-rules.js';
@@ -98,6 +98,26 @@ export interface Skill {
   description: string;
   content: string;
   score?: number;
+}
+
+/**
+ * Ownership sidecar for a skill file. Persisted as JSON at
+ * `skills/<slug>.meta.json` alongside the skill markdown.
+ *
+ * Stored as a sidecar (not inline frontmatter) so:
+ * - `searchSkills` can keep its line-index based parser unchanged.
+ * - The .md file remains a clean, human-readable document.
+ * - Adding/removing fields doesn't require a content-format migration.
+ *
+ * `migrated: true` distinguishes sidecars synthesized by the v1.0.14
+ * legacy-claim migration from sidecars written by a real `save_skill`
+ * call. Diagnostic only — does not affect the owner check.
+ */
+export interface SkillMeta {
+  created_by: string;
+  created_at: string;
+  updated_at?: string;
+  migrated?: boolean;
 }
 
 /**
@@ -548,13 +568,331 @@ export class MemoryStore {
     }
   }
 
-  async saveSkill(name: string, description: string, content: string): Promise<void> {
-    const dir = path.join(this.baseDir, 'skills');
+  /**
+   * Normalize a user-supplied skill name into a filesystem-safe slug.
+   *
+   * Returns an empty string when the input has no alphanumeric character
+   * (e.g. `""`, `"!!!"`, `"---"`). Tool handlers MUST treat empty-slug as
+   * an invalid name and reject before calling {@link saveSkill}, otherwise
+   * the write would land on `skills/.md` / `skills/.meta.json` — collidable
+   * across all empty-slug attempts.
+   */
+  static sanitizeSkillSlug(name: string): string {
+    return name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  }
+
+  private skillsDir(): string {
+    return path.join(this.baseDir, 'skills');
+  }
+
+  private skillFilePath(slug: string): string {
+    return path.join(this.skillsDir(), `${slug}.md`);
+  }
+
+  private skillMetaPath(slug: string): string {
+    return path.join(this.skillsDir(), `${slug}.meta.json`);
+  }
+
+  /**
+   * Read the ownership sidecar for a skill slug.
+   *
+   * Returns null when:
+   * - the sidecar does not exist (legacy skill or fresh slug),
+   * - or the file exists but cannot be parsed as JSON (treated as legacy
+   *   so a corrupted sidecar doesn't permanently lock a slug — the
+   *   migration / runtime path will recreate it).
+   *
+   * NOTE: callers that need to distinguish "no sidecar AND no .md" from
+   * "no sidecar BUT .md exists" must check {@link existsSync} on
+   * {@link skillFilePath} separately. The legacy-handling policy lives in
+   * the consumer ({@link saveSkill}, {@link migrateLegacySkills}), not
+   * here.
+   */
+  async readSkillMeta(slug: string): Promise<SkillMeta | null> {
+    const p = this.skillMetaPath(slug);
+    if (!existsSync(p)) return null;
+    try {
+      const raw = await fs.readFile(p, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<SkillMeta>;
+      if (typeof parsed.created_by !== 'string' || !parsed.created_by) return null;
+      return {
+        created_by: parsed.created_by,
+        created_at: typeof parsed.created_at === 'string' ? parsed.created_at : new Date().toISOString(),
+        migrated: parsed.migrated === true,
+        updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Atomically write the sidecar JSON for a slug.
+   *
+   * R1-audit finding on PR #92 (v1.0.14): a plain `fs.writeFile` on the
+   * final `.meta.json` path is NOT atomic — two concurrent `saveSkill`
+   * calls on the same fresh slug can each pass the "no sidecar" check,
+   * then race to write the final file. The empirically-observed failure
+   * (3/50 of stress runs) was malformed JSON (`{...}\n}\n`-style mixed
+   * output), which {@link readSkillMeta} treats as null → the slug then
+   * falls into the `legacy-locked` branch on every subsequent save and
+   * becomes permanently un-recoverable without operator intervention.
+   *
+   * Mitigation: write to a per-process temp file in the same directory
+   * (so rename is intra-filesystem and atomic on POSIX), then rename onto
+   * the final path. The last writer's rename wins, but the file content
+   * is always a complete, valid JSON document — never a corrupt
+   * interleave. The security property is unchanged: the gate is
+   * `readSkillMeta`'s owner field, not the existence of the .tmp file.
+   *
+   * The race in "who wins ownership when two callers both see no
+   * sidecar" remains (analogous to the saveProfile TOCTOU in #54) — out
+   * of scope for this fix. What this DOES prevent is the much worse
+   * outcome where the racing writers brick the slug for everyone.
+   */
+  private async writeSkillMeta(slug: string, meta: SkillMeta): Promise<void> {
+    await fs.mkdir(this.skillsDir(), { recursive: true });
+    const finalPath = this.skillMetaPath(slug);
+    // tmpPath MUST be unique per write — using only pid+timestamp collides
+    // when two parallel calls land in the same millisecond. Both would
+    // call fs.writeFile against the same tmp file, racing inside the
+    // syscall, and the second rename would then ENOENT because the first
+    // already moved the shared tmp away. randomBytes guarantees per-call
+    // uniqueness with negligible collision risk.
+    const tmpPath = `${finalPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+    try {
+      await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2) + '\n', 'utf-8');
+      await fs.rename(tmpPath, finalPath);
+    } catch (err) {
+      // Best-effort cleanup; ignore unlink failures (the tmp file may
+      // already be gone if rename partially succeeded).
+      try { await fs.unlink(tmpPath); } catch {}
+      throw err;
+    }
+  }
+
+  /**
+   * One-shot migration: scan all legacy skills (.md files without a
+   * sibling .meta.json) and attribute them to the operator (OWNER).
+   *
+   * Rationale (#84): pre-v1.0.14 `save_skill` had no ownership tracking,
+   * so any user in any chat could overwrite any other user's skill, and
+   * malicious `content` would be surfaced globally by `searchSkills`.
+   * v1.0.14 adds an owner gate that refuses save_skill when the slug is
+   * already owned by someone else. The migration runs at startup to claim
+   * legacy slugs for the OWNER (`LARK_OWNER_OPEN_ID`) so the operator
+   * doesn't get locked out of their own skills the moment they upgrade.
+   *
+   * - Idempotent: skills with an existing sidecar are skipped.
+   * - No-op without `LARK_OWNER_OPEN_ID`: legacy skills stay un-claimed
+   *   and any `save_skill` on those slugs will be rejected (owner-mismatch
+   *   path) until the operator either sets OWNER + restarts or deletes
+   *   the offending .md manually. This is the safer failure mode — a
+   *   silent migration without OWNER would risk attributing legacy
+   *   content to the first caller (the precise threat we're closing).
+   * - Sidecar's `created_at` reflects the .md's mtime (best-effort recovery
+   *   of when the skill was actually written) and `migrated: true` so
+   *   operators can tell migrated-from-legacy apart from new sidecars.
+   */
+  async migrateLegacySkills(ownerOpenId: string | null): Promise<void> {
+    const dir = this.skillsDir();
+    if (!existsSync(dir)) return; // no skills yet
+    if (!ownerOpenId) {
+      const orphans = await this.listLegacySlugs();
+      if (orphans.length > 0) {
+        console.error(
+          `[migrate] skill ownership: ${orphans.length} legacy skill(s) without sidecar; LARK_OWNER_OPEN_ID is unset so they will be locked against save_skill overwrite. ` +
+          `Set LARK_OWNER_OPEN_ID and restart to claim them, or manually delete the relevant .md file(s) to free the slug.`,
+        );
+      }
+      return;
+    }
+    const slugs = await this.listLegacySlugs();
+    if (slugs.length === 0) return; // nothing to claim, no summary needed
+    let claimed = 0;
+    const failures: string[] = [];
+    for (const slug of slugs) {
+      let createdAt = new Date().toISOString();
+      try {
+        const stat = await fs.stat(this.skillFilePath(slug));
+        createdAt = stat.mtime.toISOString();
+      } catch {
+        // mtime unreadable — fall back to "now"; the sidecar timestamp is
+        // informational, not part of the owner check.
+      }
+      try {
+        await this.writeSkillMeta(slug, { created_by: ownerOpenId, created_at: createdAt, migrated: true });
+        claimed++;
+      } catch (err) {
+        console.error(`[migrate] skill ownership: failed to write sidecar for "${slug}":`, err);
+        failures.push(slug);
+      }
+    }
+    // Always emit a summary when there were legacy slugs (R2-audit F4) — a
+    // total-failure case previously left the operator with only per-slug
+    // error lines buried among other startup noise. The summary is what
+    // operators grep for after upgrade.
+    console.error(
+      `[migrate] skill ownership: claimed ${claimed}/${slugs.length} legacy skill(s) for OWNER ${ownerOpenId}` +
+        (failures.length > 0 ? ` (failed: ${failures.join(', ')})` : ''),
+    );
+    // Operator-visibility line for the just-claimed names + descriptions
+    // (R2-audit F2 minimal). Migration only gates the WRITE channel; legacy
+    // .md content was created by anyone-could-write-anything pre-v1.0.14
+    // and may carry prompt-injection payloads in `# name` or the description
+    // line — those continue to flow into Claude's memory enrichment after
+    // migration, but now under the operator's name. Surfacing the claimed
+    // names+descs gives the operator a one-time chance to spot anything
+    // they didn't write. Full content sanitization is a separate followup.
+    if (claimed > 0) {
+      for (const slug of slugs) {
+        if (failures.includes(slug)) continue;
+        try {
+          const body = await fs.readFile(this.skillFilePath(slug), 'utf-8');
+          const lines = body.split('\n');
+          const name = (lines[0] ?? '').replace(/^#\s*/, '').trim();
+          const desc = (lines[1] ?? '').trim();
+          console.error(`[migrate] skill ownership:   - ${slug}  ←  "${name}" — ${desc}`);
+        } catch {
+          console.error(`[migrate] skill ownership:   - ${slug}  ←  (content unreadable)`);
+        }
+      }
+      console.error(
+        '[migrate] skill ownership: ^ review the above for any skill you did NOT author. ' +
+        'Pre-v1.0.14 writes had no caller authorization (#84); migrated content is now attributed to OWNER. ' +
+        'Delete unwanted entries with: rm ~/.claude/channels/lark/memories/skills/<slug>.{md,meta.json}',
+      );
+    }
+  }
+
+  /**
+   * List slugs (sans .md extension) of every skill file lacking a sidecar.
+   *
+   * Distinguishes the no-skills-dir case (ENOENT → []) from
+   * permission/IO failures (rethrow), so the caller doesn't silently
+   * report "no legacy skills" when migration is actually blocked
+   * (R2-audit F3).
+   */
+  private async listLegacySlugs(): Promise<string[]> {
+    const dir = this.skillsDir();
+    let files: string[];
+    try {
+      files = await fs.readdir(dir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return []; // skills dir not created yet
+      console.error(`[migrate] skill ownership: cannot read ${dir} (${code ?? 'unknown error'}) — migration aborted. Fix permissions and restart.`);
+      throw err;
+    }
+    const out: string[] = [];
+    for (const f of files) {
+      if (!f.endsWith('.md')) continue;
+      const slug = f.slice(0, -'.md'.length);
+      if (!existsSync(this.skillMetaPath(slug))) out.push(slug);
+    }
+    return out;
+  }
+
+  /**
+   * Persist a skill with ownership tracking (#84).
+   *
+   * Authorization model:
+   * - Slug is derived from `name` via {@link sanitizeSkillSlug}. Empty
+   *   slugs (no alphanumeric characters) are rejected — callers must
+   *   surface a recognizable error to the user.
+   * - Sidecar JSON at `skills/<slug>.meta.json` records `created_by`
+   *   (caller open_id at first write). Subsequent writes by anyone else
+   *   are denied (`reason: 'not-owner'`).
+   * - Sidecar absent: treated as a fresh slug — caller becomes owner.
+   *   The startup migration ({@link migrateLegacySkills}) closes the
+   *   "legacy .md without sidecar" window by pre-claiming for OWNER, so
+   *   under normal operation, missing-sidecar means truly new.
+   *   If migration didn't run (no OWNER configured), pre-existing .md
+   *   files have no sidecar and an arbitrary caller would otherwise be
+   *   able to claim them — defend by additionally rejecting when .md
+   *   exists but sidecar is missing AND no OWNER is configured.
+   *
+   * Write order: .md first, then sidecar. Rationale: the inverse order
+   * (sidecar first) creates a worse failure mode — a sidecar without an
+   * .md would falsely lock the slug against the next legitimate save.
+   * In the .md-first order, a sidecar-write failure leaves the slug
+   * temporarily unowned, but the next save by the same caller will
+   * succeed (sidecar missing path) and the startup migration would
+   * eventually claim it for OWNER on the next restart.
+   */
+  async saveSkill(
+    name: string,
+    description: string,
+    content: string,
+    opts: { caller: string; ownerOpenId: string | null },
+  ): Promise<
+    | { ok: true; slug: string; action: 'created' | 'updated' }
+    | { ok: false; reason: 'empty-slug' | 'not-owner' | 'legacy-locked'; message: string }
+  > {
+    const slug = MemoryStore.sanitizeSkillSlug(name);
+    if (!slug) {
+      return {
+        ok: false,
+        reason: 'empty-slug',
+        message: `Skill name "${name}" sanitizes to an empty slug. Use a name containing at least one alphanumeric character (a-z, 0-9).`,
+      };
+    }
+
+    const dir = this.skillsDir();
     await fs.mkdir(dir, { recursive: true });
 
-    const fileName = name.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.md';
+    const filePath = this.skillFilePath(slug);
+    const sidecar = await this.readSkillMeta(slug);
+    const fileExists = existsSync(filePath);
+
+    if (sidecar) {
+      if (sidecar.created_by !== opts.caller) {
+        return {
+          ok: false,
+          reason: 'not-owner',
+          message:
+            `Skill "${slug}" is owned by another user and cannot be overwritten. ` +
+            `Pick a different name, or ask the original author / operator to delete ` +
+            `the skill first (rm ~/.claude/channels/lark/memories/skills/${slug}.{md,meta.json}).`,
+        };
+      }
+    } else if (fileExists) {
+      // No sidecar BUT .md exists — legacy skill that migration didn't
+      // (or couldn't) claim. Refuse to attribute it to the current caller
+      // since we cannot prove they wrote it. Operator can run with
+      // LARK_OWNER_OPEN_ID set + restart to migrate, or manually delete.
+      return {
+        ok: false,
+        reason: 'legacy-locked',
+        message:
+          `Skill "${slug}" exists from a legacy install with no ownership record. ` +
+          (opts.ownerOpenId
+            ? `Restart the plugin to run the legacy-skill migration (it will be claimed for OWNER).`
+            : `Set LARK_OWNER_OPEN_ID and restart to enable the legacy-skill migration, or manually delete the file.`),
+      };
+    }
+
     const fileContent = `# ${name}\n${description}\n\n${content}`;
-    await fs.writeFile(path.join(dir, fileName), fileContent, 'utf-8');
+    await fs.writeFile(filePath, fileContent, 'utf-8');
+
+    const now = new Date().toISOString();
+    const newMeta: SkillMeta = sidecar
+      ? { ...sidecar, updated_at: now }
+      : { created_by: opts.caller, created_at: now };
+    try {
+      await this.writeSkillMeta(slug, newMeta);
+    } catch (err) {
+      // .md write already succeeded — surface sidecar failure to stderr
+      // but return success on the user-visible operation. The slug is
+      // temporarily unowned; next save by the same caller will re-attempt
+      // the sidecar, and the next startup migration will claim it for
+      // OWNER if it's still bare.
+      console.error(`[memory] saveSkill: wrote ${filePath} but failed to write sidecar:`, err);
+    }
+    return { ok: true, slug, action: sidecar ? 'updated' : 'created' };
   }
 
   // ── Helpers ──

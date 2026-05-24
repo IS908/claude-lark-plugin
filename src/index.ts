@@ -50,6 +50,15 @@ async function main() {
   const memoryStore = new MemoryStore();
   console.error(`[memory] Using ${appConfig.memoriesDir}`);
 
+  // 1a. One-shot legacy-skill ownership migration (#84). Pre-v1.0.14
+  // save_skill had no ownership tracking, so existing skills/<slug>.md
+  // files have no sidecar. The migration claims them for OWNER so the
+  // operator isn't locked out of their own skills the moment they
+  // upgrade. Idempotent: skills with an existing .meta.json are skipped.
+  // No-op without LARK_OWNER_OPEN_ID — see migrateLegacySkills for the
+  // fail-loud diagnostic.
+  await memoryStore.migrateLegacySkills(appConfig.ownerOpenId);
+
   // 1b. Create identity session (server-side caller tracking for sensitive tools)
   const identitySession = new IdentitySession(
     () => appConfig.ownerOpenId,
@@ -63,7 +72,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.13' },
+    { name: 'claude-lark-plugin', version: '1.0.14' },
     {
       capabilities: {
         logging: {},
