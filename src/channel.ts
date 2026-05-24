@@ -167,6 +167,43 @@ export class LatestMessageTracker {
   }
 }
 
+/**
+ * Pure decision: should this group-chat message be processed by the
+ * bot? (#86, #55 fix — fail-safe default when botOpenId is unknown.)
+ *
+ * Returns true iff the message has at least one mention AND we know
+ * the bot's open_id AND the bot is among the mentions. Returns false
+ * (rejects) when botOpenId is empty — better silent during startup
+ * race than spammy unsolicited replies in every group.
+ *
+ * Exported for testing.
+ */
+export function shouldAcceptGroupMention(
+  mentions: Array<{ id?: { open_id?: string; union_id?: string } }> | null | undefined,
+  botOpenId: string,
+): boolean {
+  if (!mentions || mentions.length === 0) return false;
+  if (!botOpenId) return false; // fail-safe: don't process when bot id is unknown
+  return mentions.some((m) => (m.id?.open_id ?? m.id?.union_id) === botOpenId);
+}
+
+/**
+ * Pure decision: is the bot among the parsed mentions? Forwarded to
+ * Claude as `meta.bot_mentioned`. Fail-safe default when botOpenId is
+ * unknown (#86 — pre-fix returned `parsedMentions.length > 0` which
+ * biased Claude toward replying to any group mention even when the bot
+ * wasn't actually addressed).
+ *
+ * Exported for testing.
+ */
+export function computeBotMentioned(
+  parsedMentions: Array<{ id: string }>,
+  botOpenId: string,
+): boolean {
+  if (!botOpenId) return false;
+  return parsedMentions.some((m) => m.id === botOpenId);
+}
+
 export class LarkChannel {
   private client: Lark.Client;
   private nameCache = new Map<string, string>(); // open_id/chat_id → display name
@@ -304,21 +341,25 @@ export class LarkChannel {
       return;
     }
 
-    // In group chats, only process messages that @mention the bot
+    // In group chats, only process messages that @mention the bot.
+    // Pre-v1.0.25, missing botOpenId fell through and accepted ANY
+    // group mention (#55 + #86). Now via the shared
+    // shouldAcceptGroupMention helper: deny by default when bot's id
+    // is unknown (startup race / fetch failure) — better silent than
+    // spammy unsolicited replies in every group. The fetchBotOpenId
+    // path is hardened with retries + background re-fetch so the
+    // missing-id state is short-lived.
     if (chatType === 'group') {
-      if (!mentions || mentions.length === 0) {
-        debugLog(`[channel] Ignoring group message: no mentions`);
-        return;
-      }
-      // If we know the bot's open_id, match precisely; otherwise accept any mention
-      if (this.botOpenId) {
-        const botMentioned = mentions.some(
-          (m: any) => (m.id?.open_id ?? m.id?.union_id) === this.botOpenId
+      if (!shouldAcceptGroupMention(mentions, this.botOpenId)) {
+        debugLog(
+          `[channel] Ignoring group message: ` +
+          (!mentions || mentions.length === 0
+            ? 'no mentions'
+            : !this.botOpenId
+              ? 'botOpenId not yet known (startup race or fetch failure)'
+              : 'bot not @mentioned'),
         );
-        if (!botMentioned) {
-          debugLog(`[channel] Ignoring group message: bot not @mentioned`);
-          return;
-        }
+        return;
       }
       debugLog(`[channel] Group message with @mention, processing`);
     }
@@ -351,12 +392,12 @@ export class LarkChannel {
       }),
     );
 
-    // Detect whether this bot was among the mentioned users — forwarded to
-    // Claude as meta.bot_mentioned so Claude has a text-independent signal
-    // when multiple users are @mentioned in the same message.
-    const botMentioned = this.botOpenId
-      ? parsedMentions.some((m) => m.id === this.botOpenId)
-      : parsedMentions.length > 0; // fallback: same heuristic as the group-filter
+    // Detect whether this bot was among the mentioned users — forwarded
+    // to Claude as meta.bot_mentioned. Same fail-safe default as the
+    // group-filter above (#86 fix): when botOpenId is unknown, return
+    // false rather than the pre-v1.0.25 "any mention counts" heuristic
+    // that biased Claude toward replying.
+    const botMentioned = computeBotMentioned(parsedMentions, this.botOpenId);
 
     // Parse message text, resolving @_user_N placeholders to @<name>
     const text = resolveMentionPlaceholders(
@@ -763,10 +804,51 @@ export class LarkChannel {
   }
 
   /**
-   * Fetch the bot's own open_id via the bot info API.
-   * Used to filter group messages — only process those that @mention this bot.
+   * Fetch the bot's own open_id via the bot info API. Used to filter
+   * group messages — only those that @mention this bot are forwarded
+   * to Claude.
+   *
+   * v1.0.25 (#86, #55) hardening:
+   * - **Startup retry**: 5 attempts with 2s linear backoff. Network
+   *   blips / Feishu 5xx during the initial fetch are common; failing
+   *   over to the empty `botOpenId` state would silence ALL group
+   *   @-mentions until next process restart (the new fail-safe is
+   *   deny-by-default).
+   * - **Background re-fetch**: if startup retries all fail, schedule
+   *   a periodic re-fetch every 5 minutes for the next hour so the
+   *   bot can recover without restart if the underlying issue clears
+   *   (network, transient permission). Stops on first success or
+   *   after the cap.
+   *
+   * Pre-fix the function tried once and swallowed any error; combined
+   * with the old "accept any mention" fallback, a single startup fetch
+   * failure meant the bot would noisy-reply to EVERY @mention in EVERY
+   * group for the entire process lifetime.
    */
   private async fetchBotOpenId(): Promise<void> {
+    const MAX_STARTUP_ATTEMPTS = 5;
+    const STARTUP_RETRY_DELAY_MS = 2000;
+    for (let attempt = 1; attempt <= MAX_STARTUP_ATTEMPTS; attempt++) {
+      if (await this.tryFetchBotOpenIdOnce(attempt, MAX_STARTUP_ATTEMPTS)) return;
+      if (attempt < MAX_STARTUP_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, STARTUP_RETRY_DELAY_MS));
+      }
+    }
+    console.error(
+      `[channel] WARNING: botOpenId not resolved after ${MAX_STARTUP_ATTEMPTS} startup attempts. ` +
+      `Group @-mentions will be REJECTED (fail-safe — better silent than spammy). ` +
+      `Scheduling background re-fetch every 5 minutes for the next hour.`,
+    );
+    this.startBackgroundBotIdRefetch();
+  }
+
+  /**
+   * Single attempt to fetch the bot's open_id. Returns true on success,
+   * false on any failure (transient or permanent). Logs at the level
+   * appropriate for the attempt number — last attempt and background
+   * retries log at error, intermediate startup attempts at debug.
+   */
+  private async tryFetchBotOpenIdOnce(attempt: number, totalAttempts: number): Promise<boolean> {
     try {
       const resp = await this.client.request({
         method: 'GET',
@@ -775,13 +857,53 @@ export class LarkChannel {
       const openId = (resp as any)?.bot?.open_id;
       if (openId) {
         this.botOpenId = openId;
-        debugLog(`[channel] Bot open_id resolved: ${openId}`);
-      } else {
-        console.error('[channel] Warning: could not resolve bot open_id from /bot/v3/info');
+        console.error(`[channel] Bot open_id resolved: ${openId} (attempt ${attempt}/${totalAttempts})`);
+        return true;
       }
+      console.error(
+        `[channel] /bot/v3/info attempt ${attempt}/${totalAttempts}: response had no bot.open_id`,
+      );
+      return false;
     } catch (err) {
-      console.error('[channel] Warning: failed to fetch bot info:', err);
+      const level = attempt === totalAttempts ? '[channel] ERROR' : '[channel]';
+      console.error(`${level} fetchBotOpenId attempt ${attempt}/${totalAttempts} failed:`, err);
+      return false;
     }
+  }
+
+  /**
+   * Background re-fetch loop — runs every 5 minutes for up to 1 hour
+   * after startup retries all failed. Stops on first success. Capped
+   * so a permanently-broken setup doesn't burn API quota indefinitely.
+   */
+  private startBackgroundBotIdRefetch(): void {
+    const BG_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+    const BG_MAX_ATTEMPTS = 12; // 1 hour total
+    let bgAttempt = 0;
+    const tick = async () => {
+      bgAttempt++;
+      if (this.botOpenId) return; // resolved by some other code path; stop
+      const ok = await this.tryFetchBotOpenIdOnce(bgAttempt, BG_MAX_ATTEMPTS);
+      if (ok) {
+        console.error(
+          `[channel] Background re-fetch succeeded on attempt ${bgAttempt} — group @-mentions are now active.`,
+        );
+        return;
+      }
+      if (bgAttempt >= BG_MAX_ATTEMPTS) {
+        console.error(
+          `[channel] Background re-fetch gave up after ${BG_MAX_ATTEMPTS} attempts (~1 hour). ` +
+          `Group @-mentions will remain REJECTED until process restart. ` +
+          `Check Feishu app permissions (im:bot scope) and network.`,
+        );
+        return;
+      }
+      // .unref() so the dangling background timer doesn't keep the
+      // event loop alive on its own — graceful shutdowns can exit
+      // cleanly. R1-audit cosmetic on #86.
+      setTimeout(() => { void tick(); }, BG_INTERVAL_MS).unref();
+    };
+    setTimeout(() => { void tick(); }, BG_INTERVAL_MS).unref();
   }
 
   /**

@@ -90,6 +90,10 @@ echo "=== Single-instance lock unit checks ==="
 npx tsx scripts/lock-smoke.ts
 
 echo ""
+echo "=== Bot @-mention fail-safe unit checks ==="
+npx tsx scripts/bot-mention-failsafe-smoke.ts
+
+echo ""
 echo "=== Path-traversal defense unit checks ==="
 npx tsx scripts/path-traversal-smoke.ts
 
