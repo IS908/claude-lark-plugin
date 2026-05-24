@@ -18,6 +18,47 @@ function lineHash(text: string): string {
   return createHash('sha1').update(text).digest('hex').slice(0, 8);
 }
 
+/**
+ * Defense layer 2 for #93 (path traversal via Claude-supplied chat/thread IDs).
+ *
+ * Zod regex at the tool boundary (`larkIdSchema` in tools.ts) is the
+ * primary defense — but anything that calls into `MemoryStore` from a
+ * non-tool path (cronjob runtime, dry-run, future code) bypasses Zod.
+ * This helper makes the constraint a property of the storage layer
+ * itself: any key destined to become a path component is rejected here
+ * if it contains a separator, parent-traversal, NUL, or control byte
+ * BEFORE it reaches `path.join` (which silently *collapses* `..`
+ * rather than rejecting it — the precise hazard #93 exploits).
+ *
+ * Note: separately from path safety, callers like `saveEpisode` that
+ * accept `chatId` from authenticated identity context don't NEED this
+ * check (the value already came from a Feishu webhook payload), but
+ * apply it anyway to keep the storage layer's contract self-defending.
+ */
+function assertSafeKey(key: string, field: string): void {
+  // Length cap 255 matches POSIX NAME_MAX / macOS HFS+/APFS per-component
+  // limit. Beyond that, `fs.mkdir`/`writeFile` would throw ENAMETOOLONG —
+  // we'd rather surface a clear "Invalid <field>" upstream than a syscall
+  // error. Tool-boundary `LARK_ID_REGEX` caps at 128 (well within NAME_MAX),
+  // so the larger 255 here is reachable only from non-tool callers and
+  // serves as a final storage-layer guard.
+  if (
+    !key ||
+    typeof key !== 'string' ||
+    key.length > 255 ||
+    key.includes('/') ||
+    key.includes('\\') ||
+    key.includes('..') ||
+    key.includes('\0') ||
+    // eslint-disable-next-line no-control-regex
+    /[\x00-\x1f]/.test(key)
+  ) {
+    throw new Error(
+      `Invalid ${field}: "${key.slice(0, 64)}${key.length > 64 ? '…' : ''}" — must not contain '/', '\\', '..', null/control bytes, and must be 1-255 chars.`,
+    );
+  }
+}
+
 /** Normalize a profile line for deduplication (not for storage). */
 function normalizeProfileLine(line: string): string {
   return line.trim().replace(/^[-*]\s+/, '').toLowerCase();
@@ -136,6 +177,10 @@ export class MemoryStore {
   // ── User Profile (tiered, v0.10.0+) ──
 
   private profileDir(userId: string): string {
+    // userId is server-derived (caller open_id from authenticated Feishu
+    // session) so it should never carry separators, but #93 motivates
+    // defense-in-depth on every path-building site.
+    assertSafeKey(userId, 'userId');
     return path.join(this.baseDir, 'profiles', userId);
   }
 
@@ -144,6 +189,7 @@ export class MemoryStore {
   }
 
   private legacyProfilePath(userId: string): string {
+    assertSafeKey(userId, 'userId');
     return path.join(this.baseDir, 'profiles', `${userId}.md`);
   }
 
@@ -419,6 +465,14 @@ export class MemoryStore {
   ): Promise<Episode[]> {
     if (!scope?.chatId) return [];
 
+    // Defense layer 2 against #93 path traversal — assert before path.join.
+    // Read paths must guard too: even though listing/reading malformed
+    // paths can't *write* outside baseDir, a traversal in `chatId` could
+    // exfiltrate the *existence* of files elsewhere (return their contents
+    // if they happen to look like episodes), leaking server info.
+    assertSafeKey(scope.chatId, 'chatId');
+    if (scope.threadId) assertSafeKey(scope.threadId, 'threadId');
+
     const dir = scope.threadId
       ? path.join(this.baseDir, 'episodes', scope.chatId, 'threads', scope.threadId)
       : path.join(this.baseDir, 'episodes', scope.chatId);
@@ -481,6 +535,10 @@ export class MemoryStore {
     content: string,
     meta: EpisodeMeta
   ): Promise<void> {
+    // Defense layer 2 against #93 path traversal — assert before path.join.
+    assertSafeKey(meta.chatId, 'chatId');
+    if (meta.threadId) assertSafeKey(meta.threadId, 'threadId');
+
     const dir =
       type === 'thread' && meta.threadId
         ? path.join(this.baseDir, 'episodes', meta.chatId, 'threads', meta.threadId)
@@ -494,6 +552,7 @@ export class MemoryStore {
   }
 
   async listEpisodes(chatId: string): Promise<Episode[]> {
+    assertSafeKey(chatId, 'chatId');
     const dir = path.join(this.baseDir, 'episodes', chatId);
     try {
       const files = await fs.readdir(dir);
@@ -519,8 +578,13 @@ export class MemoryStore {
   }
 
   async deleteEpisodes(chatId: string, ids: string[]): Promise<void> {
+    assertSafeKey(chatId, 'chatId');
     const dir = path.join(this.baseDir, 'episodes', chatId);
     for (const id of ids) {
+      // Episode IDs are server-generated filenames (timestamp.md) but the
+      // delete API takes them as opaque strings, so apply the same guard —
+      // a caller could pass `../../etc/passwd.md` and otherwise unlink it.
+      assertSafeKey(id, 'episode id');
       try {
         await fs.unlink(path.join(dir, id));
       } catch {

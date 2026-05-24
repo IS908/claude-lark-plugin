@@ -82,4 +82,8 @@ echo "=== Skill ownership unit checks ==="
 npx tsx scripts/skill-ownership-smoke.ts
 
 echo ""
+echo "=== Path-traversal defense unit checks ==="
+npx tsx scripts/path-traversal-smoke.ts
+
+echo ""
 echo "All tests passed."

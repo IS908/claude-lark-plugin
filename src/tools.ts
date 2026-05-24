@@ -15,6 +15,43 @@ import { JOB_THREAD_PREFIX } from './scheduler.js';
 import { writeSdkResource } from './sdk-resource.js';
 
 /**
+ * Format regex for Feishu chat / thread / message / user IDs.
+ *
+ * Feishu IDs are short ASCII tokens with a prefix (`oc_`, `om_`, `omt_`,
+ * `ou_`, `og_`, `cli_msg_`, etc.) followed by alphanumerics. This regex
+ * permits the union of all currently-observed shapes plus a generous
+ * upper bound, and **rejects** anything containing path separators,
+ * dot-dot, null bytes, whitespace, or any other character that would let
+ * a Claude-supplied ID escape the storage hierarchy when joined into a
+ * filesystem path (`saveEpisode` etc., see #93).
+ *
+ * Defense layer 1 of 2 — Zod-level rejection at the tool boundary.
+ * Layer 2 lives inside `MemoryStore.assertSafeKey` so a future
+ * code path that bypasses the schema (or a deserialization quirk)
+ * still cannot land bytes outside `baseDir`.
+ *
+ * Two special-case exemptions on top of the base regex:
+ * - cronjob-synthetic `thread_id`s prefixed `JOB_THREAD_PREFIX` (see
+ *   src/scheduler.ts) — they contain colons in the iso-ish timestamp.
+ *   We exempt them by accepting `:` as well; they never reach the file
+ *   layer because cronjob notifications don't trigger save_memory's
+ *   thread path (the flush handler uses chat_type='system' which the
+ *   distillation prompt also restricts to type=chat|thread, not profile).
+ * - the reserved sentinel `__terminal__` (`TERMINAL_CHAT_ID`) used by
+ *   terminal-side skills — exempt because it never lands as a directory
+ *   name (`resolveCaller` short-circuits to OWNER, and OWNER's userId
+ *   is the path component, not the sentinel chat_id).
+ *
+ * The final form: alphanumeric + `_` + `-` + `:`, 1..128 chars.
+ */
+export const LARK_ID_REGEX = /^[A-Za-z0-9_:-]{1,128}$/;
+
+const larkIdSchema = (label: string) =>
+  z
+    .string()
+    .regex(LARK_ID_REGEX, `Invalid ${label}: must be 1-128 chars of [A-Za-z0-9_:-]`);
+
+/**
  * Sanitize and length-cap a Feishu attachment filename for safe local
  * storage. Path-basename strips any directory prefix, regex replaces
  * non-`\w.-` chars (including spaces, CJK, special punctuation) with
@@ -144,7 +181,7 @@ export function registerTools(
       description:
         'Send a reply to a Feishu chat. Plain text by default; long or markdown-rich content auto-renders as a Feishu card. Pass "card" param with raw Schema 2.0 JSON to send a pre-built card directly.',
       inputSchema: z.object({
-        chat_id: z.string().describe('The chat ID to reply in'),
+        chat_id: larkIdSchema('chat_id').describe('The chat ID to reply in'),
         text: z.string().describe('The text content to send (ignored when card is provided)'),
         card: z
           .string()
@@ -152,9 +189,8 @@ export function registerTools(
           .describe(
             'Raw Feishu Schema 2.0 card JSON string. When provided, sends the card directly without buildCards conversion. Use this for pre-built cards from scripts/skills.'
           ),
-        reply_to: z.string().optional().describe('Message ID to reply to (quoted reply)'),
-        thread_id: z
-          .string()
+        reply_to: larkIdSchema('reply_to').optional().describe('Message ID to reply to (quoted reply)'),
+        thread_id: larkIdSchema('thread_id')
           .optional()
           .describe(
             'Thread ID from the <channel> meta. Pass this when replying to a threaded message — the plugin will auto-fill reply_to if you omit it, ensuring the reply lands in the correct thread.'
@@ -455,7 +491,7 @@ export function registerTools(
     {
       description: 'Edit a previously sent bot message (text or card_markdown).',
       inputSchema: z.object({
-        message_id: z.string().describe('The message ID to edit'),
+        message_id: larkIdSchema('message_id').describe('The message ID to edit'),
         text: z.string().describe('New content'),
         format: z
           .enum(['text', 'card_markdown'])
@@ -495,7 +531,7 @@ export function registerTools(
     {
       description: 'Add an emoji reaction to a message.',
       inputSchema: z.object({
-        message_id: z.string().describe('The message ID to react to'),
+        message_id: larkIdSchema('message_id').describe('The message ID to react to'),
         emoji: z.string().describe('Emoji type (e.g., "THUMBSUP", "SMILE", "HEART")'),
       }),
     },
@@ -520,8 +556,8 @@ export function registerTools(
       description:
         'Download an attachment (image, file, audio, video) from a message to local inbox. Pass file_name from the inbound notification\'s meta.attachment_name so the saved file keeps its original extension — Claude Read needs the extension to infer MIME type for PDF/text.',
       inputSchema: z.object({
-        message_id: z.string().describe('The message ID containing the attachment'),
-        file_key: z.string().describe('The file key of the attachment'),
+        message_id: larkIdSchema('message_id').describe('The message ID containing the attachment'),
+        file_key: larkIdSchema('file_key').describe('The file key of the attachment'),
         file_name: z
           .string()
           .optional()
@@ -618,9 +654,8 @@ export function registerTools(
           ),
         content: z.string().describe('The memory content to save (concise, factual)'),
         reason: z.string().describe('Why this is worth remembering'),
-        chat_id: z.string().describe('Chat ID — required; also used to resolve caller identity'),
-        thread_id: z
-          .string()
+        chat_id: larkIdSchema('chat_id').describe('Chat ID — required; also used to resolve caller identity'),
+        thread_id: larkIdSchema('thread_id')
           .optional()
           .describe(
             'Thread ID from the current notification\'s metadata. Required whenever present — both for server-side caller resolution (omitting it silently attributes the call to the wrong user in cronjob turns) and when type="thread".'
@@ -714,8 +749,8 @@ export function registerTools(
         name: z.string().describe('Short skill name (e.g., "deploy-service"). Normalized to a slug (lowercase, non-alphanumeric → "-"). Must contain at least one alphanumeric character.'),
         description: z.string().describe('One-line description of what this skill does'),
         content: z.string().describe('The full procedure/instructions'),
-        chat_id: z.string().describe('Chat ID from the inbound notification — required for caller authorization'),
-        thread_id: z.string().optional().describe('Thread ID from the inbound notification — pass verbatim when present'),
+        chat_id: larkIdSchema('chat_id').describe('Chat ID from the inbound notification — required for caller authorization'),
+        thread_id: larkIdSchema('thread_id').optional().describe('Thread ID from the inbound notification — pass verbatim when present'),
       }),
     },
     async ({ name, description, content, chat_id, thread_id }) => {
@@ -769,18 +804,15 @@ export function registerTools(
           .string()
           .optional()
           .describe('Fixed message content (type=message)'),
-        target_chat_id: z
-          .string()
+        target_chat_id: larkIdSchema('target_chat_id')
           .describe('Chat ID that receives job output. Used by scheduler delivery and list_jobs visibility filter.'),
         model: z
           .string()
           .optional()
           .describe('Model override for prompt-type jobs (e.g. "sonnet", "haiku", "opus"). When set, the subagent executing this job uses the specified model instead of the default.'),
-        chat_id: z
-          .string()
+        chat_id: larkIdSchema('chat_id')
           .describe('Chat ID where this create_job call was triggered — used to resolve caller identity and to populate origin_chat_id'),
-        thread_id: z
-          .string()
+        thread_id: larkIdSchema('thread_id')
           .optional()
           .describe(
             'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
@@ -888,9 +920,8 @@ export function registerTools(
           .optional()
           .default('all')
           .describe('Filter by status'),
-        chat_id: z.string().describe('Chat ID where this list call is acting from'),
-        thread_id: z
-          .string()
+        chat_id: larkIdSchema('chat_id').describe('Chat ID where this list call is acting from'),
+        thread_id: larkIdSchema('thread_id')
           .optional()
           .describe(
             'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
@@ -955,7 +986,7 @@ export function registerTools(
       description:
         'Update a cronjob — change schedule, content, pause, or resume. Only the job owner can mutate a job.',
       inputSchema: z.object({
-        id: z.string().describe('Job ID'),
+        id: larkIdSchema('id').describe('Job ID'),
         status: z.enum(['active', 'paused']).optional().describe('Set status'),
         schedule: z.string().optional().describe('New cron expression or alias'),
         prompt: z.string().optional().describe('New prompt (type=prompt)'),
@@ -965,9 +996,8 @@ export function registerTools(
           .string()
           .optional()
           .describe('Model override for prompt-type jobs (e.g. "sonnet", "haiku", "opus"). Pass empty string to clear.'),
-        chat_id: z.string().describe('Chat ID where this update call is acting from'),
-        thread_id: z
-          .string()
+        chat_id: larkIdSchema('chat_id').describe('Chat ID where this update call is acting from'),
+        thread_id: larkIdSchema('thread_id')
           .optional()
           .describe(
             'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
@@ -1057,10 +1087,9 @@ export function registerTools(
     {
       description: 'Delete a cronjob permanently. Only the job owner can delete.',
       inputSchema: z.object({
-        id: z.string().describe('Job ID to delete'),
-        chat_id: z.string().describe('Chat ID where this delete call is acting from'),
-        thread_id: z
-          .string()
+        id: larkIdSchema('id').describe('Job ID to delete'),
+        chat_id: larkIdSchema('chat_id').describe('Chat ID where this delete call is acting from'),
+        thread_id: larkIdSchema('thread_id')
           .optional()
           .describe(
             'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
@@ -1114,9 +1143,8 @@ export function registerTools(
       description:
         "List what the bot has stored in the caller's profile. Output is filtered by current-chat rendering visibility (path B): in a private chat both public and private tiers are rendered; in a group chat only the public tier — because the reply is visible to the whole group. Each returned line has a short hash that forget_memory uses to target the exact line.",
       inputSchema: z.object({
-        chat_id: z.string().describe('Chat ID where this call is acting from'),
-        thread_id: z
-          .string()
+        chat_id: larkIdSchema('chat_id').describe('Chat ID where this call is acting from'),
+        thread_id: larkIdSchema('thread_id')
           .optional()
           .describe(
             'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'
@@ -1164,9 +1192,8 @@ export function registerTools(
       description:
         "Remove a specific line from the caller's profile. Always caller-scoped — you can only forget things about yourself. Optionally promotes the removed line into a persistent L2 rule so future distillations classify similar content as private.",
       inputSchema: z.object({
-        chat_id: z.string().describe('Chat ID where this call is acting from'),
-        thread_id: z
-          .string()
+        chat_id: larkIdSchema('chat_id').describe('Chat ID where this call is acting from'),
+        thread_id: larkIdSchema('thread_id')
           .optional()
           .describe(
             'Thread ID from the current notification\'s metadata. Required whenever present — the server resolves caller identity from (chat_id, thread_id); omitting it falls back to chat-level and will silently attribute the call to the wrong user in cronjob turns.'

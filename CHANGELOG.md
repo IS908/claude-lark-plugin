@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.15] - 2026-05-24
+
+### Security
+- **`chat_id` / `thread_id` / `message_id` / `target_chat_id` / `reply_to` / job `id` now reject path-traversal payloads** (#93 — **CRITICAL — arbitrary file write**). Pre-v1.0.15 these tool inputs were typed as plain `z.string()` and flowed verbatim into `path.join(baseDir, 'episodes', chatId, 'threads', threadId)` inside `MemoryStore.saveEpisode`. Because `path.join` *collapses* `..` segments rather than rejecting them, a Claude-supplied `thread_id='../../../../tmp/escape'` (delivered via prompt injection in a group chat, or via Claude misreading instructions) would write the episode markdown to `/tmp/escape/<timestamp>.md` — escaping the configured `baseDir`. Filename was fixed at `<timestamp>.md` so direct overwrite of named files (`~/.ssh/authorized_keys`, hook scripts) required pathological timing, but writing into any directory the process had access to was straightforward. `update_job` / `delete_job` accepted an analogous unsanitized `id`, allowing arbitrary `fs.unlink` outside `jobsDir`.
+
+  **Two-layer defense**:
+  1. **Tool boundary** — new `LARK_ID_REGEX = /^[A-Za-z0-9_:-]{1,128}$/` applied via `larkIdSchema(label)` to every `chat_id` / `thread_id` / `message_id` / `target_chat_id` / `reply_to` in `src/tools.ts` (all 12 tools that accept any of these). Real Feishu IDs (`oc_*`, `om_*`, `omt_*`, `ou_*`, `og_*`, `cli_msg_*`) match; anything containing `/`, `\`, `..`, `\0`, whitespace, or control characters rejects with a clear Zod error.
+  2. **Storage layer** — new `assertSafeKey` in `src/memory/file.ts` runs on `saveEpisode` / `searchEpisodes` / `listEpisodes` / `deleteEpisodes` / `profileDir` / `legacyProfilePath` *before* `path.join`, throwing a recognizable error if the key contains a traversal vector. New `assertSafeJobId` in `src/job-store.ts` does the same for `jobPath`. Read paths get the guard too — a traversal in `chatId` to `searchEpisodes` could otherwise leak file existence outside `baseDir`.
+
+  The two layers are independent: a future code path that bypasses Zod (e.g. internal cronjob plumbing) still cannot land bytes outside `baseDir`. Tests cover both layers.
+
+### Added
+- 11 smoke assertions in `scripts/path-traversal-smoke.ts` covering: `LARK_ID_REGEX` rejects every documented traversal vector + accepts realistic Feishu shapes; `saveEpisode` rejects bad `chatId` and bad `threadId` before any file write; happy-path `saveEpisode` still writes inside `baseDir`; `searchEpisodes` / `listEpisodes` / `deleteEpisodes` reject bad keys; `getProfile` rejects bad `userId`; `writeJob` throws on traversal id, `readJob` returns null, `deleteJob` returns false (catch-internal contract preserved); off-by-one boundary checks at 128 chars (Layer-1 regex) and 255 chars (Layer-2 storage cap = POSIX NAME_MAX).
+- `LARK_ID_REGEX` exported from `src/tools.ts` for downstream test reuse.
+
+### R1-audit followups (closed in this PR)
+- **`update_job.id` / `delete_job.id` / `download_attachment.file_key` now use `larkIdSchema`** — pre-R1-fix these were still plain `z.string()`. Layer 2 (`assertSafeJobId` / inbox-side defenses) already caught the traversal so the gap was design-inconsistency rather than a vulnerability, but a Layer-1 rejection produces a clear `Invalid <field>` error instead of a downstream Feishu-API failure or silent `false` return.
+- **`assertSafeKey` length cap lowered from 256 to 255** to match POSIX `NAME_MAX` / macOS HFS+/APFS per-component limit. Beyond 255 the syscalls would throw `ENAMETOOLONG`; clearer to reject upstream.
+
+### Operator notes
+- Legitimate IDs are unaffected — every observed Feishu ID shape (group chat, P2P chat, thread, message, user open_id, cronjob synthetic thread) matches the new regex.
+- The colon (`:`) is included in the character class to accommodate cronjob-synthetic thread IDs (`JOB_THREAD_PREFIX:<iso-timestamp>`) that contain colons in the timestamp segment.
+- If a custom integration was sending non-standard IDs (e.g. a script wrapping the tools manually), it may now hit `Invalid <field>: must be 1-128 chars of [A-Za-z0-9_:-]`. The fix is to pass the verbatim ID from the inbound Feishu notification.
+
 ## [1.0.14] - 2026-05-24
 
 ### Security

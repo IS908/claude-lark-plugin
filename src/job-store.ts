@@ -151,7 +151,33 @@ async function ensureJobsDir(): Promise<string> {
   return dir;
 }
 
+/**
+ * Defense layer 2 for #93 (path traversal). `create_job` derives `id`
+ * via {@link sanitizeJobId} so newly-created jobs are inherently safe,
+ * but `update_job` / `delete_job` accept an `id` from Claude directly
+ * (e.g. `z.string()` at the tool boundary — the Zod layer there caps
+ * the shape per `LARK_ID_REGEX` but this defense is the storage-layer
+ * contract). Without this, a stray `'../../etc/cron.daily/payload'`
+ * could become a `jobPath` outside `jobsDir` and the subsequent
+ * `fs.unlink` / `fs.writeFile` would escape the sandbox.
+ */
+function assertSafeJobId(id: string): void {
+  if (
+    !id ||
+    typeof id !== 'string' ||
+    id.length === 0 ||
+    id.length > 128 ||
+    id.includes('/') ||
+    id.includes('\\') ||
+    id.includes('..') ||
+    id.includes('\0')
+  ) {
+    throw new Error(`Invalid job id: "${String(id).slice(0, 64)}" — must be 1-128 chars without '/', '\\', '..', null.`);
+  }
+}
+
 function jobPath(id: string): string {
+  assertSafeJobId(id);
   return path.join(appConfig.jobsDir, `${id}.json`);
 }
 
