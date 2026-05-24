@@ -32,11 +32,40 @@ import { homedir } from 'node:os';
  * distiller will respect it.
  */
 export const L1_BLACKLIST_REGEX: { name: string; regex: RegExp }[] = [
-  { name: 'cn-mobile', regex: /\b1[3-9]\d{9}\b/ },
+  // Phone: CN mobile + US phone. Both allow optional separators
+  // (`-`, `.`, space) at the standard grouping boundaries so that
+  // human-written forms like `138 1234 5678` or `138-1234-5678` are
+  // caught. Pre-v1.0.27 (#76) cn-mobile required 11 consecutive
+  // digits and missed every separator-containing variant.
+  { name: 'cn-mobile', regex: /\b1[3-9]\d[-.\s]?\d{4}[-.\s]?\d{4}\b/ },
   { name: 'us-phone', regex: /\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b/ },
-  { name: 'cn-id', regex: /\b\d{17}[\dXx]\b/ },
+  // CN national ID: 18 digits/X. Allow separators at the standard
+  // 6-8-3+1 grouping (region-yyyymmdd-seq+check) since humans
+  // commonly read them out grouped. Pre-v1.0.27 required 18
+  // consecutive chars.
+  { name: 'cn-id', regex: /\b\d{6}[-.\s]?\d{8}[-.\s]?\d{3}[\dXx]\b/ },
   { name: 'credit-card', regex: /\b(?:\d[ -]*?){13,16}\b/ },
-  { name: 'token-like', regex: /\b(?:sk|pk|api|token|secret)[-_][a-zA-Z0-9]{16,}\b/i },
+
+  // ── Service-specific API tokens (#76 fix) ──
+  //
+  // Pre-v1.0.27 only the generic `token-like` regex existed, which
+  // required `sk|pk|api|token|secret` LITERAL prefix followed by a
+  // single `-`/`_` and then 16+ alphanumeric chars with NO further
+  // `-`/`_`. That signature caught nothing in practice — every
+  // real-world API token has structural separators in its body
+  // (e.g. `sk-ant-api03-...`, `sk_live_...`). Each major provider
+  // gets a dedicated regex matching its documented format.
+  { name: 'github-token', regex: /\b(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{36,}\b/ },
+  { name: 'aws-access-key', regex: /\b(AKIA|ASIA)[0-9A-Z]{16}\b/ },
+  { name: 'slack-token', regex: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/ },
+  { name: 'anthropic-key', regex: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/ },
+  { name: 'stripe-key', regex: /\b(sk|rk|pk)_(live|test)_[A-Za-z0-9]{20,}\b/ },
+  { name: 'jwt', regex: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/ },
+  // Generic token-like fallback: now allows `[-_]` in the body so
+  // hybrid forms not matching the specific patterns above (custom
+  // internal tokens, vendor-specific schemes) still trigger.
+  { name: 'token-like', regex: /\b(?:sk|pk|api|token|secret)[-_][A-Za-z0-9_-]{16,}\b/i },
+
   { name: 'money-amount', regex: /\b\d+\s*[wk万千]\s*(?:元|块|RMB|CNY|USD)?\b|\$\d{3,}/ },
 ];
 

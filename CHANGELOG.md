@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.27] - 2026-05-25
+
+### Fixed
+- **L1 privacy blacklist now catches real-world API tokens and separator-containing CN phone/ID** (#76 — **HIGH, classification miss for the most common sensitive-data formats**). Pre-v1.0.27 the L1 regex set had three significant misses:
+  - **`token-like`** required prefix `sk|pk|api|token|secret` followed by a single `-`/`_` and then 16+ alphanumeric chars with NO further `-`/`_`. This caught NOTHING in practice — every real-world API token has structural separators in its body. `sk-ant-api03-...` (Anthropic), `sk_live_...` (Stripe), `ghp_...` (GitHub), `AKIA...` (AWS), `xoxb-...` (Slack), `eyJ...` (JWT) — all missed.
+  - **`cn-mobile`** required 11 consecutive digits. Human-written forms like `138 1234 5678`, `138-1234-5678`, `+86 138 1234 5678` — all missed.
+  - **`cn-id`** required 18 consecutive characters. Grouped form `110101 19900101 1234` — missed.
+
+  Combined with the L1 safety net wired in via #75 (v1.0.13) and the distiller envelope (#114, v1.0.18), the missing patterns meant LLM-classified-public content with these formats stayed in `public.md` instead of being forced to `private.md`.
+
+  Fix: 6 new service-specific regexes (anthropic-key, github-token, aws-access-key, slack-token, stripe-key, jwt) with documented real formats. Generic `token-like` widened to accept `[-_]` in the body. `cn-mobile` and `cn-id` both gained the `[-.\s]?` separator pattern that `us-phone` already had.
+
+### Added
+- 18 new L1 smoke assertions covering all 6 service-specific token formats (with real example payloads — Anthropic, GitHub `ghp_`/`gho_`/`ghs_`, AWS `AKIA`/`ASIA`, Slack `xoxb-`/`xoxp-`, Stripe `sk_live_`/`rk_test_`, JWT 3-segment), separator-tolerant phone/ID variants (space, dash, dot separators at standard grouping boundaries), and 4 negative regression-guards (short `AKI` prefix, `ghp_short` body, plain word "JWT", short numeric code) so future regex weakenings are caught.
+- L1 test count: 10 → 28.
+
+### Operator notes
+- Existing on-disk `public.md` files written under v0.13–v1.0.26 may contain L1-class data the broader regex set would have caught. v1.0.27 only protects FUTURE writes — it does NOT retroactively rescan (same model as the v1.0.13 #75 fix). Operators concerned about historical exposure can spot-check `~/.claude/channels/lark/memories/profiles/*/public.md` against the patterns documented in `src/privacy-rules.ts`.
+- Token regexes are based on documented public formats as of 2026-05. New providers (or schema changes by existing providers) need to be added explicitly — the generic `token-like` regex is a fallback but is intentionally conservative (requires the well-known prefix words).
+
 ## [1.0.26] - 2026-05-25
 
 ### Fixed

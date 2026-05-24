@@ -209,7 +209,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.26' },
+    { name: 'claude-lark-plugin', version: '1.0.27' },
     {
       capabilities: {
         logging: {},

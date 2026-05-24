@@ -27,6 +27,34 @@ const l1Cases: [string, 'private' | 'public' | 'gray'][] = [
   ['熟悉 TypeScript 和 Rust', 'public'],
   ['晚上想吃烤鱼', 'gray'],
   ['偏好会议安排在下午', 'gray'],
+
+  // ── #76 fix: separator-tolerant phone/ID ──
+  // Pre-fix, cn-mobile required 11 consecutive digits — these all missed.
+  ['mobile: 138 1234 5678', 'private'],
+  ['手机: 138-1234-5678', 'private'],
+  ['contact 138.1234.5678', 'private'],
+  // Pre-fix cn-id required 18 consecutive — grouped form missed.
+  ['ID: 110101 19900101 1234', 'private'],
+  ['身份证 110101-19900101-1234', 'private'],
+
+  // ── #76 fix: service-specific tokens (real formats) ──
+  ['Anthropic key: sk-ant-api03-abc123def456ghi789jkl012mno345pqr', 'private'],
+  ['github token ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', 'private'],
+  ['aws AKIAIOSFODNN7EXAMPLE', 'private'],
+  ['aws temporary ASIAIOSFODNN7EXAMPLE', 'private'],
+  ['slack: xoxb-1234567890-abcdefghijklm', 'private'],
+  ['slack bot xoxp-1234567890-abcdefghijklm', 'private'],
+  ['stripe live sk_live_abcdefghijklmnopqrstuvwxyz123456', 'private'],
+  ['stripe restricted rk_test_abcdefghijklmnopqrstuvwxyz12', 'private'],
+  ['jwt eyJhbGciOiJIUzI1NiIs.eyJzdWIiOiIxMjM.SflKxwRJSMeKKF7zjA', 'private'],
+
+  // ── #76 negative tests (lookalikes that should NOT trigger) ──
+  // Conservative — these LOOK token-y but don't match real formats.
+  // Catches a future regression where someone weakens a regex.
+  ['the variable AKI was set', 'gray'],        // short AKI prefix, not 16+ uppercase suffix
+  ['ghp_short', 'gray'],                       // ghp_ prefix but body too short
+  ['just talking about JWTs in general', 'gray'], // word "JWT" alone, no payload
+  ['code 12345', 'gray'],                      // 5 digits, no phone/id pattern
 ];
 
 let l1Passed = 0;
