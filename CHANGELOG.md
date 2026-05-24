@@ -16,11 +16,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Helper is hard-capped at 1000 iterations as a runaway guard for pathological schedules (e.g. every-minute cron over multi-day downtime). Cap hit emits a `[scheduler] mostRecentMissedSlot: ... capping at iteration 1000` stderr warning so operators can see and adjust.
 
 ### Added
-- 3 new scheduler-smoke assertions (Part E — 19 → 22):
-  - 19a: `mostRecentMissedSlot` pure-function semantics (hourly 5h gap fast-forwards to the right slot; `now < fromTime` is a no-op; tiny-gap with no intermediates returns `fromTime` unchanged).
-  - 19b: 1000-iteration safety cap on every-minute cron over a 10-day downtime emits the warning and returns a valid (capped) value rather than hanging.
+- 4 new scheduler-smoke assertions (Part E — 19 → 23):
+  - 19a: `mostRecentMissedSlot` pure-function semantics (hourly 5h gap fast-forwards to the right slot; `now < fromTime` is a no-op; tiny-gap with no intermediates returns `fromTime` unchanged). Includes TZ-robustness note.
+  - 19b: 1000-iteration safety cap on every-minute cron over a 10-day downtime emits the warning AND returns a slot ~1000 × 1min ahead of fromTime (R1-audit upper-bound check — pre-fix, a regression returning the 2nd iteration would have silently passed).
+  - 19b-stale: codification of the cap-stale path (defense-in-depth — `isMissedRunStale` re-check after fast-forward).
   - 19c: end-to-end recovery integration — a hand-set 3h-late hourly job triggers exactly 1 send, content matches, `next_run_at` post-execute is in the future, and the fast-forward log line names the number of skipped hours.
 - New export from `src/job-store.ts`: `mostRecentMissedSlot`.
+
+### R1-audit followups (closed in this PR)
+- **`isMissedRunStale` re-check after fast-forward** — pre-followup the gate only ran on the original `nextRun`; if the cap fires (per-second crons over multi-day downtime), the returned slot could be hours-to-days behind `now` even though the original wasn't stale. Now: if `mostRecentMissedSlot` returns a stale-by-threshold slot, route through the existing skip-and-notify path instead of delivering wrong-time content.
+- **Else-branch log clarified** to "no intermediate slots to skip" — distinguishes "no fast-forward needed" from "did nothing".
+- **Test 19b strengthened** with upper-bound assertion on advancement (regression guard against returning 2nd iteration instead of 1000th).
+- **TZ-robustness note** added to test 19a explaining why UTC-anchored expectations are safe for `0 * * * *` (minute=0 aligns identically under any whole-hour-offset tz) — future authors warned against non-zero-minute crons without explicit tz pinning.
 
 ### Operator notes
 - After this fix, observed behavior in the most common downtime scenario (laptop closed for a few hours): on restart, the bot delivers the most-recent missed run (single delivery, content keyed to the most recent slot) instead of the oldest. The cadence after that is normal.

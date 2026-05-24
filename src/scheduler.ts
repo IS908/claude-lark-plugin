@@ -259,16 +259,38 @@ export class JobScheduler {
         // slot so the catch-up reflects "what should have just fired".
         // executeJob still advances to the next future slot after success.
         const recovered = mostRecentMissedSlot(job.meta.schedule, nextRun, now);
+        // R1-audit followup: re-check stale after fast-forward. The
+        // `isMissedRunStale` gate at line 234 ran on the ORIGINAL nextRun
+        // (fresh). If `mostRecentMissedSlot` hit its 1000-iter cap (per-
+        // second crons over a few minutes, or per-minute crons over a
+        // few hours), the returned `recovered` slot can be hours-to-
+        // days behind now even though the original wasn't stale —
+        // delivering content keyed to an arbitrary past slot. Treat as
+        // stale and route through the existing skip-and-notify path.
+        if (isMissedRunStale(recovered, now)) {
+          const lateHours = ((now - recovered) / 3_600_000).toFixed(1);
+          console.error(
+            `[scheduler] Skipping job ${job.meta.id}: post-fast-forward slot ` +
+            `${new Date(recovered).toISOString()} is ${lateHours}h late (cap hit on pathological schedule). ` +
+            `Rescheduling to next occurrence.`,
+          );
+          job.runtime.next_run_at = computeNextRun(job.meta.schedule);
+          await writeJob(job);
+          await this.notifyStaleSkip(job, lateHours);
+          continue;
+        }
         if (recovered !== nextRun) {
-          const skipped = ((recovered - nextRun) / 3_600_000).toFixed(1);
+          const skippedH = ((recovered - nextRun) / 3_600_000).toFixed(1);
           console.error(
             `[scheduler] Recovering missed job ${job.meta.id}: fast-forwarded next_run_at ` +
             `from ${new Date(nextRun).toISOString()} to ${new Date(recovered).toISOString()} ` +
-            `(skipped ~${skipped}h of intermediate slots — only the most-recent missed run is delivered).`,
+            `(skipped ~${skippedH}h of intermediate slots — only the most-recent missed run is delivered).`,
           );
           job.runtime.next_run_at = new Date(recovered).toISOString();
         } else {
-          console.error(`[scheduler] Recovering missed job: ${job.meta.id}`);
+          console.error(
+            `[scheduler] Recovering missed job ${job.meta.id} (no intermediate slots to skip)`,
+          );
         }
         await this.executeJob(job);
       } catch (err) {
