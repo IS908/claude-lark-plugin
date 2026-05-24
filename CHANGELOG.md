@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.17] - 2026-05-24
+
+### Fixed
+- **Distiller dual-call profile race closed via single-tool path** (#97). v1.0.13 (#75) added a per-line L1 safety net inside `MemoryStore.saveProfile` that redirects sensitive lines from a public-tier write to private (append). The `profileDistillationPrompt` template (in `src/prompts.ts`) was designed to instruct Claude to call `save_memory(type="profile", tier, mode="replace")` TWICE per flush — once for public, once for private. The interaction would have been catastrophic:
+  1. First call: `tier="public" mode="replace"` with content `"phone is 13912345678\nuses Python"` → L1 hits the phone → APPENDS phone to private.md → REPLACES public.md with the safe subset.
+  2. Second call: `tier="private" mode="replace"` with content `"likes tea"` → REPLACES private.md → **the just-redirected phone line is gone**.
+
+  **R2 audit on this PR found that `profileDistillationPrompt` is NOT currently wired into production** — only the chat-episode `flushPrompt` runs on auto-flush, so the dual-call race is forward-looking infrastructure-bug rather than a live data-loss vector today. The fix is still warranted because (a) it closes the race for when profile distillation IS wired in (tracked at #113), (b) it defends against any spontaneous dual-call from Claude under unusual prompts.
+
+  Fix: new `save_memory(type="profile_tiered", content=<JSON>)` accepts a `{"public": [...], "private": [...]}` payload, runs the existing (until-now-dead) `parseTieredProfile` to apply L1 BEFORE any disk write — moving hits from public to private at the array level. Then issues two `saveProfile(mode='replace')` calls with the already-segregated arrays. Because the public array no longer contains L1 hits when `saveProfile` sees it, the storage-layer redirect doesn't fire, and the two replaces are independent and idempotent on the per-tier level.
+
+  The two `saveProfile` calls are NOT a single atomic transaction — a concurrent `getProfile` (memory enrichment for an inbound message on the same user) in the sub-ms window between them sees public-new + private-old. Per-chat queueing serializes any other `save_memory` so no save can race here. Atomic-pair writes would require a per-user lock or a temp-dir-and-rename — tracked alongside the v0-era `saveProfile` TOCTOU at #54.
+
+  Distiller prompt (`src/prompts.ts`) updated to call the new single tool with explicit retry-on-isError guidance and a NO-OP semantic for empty-both arrays. The old `save_memory(type="profile", tier, mode)` path is preserved for single-fact user-initiated writes (e.g. `/lark` skill "remember this preference") where the race doesn't apply.
+
+### Added
+- 10 smoke assertions in `scripts/profile-tiered-smoke.ts` covering: the exact #97 reproducer (phone-in-public ends up in private, never lost), multi-L1 redirect, empty-public-populated-private (single-side replace works), empty-both is **no-op preserving prior tiers** (R1-audit hardening — pre-fix would have nuked the profile), malformed JSON is **rejected with isError preserving prior tiers** (R1-audit hardening — pre-fix would have wiped public and stuffed raw blob into private on every transient LLM JSON hiccup), structurally-invalid JSON (e.g. `public: "string"` instead of array) also rejected, idempotency under repeated apply (no replace→append regression), true replace drops old facts, pre-bulleted array elements don't double-bullet, embedded `\n`/`\t` in array elements collapsed to single space (preserves one-fact-per-bullet for `listProfileLines` hash addressing).
+- `save_memory(type="profile_tiered", ...)` new MCP tool variant. SYSTEM_FLUSH_CALLER is denied for this type too (defense in depth — profile-tier writes need a real user identity).
+
+### R1-audit hardenings (closed in this PR)
+- **Malformed JSON now returns `isError` instead of writing** — `parseTieredProfile`'s fallback path would have left the handler running `saveProfile(public, replace, '')` (wiping public) and `saveProfile(private, replace, '- <raw blob>')` (stuffing one giant unstructured line into private). The handler now validates shape (`Array.isArray` on both fields) and rejects with a clear error before touching disk.
+- **Empty-both is a no-op** — pre-fix the new single-call default of "replace both" would have truncated the entire profile when LLM produced no extractable facts (more destructive than the v1.0.10–v1.0.16 dual-call which naturally skipped empty calls). New semantic: existing tiers preserved; explicit wipe goes through `forget_memory` or manual edit.
+- **Embedded `\n`/`\t` collapsed** — `\n` inside an array element would have created a multi-line bullet, confusing `listProfileLines` (which maps hash → single line) and `forget_memory` hash addressing. Now collapsed to single space at fmt time.
+- Dead `Object.assign` on auditArgs removed (was a no-op + misleading comment).
+
+### Operator notes
+- An auto-flush running mid-upgrade (old prompt cached, new server) would still issue the old dual-call pattern — the bug would still trigger on those specific turns. After the next MCP server restart (or session refresh) the new prompt is in effect.
+- The new `parseTieredProfile` server-side path is the architecture envisioned by v1.0.13 R3 audit (the helper was already exported but unused — this PR wires it in).
+
 ## [1.0.16] - 2026-05-24
 
 ### Security

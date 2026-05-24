@@ -11,6 +11,7 @@ import type { IdentitySession } from './identity-session.js';
 import { SYSTEM_FLUSH_CALLER } from './identity-session.js';
 import { audit } from './audit-log.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
+import { parseTieredProfile } from './memory/distiller.js';
 import { JOB_THREAD_PREFIX } from './scheduler.js';
 import { writeSdkResource } from './sdk-resource.js';
 
@@ -739,11 +740,11 @@ export function registerTools(
         'Save a memory entry for cross-session recall. Only save durable, reusable facts — user preferences, communication style, key decisions, ongoing projects, resolved problems. Do NOT save pleasantries, failed attempts, ephemeral details, or conversation filler. Profile writes always save facts about the CALLER of this tool (i.e. the Feishu user whose message triggered the current turn) — you cannot save profile facts about a different user. For profile writes, pass tier="public" only for facts that are safe for anyone mentioning this user to see (job title, tech stack, team); everything else defaults to "private" (owner-only).',
       inputSchema: z.object({
         type: z
-          .enum(['profile', 'chat', 'thread'])
+          .enum(['profile', 'profile_tiered', 'chat', 'thread'])
           .describe(
-            'Memory type: "profile" for facts about the caller, "chat" for conversation summary, "thread" for thread-level summary'
+            'Memory type: "profile" for a single fact about the caller (specify tier + mode), "profile_tiered" for the full-tier replacement used by auto-flush distillation (content is a JSON object {public:[...], private:[...]}, server splits + applies L1 + writes both tiers atomically), "chat" for conversation summary, "thread" for thread-level summary.'
           ),
-        content: z.string().describe('The memory content to save (concise, factual)'),
+        content: z.string().describe('The memory content to save (concise, factual). For type="profile_tiered" this is a JSON string {"public": [...], "private": [...]}.'),
         reason: z.string().describe('Why this is worth remembering'),
         chat_id: larkIdSchema('chat_id').describe('Chat ID — required; also used to resolve caller identity'),
         thread_id: larkIdSchema('thread_id')
@@ -785,14 +786,14 @@ export function registerTools(
       // sentinel "writer" has no user identity to legitimately own
       // private-tier data. The flush prompt already forbids type=profile,
       // this is the server-side guard against Claude going off-script.
-      if (type === 'profile' && caller === SYSTEM_FLUSH_CALLER) {
+      if ((type === 'profile' || type === 'profile_tiered') && caller === SYSTEM_FLUSH_CALLER) {
         void audit('save_memory', caller, auditArgs, 'denied');
         return {
           content: [
             {
               type: 'text' as const,
               text:
-                'save_memory(type=profile) denied: caller is the system-flush sentinel. ' +
+                `save_memory(type=${type}) denied: caller is the system-flush sentinel. ` +
                 'Profile writes need a real user identity. If you reached this in an ' +
                 'auto-flush turn, restrict to type=chat or type=thread.',
             },
@@ -809,6 +810,136 @@ export function registerTools(
         return {
           content: [
             { type: 'text' as const, text: `Saved ${effectiveTier} profile for ${caller} (mode: ${effectiveMode}). Reason: ${reason}` },
+          ],
+        };
+      }
+
+      // profile_tiered: distiller auto-flush path (#97).
+      //
+      // Pre-v1.0.17 the distiller prompt told Claude to call save_memory
+      // twice — once with tier='public' mode='replace', once with
+      // tier='private' mode='replace'. With v1.0.13's L1 safety net
+      // (#75), the FIRST call could redirect L1-hit lines from public
+      // to private (append). Then the SECOND call's mode='replace' on
+      // private would OVERWRITE that just-redirected content with
+      // whatever Claude originally classified as private — silently
+      // losing the redirected data. End state: an L1-hit fact (phone,
+      // ID, credential) is gone from both tiers.
+      //
+      // Fix: one atomic server-side write using the existing (dead
+      // pre-v1.0.17) parseTieredProfile helper. Claude submits a JSON
+      // {"public":[...], "private":[...]}; the server runs L1 on the
+      // public array (moving hits to private), then writes both tiers
+      // in a single replace operation. Because the public array no
+      // longer contains L1 hits, saveProfile's internal redirect
+      // doesn't fire — the two replaces are independent and idempotent.
+      if (type === 'profile_tiered') {
+        // R1-audit hardening on PR #107 — refuse to write when the JSON
+        // is structurally invalid. parseTieredProfile's fallback path
+        // returns `{public:[], private:[raw blob]}` on parse failure,
+        // which my v1.0.17 first cut then mass-REPLACED both tiers,
+        // nuking the user's existing public profile on a single
+        // transient LLM JSON hiccup. Soft-fail instead: validate shape
+        // first, return a tool error if invalid, and let Claude retry
+        // (or the operator inspect logs) rather than silently destroy.
+        let parsed: { public?: unknown; private?: unknown };
+        try {
+          const raw = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          void audit('save_memory', caller, auditArgs, 'denied');
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `save_memory(type="profile_tiered") rejected: content is not valid JSON (${err instanceof Error ? err.message : String(err)}). ` +
+                  `Expected a {"public": [...], "private": [...]} object. No tiers were modified.`,
+              },
+            ],
+          };
+        }
+        if (
+          !parsed || typeof parsed !== 'object' ||
+          !Array.isArray(parsed.public) || !Array.isArray(parsed.private)
+        ) {
+          void audit('save_memory', caller, auditArgs, 'denied');
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `save_memory(type="profile_tiered") rejected: JSON must be an object with BOTH "public" and "private" as arrays of strings. ` +
+                  `No tiers were modified.`,
+              },
+            ],
+          };
+        }
+        // R1-audit hardening: empty-both is a no-op rather than a
+        // mass-truncate. The pre-v1.0.17 dual-call pattern naturally
+        // skipped empty-array calls ("Skip either call if its array is
+        // empty"); the new single-call default of "replace both" was
+        // strictly more destructive. The distiller's intent for empty-
+        // both is "produced no extractable facts this cycle", not
+        // "wipe the user's profile". Preserve existing facts; future
+        // explicit-nuke can be done via forget_memory or by editing the
+        // file. Single-side empty (one tier had no facts but the other
+        // produced facts) is still REPLACED — that's the intended
+        // "fresh rewrite" semantic.
+        const arrPublic = parsed.public as string[];
+        const arrPrivate = parsed.private as string[];
+        if (arrPublic.length === 0 && arrPrivate.length === 0) {
+          void audit('save_memory', caller, auditArgs, 'ok');
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `save_memory(type="profile_tiered"): both arrays empty — no-op (existing profile preserved). Reason: ${reason}`,
+              },
+            ],
+          };
+        }
+        // Re-run the L1 safety net via the existing helper (it accepts
+        // a raw string for tolerance with the LLM, but we already
+        // parsed; reconstruct from the parsed object so we don't
+        // re-parse our own JSON.stringify).
+        const tiered = parseTieredProfile(JSON.stringify({ public: arrPublic, private: arrPrivate }));
+        // Sanitize embedded newlines in array elements (R1-audit nit #4).
+        // A `\n` inside an element would create a multi-line bullet
+        // that listProfileLines splits into orphan lines on read,
+        // confusing what_do_you_know / forget_memory hash addressing.
+        // Collapse runs of whitespace (including \n, \r, \t) to a
+        // single space to keep one fact per line.
+        const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
+        const fmt = (arr: string[]) =>
+          arr
+            .map(oneLine)
+            .filter(Boolean)
+            .map((line) => (line.startsWith('-') ? line : `- ${line}`))
+            .join('\n') +
+          (arr.some((s) => oneLine(s).length > 0) ? '\n' : '');
+        // The two writes are sequential, NOT a single atomic transaction.
+        // A concurrent getProfile call in the window between them would
+        // see public-new + private-old (sub-ms window on a healthy
+        // filesystem). Per-chat queueing (src/queue.ts) serializes any
+        // other save_memory on the same user, so no save can race here,
+        // but read paths (memory enrichment in src/channel.ts) are
+        // unqueued. Tracked alongside the saveProfile TOCTOU at #54;
+        // a true atomic-pair write would need a per-user lock or a
+        // temp-dir-and-rename of profiles/<userId>/.
+        await memoryStore.saveProfile(caller, fmt(tiered.public), 'public', 'replace');
+        await memoryStore.saveProfile(caller, fmt(tiered.private), 'private', 'replace');
+        void audit('save_memory', caller, auditArgs, 'ok');
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `Saved tiered profile for ${caller}: ${tiered.public.length} public, ${tiered.private.length} private. Reason: ${reason}`,
+            },
           ],
         };
       }
