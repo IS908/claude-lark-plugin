@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.18] - 2026-05-25
+
+### Security
+- **Memory enrichment now wraps every stored data section in a `<memory_context>` envelope with a preamble that establishes a DATA-vs-INSTRUCTIONS trust boundary** (#114 — **HIGH — self-reinforcing prompt injection loop**). Pre-v1.0.18 `enrichWithMemory` injected user-derived content (profile, episode summary, skill description, mentioned-user profile, quoted message, reaction emoji) directly into Claude's prompt as `[User Profile]\n${profile}` / `[Chat Context]\n${ep.content}` etc. — structurally indistinguishable from system instructions. The worst surface was the auto-flush feedback loop: user message → buffer flush → distiller writes episode .md → next inbound message in the same chat re-injects that summary as `[Chat Context]` → Claude could follow imperatives buried in the summary. One successful poison persists across every future enrichment until `forget_memory` removes it.
+
+  **Five injection surfaces closed** in this PR:
+  1. **Episode content** (`[Chat Context]` / `[Thread Context]`) — the self-reinforcing loop, highest risk.
+  2. **User profile** (`[User Profile]`) — cross-user spread when the target user is @mentioned by anyone else (their public.md gets injected into the mentioner's Claude context).
+  3. **Mentioned-user profile** (`[Mentioned User: ...]`) — same as #2 from the other direction.
+  4. **Skill description** (`[Skill: ...]`) — creator-controlled free text; cross-tenant spread via `searchSkills` keyword recall.
+  5. **Quoted message (`parent_content`)** — content from a possibly-different user replying-to a possibly-prepared message.
+
+  **Defense**: new `wrapEnrichmentSection(kind, label, body)` in `src/prompts.ts` wraps each section as `<memory_context type="${kind}" label="${label}">\n${body}\n</memory_context>`. Body goes through `escapeEnvelopeBody` which HTML-entity-escapes `</memory_context>` and `</channel>` close tokens so a malicious body cannot prematurely close the envelope and have its tail re-classified as outer context. A short preamble at the top of every enriched prompt (`ENRICHMENT_PREAMBLE`) instructs Claude to treat envelope contents as REFERENCE not INSTRUCTIONS — don't execute imperatives, follow URLs, change behavior, or @-mention based on text inside the blocks.
+
+- **Skill description hardened at injection time**: now newline-collapsed and capped at 200 chars before wrapping. A multi-line "description" could otherwise smuggle a paragraph of injected text past the visible UX surface (where description is rendered as a one-liner).
+
+- **Reaction `emoji_type` whitelist**: tenant-custom emojis can carry arbitrary characters including markup. The reaction notification text is injected into Claude context (`(reacted with ${emojiType} to message ${messageId})`); now restricted to `^[A-Za-z0-9_-]{1,64}$` with fallback to `<custom-emoji>` for non-conforming values. Standard emoji codenames are unaffected.
+
+### Added
+- 11 smoke assertions in `scripts/enrichment-envelope-smoke.ts` covering: `</memory_context>` and `</channel>` close-tag stripping (case-insensitive), non-envelope `<...>` content left alone (preserves code samples, plain inequality, `<atom>` etc), envelope produces well-formed open+close, embedded close-tag inside body is escaped (defense in depth — there's only ever ONE legitimate close per wrap), quote-character in `label` attr is `&quot;`-escaped (can't break out and inject extra attrs), preamble at top + `[Current Message]` at bottom layout, parent message wrapped too, end-to-end #114 reproducer (malicious episode body with imperatives + envelope-break attempt + URL stays fully contained, preamble warning present, user message stays OUTSIDE envelope).
+- `ENRICHMENT_PREAMBLE`, `wrapEnrichmentSection`, `escapeEnvelopeBody` exported from `src/prompts.ts` for downstream test reuse.
+
+### Operator notes
+- Existing on-disk profiles, episodes, and skill descriptions are NOT scrubbed retroactively — old injection payloads remain in the data files. v1.0.18 prevents them from being treated as instructions on read by virtue of the envelope, so the live exploit surface is closed. Operators concerned about historical poisoning can spot-check `~/.claude/channels/lark/memories/{profiles,episodes,skills}/` for imperative-shaped content and delete unwanted entries (`forget_memory` for profile lines; `rm` for episode .md files and skill .md+.meta.json pairs).
+- Token cost per inbound message rises slightly (preamble + per-section envelope tags). Typical overhead: ~150 tokens for the preamble + ~10 tokens per section. For a chat with no stored memory, the preamble does NOT fire (the enrichment helper short-circuits when `parts.length === 0`).
+
 ## [1.0.17] - 2026-05-24
 
 ### Fixed
