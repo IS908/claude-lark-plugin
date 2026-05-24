@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.24] - 2026-05-25
+
+### Fixed
+- **Auto-flush sentinel binding no longer pollutes the chat-level identity slot** (#87 — **HIGH — opaque "system-flush caller" denials hit unrelated tool calls long after the flush turn**). Pre-v1.0.24 the flush handler called `identitySession.setCaller(chatId, undefined, SYSTEM_FLUSH_CALLER)` — chat-level binding. The binding had no corresponding clear, so it lingered until either a real non-threaded user message in the same chat overwrote it, or the 1-hour TTL evicted it. Any tool call resolving via the chat-level fallback in between (most commonly: a Claude cronjob calling `create_job(chat_id, thread_id=T2)` where T2 isn't bound → falls back to chat-level) returned the sentinel → the tool denied the call with `not authorized for system-flush caller` and the user saw an opaque rejection with no actionable explanation.
+
+  Fix: bind the sentinel under a flush-specific thread-key (`flush-${Date.now()}`) and pass the same key as `threadId` in the synthetic channel notification. Claude's `save_memory` call carries `thread_id=flush-<ts>` from the notification meta → `resolveCaller` hits the exact `(chatId, flushKey)` entry → sentinel is returned via PRECISE thread match, never via chat-level fallback. The chat-level slot stays whatever the last real user message wrote, preserving correct identity for unrelated tool calls in other threads or no-thread paths within the same chat.
+
+  The flush-thread-key `flush-<ts>` matches the `LARK_ID_REGEX` (alphanumeric + dash) that PR #99 added to all tool inputs, so `save_memory` accepts it without modification. No new API surface (no `clearCaller` method needed) — closes the bug entirely via existing thread-isolation primitives.
+
+### Added
+- 1 new auto-flush smoke assertion (#9, suite 8 → 9): codifies the no-pollution invariant. After a real user message binds the chat-level slot to `ou_alice`, the flush handler binds sentinel to `(chatId, flushKey)`. Then verifies that (a) flush-scoped `getCaller(chatId, flushKey)` returns sentinel (flush turn's `save_memory` works); (b) chat-level fallback `getCaller(chatId, undefined)` returns `ou_alice` (NOT sentinel — this is the pre-v1.0.24 regression); (c) arbitrary unbound-thread call `getCaller(chatId, 'some_new_thread')` falls through to `ou_alice` (the production cronjob scenario that pre-fix would have hit the sentinel).
+
+### Operator notes
+- No on-disk state change needed. The fix takes effect on the next process restart — any existing in-memory chat-level sentinel binding decays at the 1-hour TTL.
+- Audit log shape unchanged: the sentinel still appears as the caller for `save_memory(type=chat)` calls during flush turns, just under a thread-specific identity entry instead of a chat-level one.
+
 ## [1.0.23] - 2026-05-25
 
 ### Fixed

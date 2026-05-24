@@ -224,6 +224,56 @@ const auditLog = await waitForAuditLog();
   passed++;
 }
 
+// ── 9. #87 fix (v1.0.24): thread-scoped flush binding does NOT pollute
+//      the chat-level slot, so a concurrent tool call resolving via
+//      chat-level fallback on the SAME chat resolves to the LAST real
+//      user — not the sentinel. Pre-fix the binding was at chat-level
+//      and lingered past the flush turn, causing create_job (and any
+//      tool that resolves via chat-level fallback) to be silently
+//      denied with the confusing "not authorized for system-flush
+//      caller" error after every auto-flush.
+//
+//      Models the production v1.0.24 flow:
+//        1. A real user message binds (chatId, undefined) → user_alice.
+//        2. Buffer auto-flush fires: handler binds (chatId, flushKey)
+//           → SENTINEL. NOTE: thread-scoped, not chat-level.
+//        3. Verify: getCaller(chatId, flushKey) → SENTINEL ✓
+//                    getCaller(chatId, undefined) → user_alice ✓
+//                    getCaller(chatId, 'some_other_thread') → user_alice ✓
+//                      (because that thread isn't bound, falls back to
+//                       chat-level, which is STILL user_alice not SENTINEL)
+{
+  const s = new IdentitySession(() => null);
+
+  // Step 1: real user message
+  s.setCaller('oc_chat_a', undefined, 'ou_alice');
+  if (s.getCaller('oc_chat_a') !== 'ou_alice') {
+    fail('9-setup: chat-level slot should be ou_alice after real user message');
+  }
+
+  // Step 2: auto-flush (production: const flushKey = `flush-${Date.now()}`)
+  const flushKey = `flush-${Date.now()}`;
+  s.setCaller('oc_chat_a', flushKey, SYSTEM_FLUSH_CALLER);
+
+  // Step 3: assertions
+  // 3a: flush-scoped resolution hits sentinel (save_memory during flush turn works)
+  if (s.getCaller('oc_chat_a', flushKey) !== SYSTEM_FLUSH_CALLER) {
+    fail(`9: flush-scoped getCaller should return sentinel, got ${s.getCaller('oc_chat_a', flushKey)}`);
+  }
+  // 3b: chat-level fallback returns the real user, NOT sentinel
+  //     (this is the #87 fix — pre-fix this returned SENTINEL)
+  if (s.getCaller('oc_chat_a', undefined) !== 'ou_alice') {
+    fail(`9: chat-level slot must NOT be polluted; got ${s.getCaller('oc_chat_a', undefined)}`);
+  }
+  // 3c: arbitrary-thread fallback also returns real user via chat-level
+  //     (the production scenario: cronjob synth thread or any new thread
+  //      not yet bound)
+  if (s.getCaller('oc_chat_a', 'oc_some_new_thread') !== 'ou_alice') {
+    fail(`9: unbound thread should fall through to chat-level ou_alice, got ${s.getCaller('oc_chat_a', 'oc_some_new_thread')}`);
+  }
+  passed++;
+}
+
 rmSync(tmp, { recursive: true, force: true });
 
-console.log(`auto-flush smoke: ${passed}/8 PASS`);
+console.log(`auto-flush smoke: ${passed}/9 PASS`);
