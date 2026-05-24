@@ -24,7 +24,7 @@ This is a buffer flush triggered by inactivity, not a user message. The plugin h
 The following is a conversation from chat ${chatId} (${messageCount} messages).
 Please:
 1. Write a 3-5 sentence summary focusing on: what was discussed, what was decided, what was resolved, and any open items.
-2. Call save_memory(type="chat", content=<summary>, reason=<why>, chat_id="${chatId}", thread_id="${flushThreadId}") to persist it. The thread_id is REQUIRED — without it the caller resolution falls back to the chat-level slot (which is the last real user, not the system sentinel) and the audit log will falsely attribute the save to that user (#87 fix). Do not output a reply — this is system, not user.
+2. Call save_memory(type="chat", content=<summary>, reason=<why>, chat_id="${chatId}", thread_id="${flushThreadId}") to persist it. The thread_id is REQUIRED — without it the caller resolution falls back to the chat-level slot (which is the last real user, not the system sentinel) and the audit log will falsely attribute the save to that user (#87 fix). Use type="chat" — NOT type="thread" — because "${flushThreadId}" is a synthetic flush-turn identifier, not a real Feishu thread; a type="thread" write would create an orphan directory at episodes/<chat>/threads/${flushThreadId}/ that no future search ever reads. Do not output a reply — this is system, not user.
 
 Do NOT call save_memory(type="profile", ...) in this turn — profile writes are user-scoped (they persist into a specific user's profile directory), and a system caller has no user identity to attribute private-tier data to. The server-side gate will reject any profile write attempt here. Individual profile updates are handled by a separate distillation stage.
 
