@@ -898,9 +898,12 @@ export class LarkChannel {
         );
         return;
       }
-      setTimeout(() => { void tick(); }, BG_INTERVAL_MS);
+      // .unref() so the dangling background timer doesn't keep the
+      // event loop alive on its own — graceful shutdowns can exit
+      // cleanly. R1-audit cosmetic on #86.
+      setTimeout(() => { void tick(); }, BG_INTERVAL_MS).unref();
     };
-    setTimeout(() => { void tick(); }, BG_INTERVAL_MS);
+    setTimeout(() => { void tick(); }, BG_INTERVAL_MS).unref();
   }
 
   /**

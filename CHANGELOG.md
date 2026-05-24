@@ -21,9 +21,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - 10 smoke assertions in new `scripts/bot-mention-failsafe-smoke.ts`: happy path for both helpers, deny-by-default on empty botOpenId, no-mentions / null / undefined handling, `union_id` fallback when `open_id` missing, combined startup-race reproducer (#86's exact scenario).
 - New exports from `src/channel.ts`: `shouldAcceptGroupMention`, `computeBotMentioned`.
 
+### R1-audit followups (closed in this PR)
+- **Background-refetch `setTimeout`s are `.unref()`-ed** so they don't keep the event loop alive at shutdown. Cosmetic — `process.exit()` on signals already tore down the loop forcibly, but `.unref()` lets an otherwise-idle process exit naturally too.
+- PR description updated to use GitHub's `Closes #X, closes #Y` form so both #86 AND #55 auto-close on merge.
+
 ### Operator notes
 - After upgrade, expect a brief startup window (up to ~10s for 5 retries × 2s) where group @-mentions are silently ignored before `botOpenId` resolves. This is correct fail-safe behavior. P2P chats are unaffected.
 - If you see `[channel] WARNING: botOpenId not resolved after 5 startup attempts` in stderr after upgrade, check Feishu app permissions (`im:bot` scope) — the background re-fetch will keep trying every 5 minutes for up to an hour but the bot will be silent in groups during that window.
+- **Known limitation**: if bot permission is revoked at RUNTIME (post-successful-startup), the cached `botOpenId` becomes stale. No spam regression (filter correctly rejects messages that don't mention the now-stale id), but no automatic recovery either — operator restart is needed. The background re-fetch only fires from the startup-exhaustion path.
 - This release also closes #55 (same root cause — both group filter and bot_mentioned flag now share the fail-safe `shouldAcceptGroupMention` / `computeBotMentioned` helpers).
 
 ## [1.0.24] - 2026-05-25
