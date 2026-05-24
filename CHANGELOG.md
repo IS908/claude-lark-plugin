@@ -26,8 +26,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Operator notes
 - After the fix, a previously-failing job that you re-target via `update_job` will resume on its next tick. You can also re-activate a paused job in place (`update_job status='active'`).
-- The Stop hook's defer-sentinel route requires Claude to echo `[LARK_DEFER]` in its assistant text. The reply tool's error message embeds the sentinel with explicit instructions; Claude historically cooperates with this pattern. If a hung-loop is observed despite the fix, the hook itself could be extended to read a per-turn defer file written by the tool — tracked as a possible future hardening.
-- The two failure surfaces (Case 1: forever-failing jobs; Case 2: Stop hook loop) often co-occur after a bot kick — the cronjob keeps trying, AND any concurrent user @mention in the same chat triggers the Stop loop. Both are now bounded.
+- The Stop hook's defer-sentinel route requires Claude to echo `[LARK_DEFER]` in its assistant text. The reply tool's error message embeds the sentinel with explicit instructions; Claude historically cooperates with this pattern. If a hung-loop is observed despite the fix, the hook itself could be extended to read a per-turn defer file written by the tool — tracked at #122.
+- The two failure surfaces (Case 1: forever-failing jobs; Case 2: Stop hook loop) often co-occur after a bot kick — the cronjob keeps trying, AND any concurrent user @mention in the same chat triggers the Stop loop. Both are now bounded for `type=message` jobs and for any reply tool call.
+
+### Not addressed (filed as separate issues — R1-audit followups)
+- **#121** — `executePromptJob` cannot auto-pause: prompt jobs dispatch via MCP notification, not Feishu's IM API, so the classifier in `executeJob` never sees Feishu codes. A prompt job targeting an unreachable chat still burns a full Claude turn every tick (Claude's reply tool defers correctly, but the scheduler doesn't know). Needs a counter-based auto-pause or pre-flight target check.
+- **#122** — Stop hook defer-cooperation gap: the hook scans assistant text/thinking blocks for `[LARK_DEFER]` but NOT tool_result content. Claude must voluntarily echo the sentinel; if it ignores the instruction, the loop resurfaces. Mechanical fix is to have the hook also scan tool_result OR read a per-turn defer file the tool writes.
 
 ## [1.0.20] - 2026-05-25
 
