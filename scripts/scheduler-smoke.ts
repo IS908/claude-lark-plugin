@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { isMissedRunStale, JobScheduler } from '../src/scheduler.js';
 import { IdentitySession } from '../src/identity-session.js';
 import { appConfig } from '../src/config.js';
+import { mostRecentMissedSlot } from '../src/job-store.js';
 import type { JobFile } from '../src/job-store.js';
 
 function fail(msg: string): never {
@@ -348,6 +349,118 @@ try {
     passed++;
   }
 
+  // ── Part E: mostRecentMissedSlot + recoverMissedJobs catch-up (#103, v1.0.22) ──
+  //
+  //   Pre-fix recoverMissedJobs called executeJob with the stored
+  //   next_run_at unchanged → for a 5h downtime gap, "the oldest missed
+  //   slot's content" was delivered (5h time-shifted) and 4 intermediate
+  //   slots were silently dropped. Fix fast-forwards to the most-recent
+  //   pre-now slot before executing.
+
+  // 19a. mostRecentMissedSlot pure-function tests.
+  {
+    // hourly cron, 5h gap → returns the slot just before now.
+    const cronHourly = '0 * * * *';
+    const fromTime = new Date('2026-05-25T03:00:00Z').getTime();
+    const now5h30m = new Date('2026-05-25T08:30:00Z').getTime();
+    const latest = mostRecentMissedSlot(cronHourly, fromTime, now5h30m);
+    // Expected: 08:00 (the most recent hourly slot < 08:30).
+    if (latest !== new Date('2026-05-25T08:00:00Z').getTime()) {
+      fail(`19a-1: hourly cron 5h gap should fast-forward to 08:00, got ${new Date(latest).toISOString()}`);
+    }
+    // 0-gap case: now < fromTime → return fromTime unchanged.
+    const earlyNow = new Date('2026-05-25T02:00:00Z').getTime();
+    const same = mostRecentMissedSlot(cronHourly, fromTime, earlyNow);
+    if (same !== fromTime) fail(`19a-2: now < fromTime should return fromTime, got ${new Date(same).toISOString()}`);
+    // No-intermediate case: fromTime IS the most recent slot before now.
+    const tinyGap = new Date('2026-05-25T03:30:00Z').getTime(); // fromTime=03:00, gap < 1h
+    const noAdvance = mostRecentMissedSlot(cronHourly, fromTime, tinyGap);
+    if (noAdvance !== fromTime) fail(`19a-3: no intermediate slots should return fromTime, got ${new Date(noAdvance).toISOString()}`);
+    passed++;
+  }
+
+  // 19b. mostRecentMissedSlot safety cap on pathological schedule.
+  //      Every-minute cron over a multi-day downtime — pre-cap would
+  //      iterate thousands of times; cap protects boot latency.
+  {
+    const cronEveryMin = '* * * * *';
+    const fromTime = 1_700_000_000_000;
+    const tenDaysLater = fromTime + 10 * 24 * HOUR; // ~14,400 slots
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    let latest: number;
+    try {
+      latest = mostRecentMissedSlot(cronEveryMin, fromTime, tenDaysLater);
+    } finally {
+      console.error = origError;
+    }
+    if (latest === fromTime) fail('19b: should have advanced at least once');
+    if (!errors.some((e) => /capping at iteration/.test(e))) {
+      fail(`19b: cap should emit stderr warning; got: ${errors.join(' | ')}`);
+    }
+    passed++;
+  }
+
+  // 19c. recoverMissedJobs integration: a job whose next_run_at is in
+  //      the past but within the stale threshold gets its next_run_at
+  //      fast-forwarded before executeJob fires. Use a hand-set 3h-late
+  //      hourly cron, observe the catch-up fires once and the file is
+  //      written back with the FUTURE next_run_at (post-execute advance).
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent));
+    const HOURS_LATE = 3;
+    const lateNextRun = new Date(Date.now() - HOURS_LATE * HOUR).toISOString();
+    const job: JobFile = {
+      meta: {
+        id: 'recover-hourly',
+        name: 'recover-hourly',
+        type: 'message',
+        schedule: '0 * * * *', // hourly on the hour
+        schedule_human: '0 * * * *',
+        target_chat_id: 'oc_recover',
+        origin_chat_id: 'oc_recover',
+        status: 'active',
+        created_by: 'ou_owner',
+        created_at: '2026-01-01T00:00:00Z',
+        content: 'hourly briefing',
+        msg_type: 'text',
+      } as JobFile['meta'],
+      runtime: {
+        last_run_at: null,
+        next_run_at: lateNextRun,
+        run_count: 0,
+        last_error: null,
+      },
+    };
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await (scheduler as any).recoverMissedJobs([job]);
+    } finally {
+      console.error = origError;
+    }
+    if (sent.length !== 1) fail(`19c: missed-job recovery should fire exactly 1 send, got ${sent.length}`);
+    if (sent[0].text !== 'hourly briefing') fail(`19c: content lost: ${sent[0].text}`);
+    // After the catch-up, next_run_at must be in the FUTURE (executeJob
+    // advanced it via computeNextRun after success).
+    if (new Date(job.runtime.next_run_at).getTime() <= Date.now()) {
+      fail(`19c: post-catch-up next_run_at must be in the future, got ${job.runtime.next_run_at}`);
+    }
+    if (job.runtime.run_count !== 1) fail(`19c: run_count should be 1, got ${job.runtime.run_count}`);
+    // The fast-forward log line must be emitted when at least one
+    // intermediate slot was skipped (3h-late + hourly cron → 2 intermediates).
+    if (!errors.some((e) => /fast-forwarded next_run_at/.test(e))) {
+      fail(`19c: fast-forward log line missing; got: ${errors.join(' | ')}`);
+    }
+    if (!errors.some((e) => /skipped ~2/.test(e) || /skipped ~3/.test(e))) {
+      fail(`19c: log should name skipped-hours count; got: ${errors.join(' | ')}`);
+    }
+    passed++;
+  }
+
   // 19. Non-permanent-but-non-retryable error (230001 param error) →
   //     NOT auto-paused, last_error recorded, no DM. Regression guard
   //     against the auto-pause classifier accidentally widening to all
@@ -387,4 +500,4 @@ try {
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }
 
-console.log(`scheduler smoke: ${passed}/19 PASS`);
+console.log(`scheduler smoke: ${passed}/22 PASS`);

@@ -15,6 +15,7 @@ import {
   listAllJobs,
   writeJob,
   computeNextRun,
+  mostRecentMissedSlot,
   type JobFile,
 } from './job-store.js';
 
@@ -249,7 +250,26 @@ export class JobScheduler {
           continue;
         }
 
-        console.error(`[scheduler] Recovering missed job: ${job.meta.id}`);
+        // #103 fix (v1.0.22): catch-up runs the MOST RECENT missed slot,
+        // not the OLDEST. Pre-fix, recoverMissedJobs called executeJob
+        // with the stored next_run_at unchanged — for an hourly job that
+        // was down 03:00→08:30, that meant delivering "03:00 content" at
+        // 08:30 (5h time-shift) while silently dropping the 04:00–08:00
+        // slots. Now: fast-forward next_run_at to the latest pre-now
+        // slot so the catch-up reflects "what should have just fired".
+        // executeJob still advances to the next future slot after success.
+        const recovered = mostRecentMissedSlot(job.meta.schedule, nextRun, now);
+        if (recovered !== nextRun) {
+          const skipped = ((recovered - nextRun) / 3_600_000).toFixed(1);
+          console.error(
+            `[scheduler] Recovering missed job ${job.meta.id}: fast-forwarded next_run_at ` +
+            `from ${new Date(nextRun).toISOString()} to ${new Date(recovered).toISOString()} ` +
+            `(skipped ~${skipped}h of intermediate slots — only the most-recent missed run is delivered).`,
+          );
+          job.runtime.next_run_at = new Date(recovered).toISOString();
+        } else {
+          console.error(`[scheduler] Recovering missed job: ${job.meta.id}`);
+        }
         await this.executeJob(job);
       } catch (err) {
         console.error(`[scheduler] Failed to recover job ${job.meta.id}:`, err);
