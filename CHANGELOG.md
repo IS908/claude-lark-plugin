@@ -26,6 +26,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Orphan `</at>` tail sweep** — a mixed-form input like `<at user_id="x"/>foo</at>` previously left a dangling `</at>` in the output. Cosmetic but worth fixing.
 - **`executeMessageJob` refuses non-`text` `msg_type`** — `post` rich-text payload also supports `<at>` and would have bypassed the sanitizer. `create_job` hardcodes text, so this is purely a defense against hand-edited job files. Refused jobs log a stderr message naming the file.
 
+### R2-audit followups (closed in this PR)
+- **ConversationBuffer records the SANITIZED form** — the `reply` tool's `recordAndRevokeAck` previously stored the raw `text` argument. Pre-fix, a prompt-injected `<at>` would land in the on-disk episode .md → re-injected into Claude's prompt by the enrichment path → Claude might quote it again. The outbound sanitizer caught the re-emission so this was defense-in-depth not a live exploit, but storing the sanitized form is cleaner and avoids audit-trail confusion.
+- **2 new scheduler-smoke tests** (suite 13 → 15): msg_type='post' is refused with stderr line naming the job id; msg_type='text' (default) still executes AND has `<at>` stripped end-to-end via the sanitizer.
+
+### Not addressed (separate issue)
+- **#105** — reply tool's raw-`card` JSON parameter does not gate Schema 2.0 `markdown`/`lark_md` element blocks, which Feishu's card-markdown renderer DOES interpret for `<at>`. Lower urgency because the path requires Claude to construct valid Schema 2.0 JSON (non-trivial prompt-inject target), but still worth closing in a future release with either JSON-tree sanitization or explicit refusal of `markdown` tags in raw cards.
+
 ### Operator notes
 - Legitimate `<at>`-shaped content in bot replies (e.g. Claude explaining what an `<at>` tag IS) loses the angle-bracket wrapping. If you need to discuss `<at>` syntactically without it being processed as a mention, wrap the example differently (escape the brackets, or use a code fence and accept that the inner `<at>` is also stripped). A future release may add a fence-aware variant.
 - Card-mode replies (`buildCards` / Schema 2.0) are NOT sanitized — that renderer does not interpret `<at>` as a mention. If you need a mention inside a card you must use the card's explicit `at` block (not currently exposed through the tool API).

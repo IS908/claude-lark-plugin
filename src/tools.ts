@@ -343,10 +343,19 @@ export function registerTools(
 
       // Helper: record in buffer + revoke ack (shared by card & normal paths)
       function recordAndRevokeAck(replyText: string) {
+        // Buffer stores what the USER ACTUALLY SAW — sanitize <at> on
+        // record so the on-disk episode reflects Feishu's rendered
+        // output (which post-#96 has no @-mention payloads). Without
+        // this, a prompt-injected `<at>` in `replyText` would land in
+        // the buffer → distilled into an episode .md → re-injected
+        // into Claude's context on next enrichment, where Claude
+        // might quote it again. Outbound sanitization catches the
+        // re-emission, but storing the sanitized form is cleaner and
+        // avoids audit-trail confusion (R2-audit followup on #96).
         conversationBuffer?.record(chat_id, {
           role: 'assistant',
           senderId: 'bot',
-          text: replyText.slice(0, 500),
+          text: sanitizeOutboundText(replyText).slice(0, 500),
           timestamp: new Date().toISOString(),
         });
 
