@@ -117,6 +117,41 @@ export function sanitizeOutboundText(text: string): string {
  */
 export const LARK_ID_REGEX = /^[A-Za-z0-9_:-]{1,128}$/;
 
+/**
+ * Build the `forget_memory` tool-reply text. Pure function — extracted
+ * (#88 R1-audit followup) so the singular vs plural-with-allTexts
+ * branch logic is unit-testable without standing up the MCP server.
+ *
+ * Inputs:
+ * - `result`: shape from `MemoryStore.removeProfileLine`
+ *   (`{removed, sample, allTexts}`).
+ * - `hash`: the user-supplied 8-char hash.
+ * - `tier`: 'public' | 'private'.
+ * - `tail`: optional promote-to-rule outcome string (may include
+ *   a multi-rule warning when removed > 1).
+ *
+ * Contract:
+ * - `removed === 1`: singular `Removed "<text>" from <tier> profile.<tail>`
+ * - `removed >= 2`: plural with numbered list + recovery hint.
+ * - `removed === 0`: caller should NOT call this — it's reserved for
+ *   the success path.
+ */
+export function formatForgetMemoryReply(
+  result: { removed: number; sample: string | null; allTexts: string[] },
+  hash: string,
+  tier: 'public' | 'private',
+  tail: string,
+): string {
+  if (result.removed === 1) {
+    return `Removed "${result.sample}" from ${tier} profile.${tail}`;
+  }
+  const numbered = result.allTexts.map((t, i) => `  ${i + 1}) "${t}"`).join('\n');
+  return (
+    `Removed ${result.removed} lines sharing hash "${hash}" from ${tier} profile:\n${numbered}\n` +
+    `If only one of these was the intended target, re-add the others with save_memory(type="profile", tier="${tier}", mode="append", content=...).${tail}`
+  );
+}
+
 const larkIdSchema = (label: string) =>
   z
     .string()
@@ -1412,7 +1447,7 @@ export function registerTools(
     'forget_memory',
     {
       description:
-        "Remove a specific line from the caller's profile. Always caller-scoped — you can only forget things about yourself. Optionally promotes the removed line into a persistent L2 rule so future distillations classify similar content as private.",
+        "Remove profile lines by 8-char hash from caller's profile. Always caller-scoped. If multiple lines share the hash (duplicates or rare birthday-paradox collision), ALL of them are removed in one call — the tool reply lists every removed text by index so the operator can re-add unintended losses via save_memory(mode='append'). Optionally promotes the (sample) removed text to a persistent L2 rule.",
       inputSchema: z.object({
         chat_id: larkIdSchema('chat_id').describe('Chat ID where this call is acting from'),
         thread_id: larkIdSchema('thread_id')
@@ -1454,8 +1489,8 @@ export function registerTools(
         };
       }
 
-      const removed = await memoryStore.removeProfileLine(caller, tier, hash);
-      if (!removed) {
+      const result = await memoryStore.removeProfileLine(caller, tier, hash);
+      if (result.removed === 0) {
         return {
           isError: true,
           content: [{ type: 'text' as const, text: `Failed to remove line "${hash}".` }],
@@ -1465,25 +1500,47 @@ export function registerTools(
       // Line removal above is the primary effect; rule promotion is
       // a best-effort enhancement. If addL2Rule fails, don't undo the
       // removal — just report the partial outcome so the user knows.
+      //
+      // Rule-promotion text choice (#88 followup): when multiple lines
+      // shared the hash, we use the sample text (first match) as the
+      // rule seed. The texts are normalized-equal after bullet-strip
+      // (that's why their hashes collide), so the sample is
+      // representative — but the operator should see the count + the
+      // full list (below) so they can decide whether to manually add
+      // other variants. R1-audit followup: when removed>1+promote, also
+      // emit a "review whether you want all variants treated as
+      // private" warning so the operator catches the over-broad rule.
       let tail = '';
       if (promote_to_rule) {
         try {
           const { addL2Rule } = await import('./privacy-rules.js');
-          await addL2Rule(target.text, 'Always private');
+          await addL2Rule(result.sample ?? '', 'Always private');
           tail = ' Also appended to privacy-rules.md under "Always private" — future distillations will classify similar content accordingly.';
+          if (result.removed > 1) {
+            tail +=
+              ' Note: rule seeded from the sample text only; multiple lines were removed, so review whether other variants should also be added manually.';
+          }
         } catch (err) {
           tail = ` (Warning: removal succeeded but failed to append rule to privacy-rules.md: ${err instanceof Error ? err.message : String(err)}. You can add the rule manually.)`;
         }
       }
 
-      void audit('forget_memory', caller, auditArgs, 'ok');
+      // Audit log includes the removed count for forensic visibility
+      // (R1-audit followup #12 — pre-fix only ok/denied was recorded,
+      // hiding that a multi-delete had happened from the audit trail).
+      void audit('forget_memory', caller, { ...auditArgs, removed: result.removed }, 'ok');
+
+      // #88 fix: faithful confirmation that names the count AND lists
+      // every removed text (so the operator can copy-paste back any
+      // unintended losses via save_memory). Pre-fix the singular wording
+      // hid multi-deletes entirely; intermediate fix named the count
+      // but the recovery hint ("re-add the others") was misleading
+      // because what_do_you_know wouldn't show the deleted texts to
+      // copy from. R1-audit followup #8 — surface allTexts inline via
+      // formatForgetMemoryReply (extracted as a pure function so the
+      // branch logic is unit-testable).
       return {
-        content: [
-          {
-            type: 'text' as const,
-            text: `Removed "${target.text}" from ${tier} profile.${tail}`,
-          },
-        ],
+        content: [{ type: 'text' as const, text: formatForgetMemoryReply(result, hash, tier, tail) }],
       };
     }
   );

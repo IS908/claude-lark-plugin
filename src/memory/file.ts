@@ -438,23 +438,40 @@ export class MemoryStore {
   }
 
   /**
-   * Remove a single line (identified by its hash from {@link listProfileLines})
-   * from the given tier file. Returns true if a line was removed, false if
-   * nothing matched. Idempotent — removing the same hash twice returns false
-   * on the second call.
+   * Remove every line whose 8-char hash matches `hash` from the given
+   * tier file (#88). Returns the count of removed lines AND a sample of
+   * the removed text so the caller can surface a faithful confirmation
+   * message: an 8-char sha1 prefix can collide across duplicates of the
+   * same fact ("prefers tea" written twice with different bullet
+   * formatting normalizes to the same key) OR via birthday paradox on
+   * adversarial input. Pre-v1.0.19 the tool reply hardcoded singular
+   * `Removed "<text>" from ...` regardless of how many lines vanished
+   * — silent multi-delete with no operator-visible signal.
    *
-   * The rewritten file is bullet-normalized: every remaining line is written
-   * back with a `- ` prefix so the tier stays visually consistent with the
-   * append-mode storage convention.
+   * Idempotent — removing the same hash twice returns `removed: 0` on
+   * the second call.
+   *
+   * The rewritten file is bullet-normalized: every remaining line is
+   * written back with a `- ` prefix so the tier stays visually
+   * consistent with the append-mode storage convention.
    */
-  async removeProfileLine(ownerId: string, tier: Tier, hash: string): Promise<boolean> {
+  async removeProfileLine(
+    ownerId: string,
+    tier: Tier,
+    hash: string,
+  ): Promise<{ removed: number; sample: string | null; allTexts: string[] }> {
     const lines = await this.listProfileLines(ownerId, tier);
+    const targets = lines.filter((l) => l.hash === hash);
+    if (targets.length === 0) return { removed: 0, sample: null, allTexts: [] };
     const kept = lines.filter((l) => l.hash !== hash);
-    if (kept.length === lines.length) return false;
 
     const next = kept.map((l) => `- ${l.text}`).join('\n') + (kept.length > 0 ? '\n' : '');
     await fs.writeFile(this.profileTierPath(ownerId, tier), next, 'utf-8');
-    return true;
+    return {
+      removed: targets.length,
+      sample: targets[0].text,
+      allTexts: targets.map((t) => t.text),
+    };
   }
 
   // ── Episodes ──

@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.19] - 2026-05-25
+
+### Fixed
+- **`forget_memory` no longer silently deletes multiple lines that share an 8-char hash** (#88 — **MEDIUM, silent data loss**). Pre-v1.0.19 `MemoryStore.removeProfileLine` used `filter(l => l.hash !== hash)` which strips **every** matching line in one pass, but the tool reply was hardcoded singular `Removed "<text>" from <tier> profile.` — so a multi-delete was invisible to the operator. Collisions happen naturally (multiple `save_memory(profile, content="prefers tea", mode="append")` calls with mixed bullet formatting normalize to the same key after `listProfileLines`' bullet-strip) and could be triggered adversarially (8-char sha1 prefix is 32 bits — birthday paradox at ~77k lines, well above realistic profile size for an honest user but exploitable in principle).
+
+  Fix:
+  - `MemoryStore.removeProfileLine(ownerId, tier, hash)` now returns `{ removed: number, sample: string | null, allTexts: string[] }` instead of a bare boolean.
+  - `forget_memory` tool reply (via the new pure `formatForgetMemoryReply` helper) branches on `removed`: singular `Removed "<text>" from ${tier} profile.` when 1; plural lists every removed text inline as a numbered list followed by a `save_memory(type="profile", tier=..., mode="append", content=...)` recovery hint, so the operator can copy-paste any unintended losses back. R1 audit caught that the intermediate format (count + sample only) had a misleading recovery hint pointing at `what_do_you_know` — which can't show texts that were just deleted.
+  - `promote_to_rule=true` uses the sample text for the L2 rule append (the colliding texts are normalized-equal so the sample is representative); when `removed > 1`, the tail also warns "rule seeded from the sample text only; multiple lines were removed, so review whether other variants should also be added manually." If `addL2Rule` itself throws, the L2 warning takes precedence (single warning per reply).
+  - Audit log records the actual `removed` count so the trail shows the scope of every invocation, not just ok/denied.
+
+### Added
+- 1 new transparency-smoke assertion (#5b) covering the multi-delete path: two normalized-equal lines pre-populated via `mode='replace'` (bypasses `mergeProfileLines` dedup), `removeProfileLine` reports `removed: 2`, file ends empty, `allTexts` carries both originals.
+- Existing transparency tests updated to assert the new return shape (`result.removed === N` instead of `if (!ok)`).
+- Existing profile-tier test 14 updated to the new shape.
+- Transparency suite total: 9 → 11.
+
+### R1-audit followups (closed in this PR)
+- **Plural reply now lists every removed text inline** with a numbered list, so the operator can copy-paste any unintended losses back via `save_memory(mode='append')`. Pre-followup the reply named the count + sample but the recovery hint ("run what_do_you_know and re-add the others") was misleading — `what_do_you_know` cannot show texts that were just deleted.
+- **`promote_to_rule=true` + multi-delete now emits a warning** in the tail: "rule seeded from the sample text only; multiple lines were removed, so review whether other variants should also be added manually." Prevents the operator from accidentally over-broadening L2 rules based on collision-driven multi-deletes.
+- **Audit log records `removed` count** in the args dict, so the audit trail shows the actual scope of each `forget_memory` invocation (not just ok/denied).
+- **Tool description updated** to surface the possible multi-delete and the recovery path. Claude reads tool descriptions; this lets it warn proactively rather than confronting an unexpected plural reply post-hoc.
+- **Extracted `formatForgetMemoryReply` as a pure exported function** so the singular/plural branch logic is unit-testable without standing up the MCP server. New transparency test #5a-tool covers the formatter directly.
+
+### Operator notes
+- Existing on-disk profiles MAY contain hash collisions from past `save_memory` patterns. Calling `forget_memory` on a colliding hash now reports the count and a sample — if more than 1 was unintentionally swept, the operator can spot it in the reply text and recover via `save_memory(type='profile', tier, mode='append', content=...)` for the lost lines.
+- A future release may switch to per-line index-prefixed identifiers (e.g. `i17:abc12345`) to eliminate collisions entirely — would require updating `what_do_you_know`'s line-id rendering and `forget_memory`'s hash parameter semantics. Tracked separately if needed.
+
 ## [1.0.18] - 2026-05-25
 
 ### Security

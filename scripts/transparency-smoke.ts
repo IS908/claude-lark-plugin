@@ -50,11 +50,16 @@ let passed = 0;
 }
 
 // ── 3. removeProfileLine by hash ──
+//   v1.0.19 (#88): return shape changed from boolean to
+//   { removed: number, sample: string|null, allTexts: string[] } so the
+//   tool reply can name the count when a hash collides across multiple
+//   lines. Single-match path returns { removed: 1, ... }.
 {
   const lines = await store.listProfileLines('ou_a', 'public');
   const target = lines[1]; // "- second"
-  const ok = await store.removeProfileLine('ou_a', 'public', target.hash);
-  if (!ok) fail('3: remove should succeed');
+  const result = await store.removeProfileLine('ou_a', 'public', target.hash);
+  if (result.removed !== 1) fail(`3: remove should report 1, got ${result.removed}`);
+  if (result.sample !== target.text) fail(`3: sample mismatch: ${result.sample}`);
 
   const after = await store.listProfileLines('ou_a', 'public');
   if (after.length !== 2) fail(`3: expected 2 lines after remove, got ${after.length}`);
@@ -66,8 +71,9 @@ let passed = 0;
 {
   const lines = await store.listProfileLines('ou_a', 'public');
   const removedHash = 'deadbeef'; // not present
-  const ok = await store.removeProfileLine('ou_a', 'public', removedHash);
-  if (ok) fail('4: removing a non-existent hash should return false');
+  const result = await store.removeProfileLine('ou_a', 'public', removedHash);
+  if (result.removed !== 0) fail(`4: non-existent hash should report removed=0, got ${result.removed}`);
+  if (result.sample !== null) fail(`4: non-existent hash should have null sample, got ${result.sample}`);
   const after = await store.listProfileLines('ou_a', 'public');
   if (after.length !== lines.length) fail('4: removing a non-existent hash should not mutate');
   passed++;
@@ -80,11 +86,92 @@ let passed = 0;
   const pubLines = await store.listProfileLines('ou_b', 'public');
   const privHash = (await store.listProfileLines('ou_b', 'private'))[0].hash;
 
-  const okCross = await store.removeProfileLine('ou_b', 'public', privHash);
-  if (okCross) fail('5: private-tier hash must not match against public tier');
+  const cross = await store.removeProfileLine('ou_b', 'public', privHash);
+  if (cross.removed !== 0) fail(`5: private-tier hash must not match against public tier, got removed=${cross.removed}`);
 
   const pubAfter = await store.listProfileLines('ou_b', 'public');
   if (pubAfter.length !== pubLines.length) fail('5: cross-tier call must not mutate public');
+  passed++;
+}
+
+// ── 5a-tool. formatForgetMemoryReply singular vs plural (#88 R1) ──
+//   Pure-function test of the reply-text branch logic the tool handler
+//   uses. Pre-extraction, the singular/plural split was inline in the
+//   handler and untested at unit level; a future regression flipping
+//   the branches would not have been caught by the storage-layer tests.
+{
+  const { formatForgetMemoryReply } = await import('../src/tools.js');
+
+  // Singular path: removed=1, no tail.
+  const singular = formatForgetMemoryReply(
+    { removed: 1, sample: 'likes Python', allTexts: ['likes Python'] },
+    'abc12345',
+    'public',
+    '',
+  );
+  if (!singular.startsWith('Removed "likes Python" from public profile.')) {
+    fail(`tool-fmt singular: got ${JSON.stringify(singular)}`);
+  }
+  if (singular.includes('lines sharing hash')) {
+    fail(`tool-fmt singular leaked plural wording: ${singular}`);
+  }
+
+  // Plural path: removed=3, all texts listed numbered, recovery hint
+  // names the tier and append mode.
+  const plural = formatForgetMemoryReply(
+    {
+      removed: 3,
+      sample: 'prefers tea',
+      allTexts: ['prefers tea', 'prefers tea', 'prefers tea'],
+    },
+    'deadbeef',
+    'private',
+    '',
+  );
+  if (!plural.includes('Removed 3 lines sharing hash "deadbeef" from private profile:')) {
+    fail(`tool-fmt plural header missing: ${plural}`);
+  }
+  if (!plural.includes('  1) "prefers tea"') || !plural.includes('  3) "prefers tea"')) {
+    fail(`tool-fmt plural numbered list missing: ${plural}`);
+  }
+  if (!plural.includes('save_memory(type="profile", tier="private", mode="append"')) {
+    fail(`tool-fmt plural recovery hint wrong tier/mode: ${plural}`);
+  }
+
+  // Tail append: singular + promote_to_rule tail.
+  const singularTail = formatForgetMemoryReply(
+    { removed: 1, sample: 'foo', allTexts: ['foo'] },
+    'h',
+    'private',
+    ' Also appended to privacy-rules.md.',
+  );
+  if (!singularTail.endsWith(' Also appended to privacy-rules.md.')) {
+    fail(`tool-fmt singular tail not preserved: ${singularTail}`);
+  }
+  passed++;
+}
+
+// ── 5b. removeProfileLine reports count when multiple lines share a hash (#88) ──
+//   Two lines with normalized-identical text ("prefers tea" with and
+//   without leading bullet, after listProfileLines strips bullets)
+//   compute to the same 8-char hash. forget_memory pre-v1.0.19 returned
+//   `Removed "<text>"` — singular — hiding the multi-delete entirely.
+//   v1.0.19 returns count + sample so the tool can warn the user.
+{
+  // Construct file with two normalized-equal lines. Using replace mode
+  // bypasses mergeProfileLines' dedup, so both lines persist on disk.
+  await store.saveProfile('ou_dup', '- prefers tea\nprefers tea\n', 'private', 'replace');
+  const lines = await store.listProfileLines('ou_dup', 'private');
+  if (lines.length !== 2) fail(`5b: expected 2 lines pre-delete, got ${lines.length}`);
+  // Both lines must hash-equal.
+  if (lines[0].hash !== lines[1].hash) fail('5b: setup failed — duplicate lines should hash-equal');
+  const result = await store.removeProfileLine('ou_dup', 'private', lines[0].hash);
+  if (result.removed !== 2) fail(`5b: expected removed=2, got ${result.removed}`);
+  if (result.sample !== 'prefers tea') fail(`5b: sample wrong: ${result.sample}`);
+  if (result.allTexts.length !== 2) fail(`5b: allTexts should have 2 entries, got ${result.allTexts.length}`);
+  // File should be empty (both lines removed).
+  const after = await store.listProfileLines('ou_dup', 'private');
+  if (after.length !== 0) fail(`5b: file should be empty after multi-delete, got ${after.length}`);
   passed++;
 }
 
@@ -142,4 +229,4 @@ let passed = 0;
 }
 
 rmSync(tmp, { recursive: true, force: true });
-console.log(`transparency smoke: ${passed}/9 PASS`);
+console.log(`transparency smoke: ${passed}/11 PASS`);

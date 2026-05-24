@@ -310,8 +310,8 @@ passed++;
   await s.saveProfile('ou_rm', '- first\nsecond\n- third', 'private', 'replace');
   const listed = await s.listProfileLines('ou_rm', 'private');
   const secondHash = listed.find((l) => l.text === 'second')!.hash;
-  const ok = await s.removeProfileLine('ou_rm', 'private', secondHash);
-  if (!ok) fail('14: removeProfileLine should report success');
+  const result = await s.removeProfileLine('ou_rm', 'private', secondHash);
+  if (result.removed !== 1) fail(`14: removeProfileLine should report removed=1, got ${result.removed}`);
   const body = readFileSync(join(r, 'profiles', 'ou_rm', 'private.md'), 'utf-8');
   // Remaining lines should both carry bullets now
   if (body !== '- first\n- third\n') fail(`14: expected bullet-normalized rewrite, got ${JSON.stringify(body)}`);
