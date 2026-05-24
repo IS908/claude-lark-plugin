@@ -408,8 +408,28 @@ function setup(respFor: (fileKey: string, type: string) => unknown) {
   passed++;
 }
 
+// 16. R1-audit followup: partial opts object (e.g. `{}` or
+//     `{ ...someUnrelatedField }`) must NOT silently disable the cap.
+//     Pre-fix, the signature `opts = { maxBytes: Infinity }` only
+//     supplied the default when opts was wholly absent — a caller
+//     passing `{}` got `opts.maxBytes === undefined` and the `>`
+//     comparisons returned false, bypassing enforcement entirely.
+{
+  const filePath = path.join(tmpInbox, 'partial-opts.bin');
+  const big = Buffer.alloc(2048, 'p');
+  // Empty opts: should fall back to maxBytes=Infinity (no rejection).
+  await writeSdkResource(big, filePath, {});
+  if (!existsSync(filePath)) fail('16: empty opts should default to Infinity (no rejection)');
+
+  // Spread without maxBytes: same behavior.
+  const filePath2 = path.join(tmpInbox, 'spread-opts.bin');
+  await writeSdkResource(big, filePath2, { ...{ unrelated: 'x' } as any });
+  if (!existsSync(filePath2)) fail('16: opts spread without maxBytes should default to Infinity');
+  passed++;
+}
+
 rmSync(tmpInbox, { recursive: true, force: true });
 delete process.env.LARK_INBOX_DIR;
 
-console.log(`download-attachment smoke: ${passed}/20 PASS`);
+console.log(`download-attachment smoke: ${passed}/21 PASS`);
 

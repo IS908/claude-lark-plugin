@@ -89,13 +89,18 @@ export class WriteSdkResourceTooLargeError extends Error {
 export async function writeSdkResource(
   data: unknown,
   filePath: string,
-  opts: { maxBytes: number } = { maxBytes: Infinity },
+  opts: { maxBytes?: number } = {},
 ): Promise<void> {
   if (data === null || data === undefined) {
     throw new Error('writeSdkResource: data is null/undefined');
   }
 
-  const { maxBytes } = opts;
+  // Destructure-with-default so a partial opts object (e.g.
+  // `writeSdkResource(data, path, {})` or `writeSdkResource(data, path,
+  // { ...someOptsWithoutMaxBytes })`) still falls back to Infinity
+  // rather than silently producing `undefined > undefined === false`
+  // and disabling the cap entirely. R1-audit followup on #108.
+  const { maxBytes = Infinity } = opts;
 
   if (Buffer.isBuffer(data)) {
     if (data.length > maxBytes) {
