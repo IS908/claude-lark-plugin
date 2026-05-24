@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.14] - 2026-05-24
+
+### Security
+- **`save_skill` now requires server-side caller authorization, records ownership, and rejects cross-user overwrites** (#84 — **HIGH**). Pre-v1.0.14 `save_skill` was the only sensitive tool that bypassed the `resolveCaller` + audit + ownership pattern that `save_memory` / `create_job` / `forget_memory` / `what_do_you_know` etc. all follow:
+
+  - The handler declared `chat_id` in the input schema but destructured it away — no `resolveCaller`, no `audit`.
+  - `MemoryStore.saveSkill` did `fs.writeFile` unconditionally — no ownership check, no existsSync guard, no audit, **silent overwrite of any other user's skill**.
+  - Because `searchSkills` is global (across all users and chats), a malicious `content` written by any user surfaces in every future memory-enrichment context — a free prompt-injection channel for the entire bot.
+
+  Fix (mirrors the existing sensitive-tool template):
+  - Tool handler now calls `resolveCaller('save_skill', chat_id, thread_id, auditArgs)`; failures audit `'denied'` and return an error response.
+  - `chat_id` is now `required` in the input schema (not optional), and `thread_id` is plumbed through verbatim. Sensitive-tool listing in `src/prompts.ts` + `CLAUDE.md` updated to include `save_skill`.
+  - `MemoryStore.saveSkill(name, description, content, { caller, ownerOpenId })` returns a tagged result — `{ ok, slug, action: 'created'|'updated' }` on success, `{ ok: false, reason: 'empty-slug'|'not-owner'|'legacy-locked', message }` otherwise — so the handler can emit precise denial messages without leaking ownership info beyond what the user already knew (the slug exists).
+  - Ownership is persisted in a sidecar `skills/<slug>.meta.json` (`{created_by, created_at, updated_at?, migrated?}`) — sidecar layout chosen over inline frontmatter so `searchSkills`'s line-index parser doesn't need to change and the .md file remains a clean human-readable document.
+  - **Empty-slug rejection**: names like `""`, `"!!!"`, `"---"`, or `"   "` sanitize to an empty string and would previously have landed all writes at `skills/.md` (collidable across all empty-name attempts). Now rejected at the handler boundary.
+  - **Slug-collision protection**: `"Deploy Service"`, `"deploy/service"`, `"deploy@service"` all map to slug `deploy-service`. The owner gate fires on the slug, so a second author with a different display name still gets `not-owner`.
+
+### Added
+- **Legacy-skill ownership migration** (`MemoryStore.migrateLegacySkills(ownerOpenId)`), called once at startup from `src/index.ts`. Scans `skills/*.md` for files without a sibling `.meta.json` and attributes them to OWNER (`LARK_OWNER_OPEN_ID`). Idempotent: re-running skips files with existing sidecars. Sidecar `created_at` mirrors the .md's mtime and `migrated: true` so operators can spot migrated-from-legacy attributions apart from real `save_skill` writes.
+- **Fail-loud diagnostic when OWNER is unset**: without `LARK_OWNER_OPEN_ID`, migration is a no-op AND a stderr log lists how many legacy skills are now locked against `save_skill` overwrite. Failure mode chosen deliberately — silently attributing legacy content to the first caller would re-introduce the exact threat #84 closes.
+- `IdentitySession.getOwner()` — pure passthrough of the `ownerFallback` so tool handlers can include the OWNER in error hints (e.g. the legacy-locked message tells the user to restart for migration when OWNER is set, or to set OWNER first when it isn't) without consulting the session map.
+- 15 smoke assertions in `scripts/skill-ownership-smoke.ts` covering: sanitize round-trips and empty-slug rejection, first-write claims slug, owner can update, non-owner denied, slug-collision via different display names still denied, legacy `.md` without sidecar locked (with the message changing based on OWNER configured), migration claims unowned files for OWNER, migration is idempotent (does not clobber existing owners), no-op migration without OWNER leaves files locked, corrupt sidecar treated as missing without becoming a back-door for claiming. Suite plus 2 new identity-smoke tests for `getOwner()` (8 → 10).
+
+### Operator notes
+- **Upgrade path with OWNER set**: first restart after upgrade runs the legacy claim — every pre-v1.0.14 skill becomes owned by OWNER. After that, `save_skill` from non-OWNER users on those slugs returns the `not-owner` error.
+- **Upgrade path without OWNER set**: legacy skills are locked but readable. Either set `LARK_OWNER_OPEN_ID` and restart, or manually delete `~/.claude/channels/lark/memories/skills/<slug>.md` to free a slug.
+- The audit log (`~/.claude/channels/lark/audit.log`) now records `save_skill` invocations with `name / chat_id / thread_id`. Useful for spotting unexpected overwrite attempts.
+
+### Not addressed (separate issues)
+- TOCTOU race when two `save_skill` writes for the same slug land concurrently (analogous to #54 for profiles). Owner gate still works for the dominant case; pure concurrent-overwrite is a separate fix.
+
 ## [1.0.13] - 2026-05-24
 
 ### Fixed

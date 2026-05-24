@@ -709,18 +709,40 @@ export function registerTools(
     'save_skill',
     {
       description:
-        'Save a reusable procedure as a global skill. Skills are searchable across all users and chats. Use for repeatable workflows, deployment procedures, troubleshooting guides, etc.',
+        'Save a reusable procedure as a global skill, searchable across all users and chats. Skills are owned: the first creator of a slug claims it, and only that creator can overwrite. Pass chat_id + thread_id verbatim from the current notification so the server can verify ownership — never substitute sentinels.',
       inputSchema: z.object({
-        name: z.string().describe('Short skill name (e.g., "deploy-service")'),
+        name: z.string().describe('Short skill name (e.g., "deploy-service"). Normalized to a slug (lowercase, non-alphanumeric → "-"). Must contain at least one alphanumeric character.'),
         description: z.string().describe('One-line description of what this skill does'),
         content: z.string().describe('The full procedure/instructions'),
-        chat_id: z.string().optional().describe('Chat ID where this skill was created (for context)'),
+        chat_id: z.string().describe('Chat ID from the inbound notification — required for caller authorization'),
+        thread_id: z.string().optional().describe('Thread ID from the inbound notification — pass verbatim when present'),
       }),
     },
-    async ({ name, description, content }) => {
-      await memoryStore.saveSkill(name, description, content);
+    async ({ name, description, content, chat_id, thread_id }) => {
+      const auditArgs = { name, chat_id, thread_id };
+      const auth = resolveCaller('save_skill', chat_id, thread_id, auditArgs);
+      if ('error' in auth) return auth.error;
+      const { caller } = auth;
+
+      const result = await memoryStore.saveSkill(name, description, content, {
+        caller,
+        ownerOpenId: identitySession.getOwner(),
+      });
+      if (!result.ok) {
+        void audit('save_skill', caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: result.message }],
+        };
+      }
+      void audit('save_skill', caller, auditArgs, 'ok');
       return {
-        content: [{ type: 'text' as const, text: `Saved skill "${name}": ${description}` }],
+        content: [
+          {
+            type: 'text' as const,
+            text: `${result.action === 'created' ? 'Saved' : 'Updated'} skill "${result.slug}": ${description}`,
+          },
+        ],
       };
     }
   );
