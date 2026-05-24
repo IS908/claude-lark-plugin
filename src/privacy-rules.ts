@@ -58,13 +58,24 @@ export const L1_BLACKLIST_REGEX: { name: string; regex: RegExp }[] = [
   { name: 'github-token', regex: /\b(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{36,}\b/ },
   { name: 'aws-access-key', regex: /\b(AKIA|ASIA)[0-9A-Z]{16}\b/ },
   { name: 'slack-token', regex: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/ },
-  { name: 'anthropic-key', regex: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/ },
+  // R1-audit followup on PR #128: anchor the body shape so plain
+  // English like `sk-ant-cipated-future-events-here` or
+  // `sk-ant-arctic-temperature-anomaly` doesn't false-positive.
+  // Real Anthropic keys have the form `sk-ant-<role><digits>-<payload>`
+  // where role ∈ {api, admin, sid} and digits ∈ \d{2}, e.g. `api03`.
+  { name: 'anthropic-key', regex: /\bsk-ant-(?:api|admin|sid)\d{2}-[A-Za-z0-9_-]{20,}\b/ },
   { name: 'stripe-key', regex: /\b(sk|rk|pk)_(live|test)_[A-Za-z0-9]{20,}\b/ },
   { name: 'jwt', regex: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/ },
-  // Generic token-like fallback: now allows `[-_]` in the body so
-  // hybrid forms not matching the specific patterns above (custom
-  // internal tokens, vendor-specific schemes) still trigger.
-  { name: 'token-like', regex: /\b(?:sk|pk|api|token|secret)[-_][A-Za-z0-9_-]{16,}\b/i },
+  // Generic token-like fallback: allows `[-_]` in the body so hybrid
+  // forms not matching the specific patterns above (custom internal
+  // tokens, vendor-specific schemes) still trigger. R1-audit followup
+  // on PR #128: require the body to contain at least one digit OR
+  // underscore — kills FPs on hyphenated English doc-strings like
+  // `api-documentation-string`, `token-bucket-rate-limiting-algorithm`,
+  // `secret-management-best-practices`. Real tokens essentially always
+  // contain digits or underscore-separated chunks; pure-hyphenated
+  // English compound words don't.
+  { name: 'token-like', regex: /\b(?:sk|pk|api|token|secret)[-_][A-Za-z0-9-]*[_0-9][A-Za-z0-9_-]{14,}\b/i },
 
   { name: 'money-amount', regex: /\b\d+\s*[wk万千]\s*(?:元|块|RMB|CNY|USD)?\b|\$\d{3,}/ },
 ];

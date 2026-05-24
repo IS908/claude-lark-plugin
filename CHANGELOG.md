@@ -17,8 +17,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Fix: 6 new service-specific regexes (anthropic-key, github-token, aws-access-key, slack-token, stripe-key, jwt) with documented real formats. Generic `token-like` widened to accept `[-_]` in the body. `cn-mobile` and `cn-id` both gained the `[-.\s]?` separator pattern that `us-phone` already had.
 
 ### Added
-- 18 new L1 smoke assertions covering all 6 service-specific token formats (with real example payloads — Anthropic, GitHub `ghp_`/`gho_`/`ghs_`, AWS `AKIA`/`ASIA`, Slack `xoxb-`/`xoxp-`, Stripe `sk_live_`/`rk_test_`, JWT 3-segment), separator-tolerant phone/ID variants (space, dash, dot separators at standard grouping boundaries), and 4 negative regression-guards (short `AKI` prefix, `ghp_short` body, plain word "JWT", short numeric code) so future regex weakenings are caught.
-- L1 test count: 10 → 28.
+- 23 new L1 smoke assertions covering all 6 service-specific token formats (with real example payloads — Anthropic, GitHub `ghp_`/`gho_`/`ghs_`, AWS `AKIA`/`ASIA`, Slack `xoxb-`/`xoxp-`, Stripe `sk_live_`/`rk_test_`, JWT 3-segment), separator-tolerant phone/ID variants (space, dash, dot separators at standard grouping boundaries), 4 negative regression-guards (short `AKI` prefix, `ghp_short` body, plain word "JWT", short numeric code), AND 5 hyphenated-English FP regression-guards (R1-audit followup — `api-documentation-string`, `token-bucket-rate-limit-pattern`, `secret-management-best-practices`, `sk-ant-cipated-future-events-here`, `sk-ant-arctic-temperature-anomaly` — all stay gray after the tightening).
+- L1 test count: 10 → 33.
+
+### R1-audit followups (closed in this PR)
+- **`token-like` body tightened** to require at least one digit OR underscore (`[A-Za-z0-9-]*[_0-9][A-Za-z0-9_-]{14,}`). Pre-followup the widened body matched hyphenated English compounds — `api-documentation-string`, `token-bucket-rate-limit-pattern`, `secret-management-best-practices` would all have been forced to private.md, silently splitting the user's public profile. Real tokens essentially always contain digits or underscore-separated chunks; pure-hyphenated English doesn't.
+- **`anthropic-key` regex tightened** to require the role+digits prefix `(api|admin|sid)\d{2}-`. Pre-followup `sk-ant-cipated-future-events-here` and `sk-ant-arctic-temperature-anomaly` (incidental hyphenated English) would have matched.
+
+### Filed as separate followup
+- **#129** — `L1_WHITELIST_KEYWORDS` short ASCII entries (`Go`, `PM`, `TL`) substring-match aggressively. Discovered while writing FP guards: `applyL1('alGOrithm')` returns `public` because of `Go`. Mirror-image of the #90 over-broad PRIVATE rule, but on the PUBLIC side. Pre-existing — not introduced by this PR.
+
+### Operator notes
 
 ### Operator notes
 - Existing on-disk `public.md` files written under v0.13–v1.0.26 may contain L1-class data the broader regex set would have caught. v1.0.27 only protects FUTURE writes — it does NOT retroactively rescan (same model as the v1.0.13 #75 fix). Operators concerned about historical exposure can spot-check `~/.claude/channels/lark/memories/profiles/*/public.md` against the patterns documented in `src/privacy-rules.ts`.

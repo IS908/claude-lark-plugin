@@ -55,6 +55,24 @@ const l1Cases: [string, 'private' | 'public' | 'gray'][] = [
   ['ghp_short', 'gray'],                       // ghp_ prefix but body too short
   ['just talking about JWTs in general', 'gray'], // word "JWT" alone, no payload
   ['code 12345', 'gray'],                      // 5 digits, no phone/id pattern
+
+  // ── R1-audit followup on #76 — hyphenated-English false-positive
+  // guards. Pre-tighten `token-like` would have flagged these as
+  // private (over-broad body); pre-tighten `anthropic-key` would
+  // have flagged sk-ant-<English> as private. After tightening
+  // (digit-or-underscore required in token-like body; sk-ant-
+  // requires role+digits prefix), these stay gray.
+  // Note on input choice: avoid words containing "go" (e.g. algorithm,
+  // category, golang) because the pre-existing L1 whitelist keyword
+  // `Go` (the language) substring-matches them as `public`, masking
+  // the actual `token-like` decision we want to assert. Worth a
+  // separate cleanup PR — the whitelist substring matcher is too
+  // greedy on the short keyword `Go`. Filed for triage.
+  ['See the api-documentation-string for details', 'gray'],
+  ['the token-bucket-rate-limit-pattern', 'gray'],
+  ['read the secret-management-best-practices', 'gray'],
+  ['sk-ant-cipated-future-events-here', 'gray'],          // English -ipated suffix
+  ['sk-ant-arctic-temperature-anomaly', 'gray'],          // English geography phrase
 ];
 
 let l1Passed = 0;
