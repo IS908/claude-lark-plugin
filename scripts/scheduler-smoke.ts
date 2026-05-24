@@ -259,9 +259,132 @@ try {
     if (!sent[0].text.includes('all meeting')) fail(`15: visible label lost from sanitization: ${sent[0].text}`);
   }
   passed++;
+
+  // ── Part D: permanent target-chat errors (v1.0.21, #106) ────────
+  //   When Feishu returns a code in PERMANENT_TARGET_CODES (bot
+  //   kicked / chat archived / permission revoked / etc.), the
+  //   scheduler must:
+  //     1. Auto-pause the job (status='paused' on disk).
+  //     2. DM the owner with the failure reason via open_id.
+  //     3. NOT keep retrying on every tick (would burn tokens forever).
+
+  /** Make a mock client that fails chat_id sends with a Feishu-shaped 230002 error
+   *  and records open_id (DM) sends to the `sent` array. */
+  function permanentTargetMock(sent: SentMessage[], code = 230002) {
+    return {
+      im: {
+        v1: {
+          message: {
+            create: async (args: any) => {
+              const receiveIdType = args?.params?.receive_id_type;
+              if (receiveIdType === 'chat_id') {
+                // Feishu-shaped error — exact shape the SDK returns
+                // (response.data.code / response.data.msg).
+                const err: any = new Error(`Feishu API [${code}]: chat not found`);
+                err.response = { data: { code, msg: 'chat not found' } };
+                throw err;
+              }
+              // open_id (DM) path — record successfully
+              const parsed = JSON.parse(args?.data?.content ?? '{}');
+              sent.push({
+                receive_id_type: receiveIdType,
+                receive_id: args?.data?.receive_id,
+                text: parsed.text ?? '',
+              });
+              return { data: { message_id: 'mock' } };
+            },
+          },
+        },
+      },
+    };
+  }
+
+  // 16. Permanent target error (230002 chat not found) → job auto-paused,
+  //     owner DM'd, NO retry storm next tick.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(permanentTargetMock(sent, 230002));
+    const job = makeJob('permanent-fail-job', new Date(Date.now() - 60_000).toISOString());
+    await (scheduler as any).executeJob(job);
+    if (job.meta.status !== 'paused') {
+      fail(`16: job must be auto-paused on permanent error, got status=${job.meta.status}`);
+    }
+    if (sent.length !== 1) fail(`16: owner must receive exactly 1 DM, got ${sent.length}`);
+    if (sent[0].receive_id_type !== 'open_id') fail(`16: DM must go via open_id, got ${sent[0].receive_id_type}`);
+    if (sent[0].receive_id !== 'ou_owner') fail(`16: DM must reach the job owner`);
+    if (!sent[0].text.includes('AUTO-PAUSED')) fail(`16: DM text must explain the auto-pause`);
+    if (!sent[0].text.includes('230002')) fail(`16: DM text must include the error code`);
+    if (!sent[0].text.includes('permanent-fail-job')) fail(`16: DM text must include the job id`);
+    passed++;
+  }
+
+  // 17. Each PERMANENT_TARGET_CODES code triggers auto-pause. Spot-check
+  //     several to guard against a future regression that narrows the
+  //     classifier. 230020 = no permission, 99991672 = permission denied,
+  //     190005 = chat archived, 9499 = receive_id invalid.
+  {
+    for (const code of [230020, 99991672, 190005, 9499]) {
+      const sent: SentMessage[] = [];
+      const scheduler = makeScheduler(permanentTargetMock(sent, code));
+      const job = makeJob(`code-${code}-job`, new Date(Date.now() - 60_000).toISOString());
+      await (scheduler as any).executeJob(job);
+      if (job.meta.status !== 'paused') {
+        fail(`17: code ${code} must trigger auto-pause, got ${job.meta.status}`);
+      }
+      if (sent.length !== 1) fail(`17: code ${code} must DM owner, got ${sent.length} sends`);
+    }
+    passed++;
+  }
+
+  // 18. Empty created_by → auto-paused, NO DM attempted (no owner),
+  //     no throw. Mirrors test 13's stale-skip behavior.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(permanentTargetMock(sent));
+    const job = makeJob('no-owner-permanent', new Date(Date.now() - 60_000).toISOString(), '');
+    await (scheduler as any).executeJob(job);
+    if (job.meta.status !== 'paused') fail(`18: empty-owner job must still auto-pause`);
+    if (sent.length !== 0) fail(`18: no DM should be sent when created_by is empty`);
+    passed++;
+  }
+
+  // 19. Non-permanent-but-non-retryable error (230001 param error) →
+  //     NOT auto-paused, last_error recorded, no DM. Regression guard
+  //     against the auto-pause classifier accidentally widening to all
+  //     non-retryable codes. (230001 is in isRetryableError's explicit
+  //     non-retryable list but NOT in PERMANENT_TARGET_CODES — exactly
+  //     the case that should fail loudly without auto-pausing.)
+  {
+    const sent: SentMessage[] = [];
+    const client = {
+      im: {
+        v1: {
+          message: {
+            create: async (args: any) => {
+              const receiveIdType = args?.params?.receive_id_type;
+              if (receiveIdType === 'chat_id') {
+                const err: any = new Error('Feishu API [230001]: param error');
+                err.response = { data: { code: 230001, msg: 'param error' } };
+                throw err;
+              }
+              sent.push({ receive_id_type: receiveIdType, receive_id: args?.data?.receive_id, text: '' });
+              return { data: { message_id: 'mock' } };
+            },
+          },
+        },
+      },
+    };
+    const scheduler = makeScheduler(client);
+    const job = makeJob('non-permanent-fail-job', new Date(Date.now() - 60_000).toISOString());
+    await (scheduler as any).executeJob(job);
+    if (job.meta.status === 'paused') fail(`19: code 230001 must NOT auto-pause (not in PERMANENT_TARGET_CODES)`);
+    if (job.runtime.last_error == null) fail(`19: non-retryable error must record last_error`);
+    if (sent.length !== 0) fail(`19: non-permanent error must NOT DM owner`);
+    passed++;
+  }
 } finally {
   (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }
 
-console.log(`scheduler smoke: ${passed}/15 PASS`);
+console.log(`scheduler smoke: ${passed}/19 PASS`);

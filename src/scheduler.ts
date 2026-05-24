@@ -76,6 +76,40 @@ const RETRYABLE_NETWORK_ERRORS = new Set([
 /** HTTP status codes that warrant a retry. */
 const RETRYABLE_HTTP_CODES = new Set([429, 500, 502, 503, 504]);
 
+/**
+ * Feishu API error codes indicating a TARGET-CHAT is permanently
+ * unreachable from the bot's POV: kicked from group, chat dissolved/
+ * archived, no permission to send. These are NOT transient — retrying
+ * on the next tick would just fail again forever, spamming logs and
+ * burning tokens (#106).
+ *
+ * When a cronjob hits one of these, the scheduler auto-pauses the job
+ * and DMs the owner so they can decide whether to re-target or delete.
+ *
+ * 99991672 — permission denied (also marked non-retryable in isRetryableError)
+ * 230002 / 230020 — chat not found / no permission to message this chat
+ * 9499     — receive_id format invalid / target deactivated
+ * 190005   — chat archived/disabled
+ */
+export const PERMANENT_TARGET_CODES = new Set<number>([
+  99991672,
+  230002,
+  230020,
+  9499,
+  190005,
+]);
+
+/** Extract a numeric Feishu API code from a thrown error, or null. */
+export function getFeishuApiCode(err: any): number | null {
+  const code = err?.response?.data?.code ?? err?.data?.code;
+  return typeof code === 'number' ? code : null;
+}
+
+/** Extract a human-readable Feishu API message from a thrown error. */
+export function getFeishuApiMsg(err: any): string {
+  return err?.response?.data?.msg ?? err?.data?.msg ?? (err?.message ?? String(err));
+}
+
 function isRetryableError(err: any): boolean {
   // Network-level errors (Node.js syscall errors)
   if (err?.code && RETRYABLE_NETWORK_ERRORS.has(err.code)) return true;
@@ -301,17 +335,75 @@ export class JobScheduler {
       }
     }
 
-    // All retries exhausted or permanent error — record failure
+    // All retries exhausted or permanent error — record failure.
     job.runtime.last_run_at = new Date(startTime).toISOString();
     job.runtime.next_run_at = computeNextRun(job.meta.schedule);
     job.runtime.last_error = lastErr?.message ?? String(lastErr);
 
-    const retryNote = isRetryableError(lastErr)
-      ? ` (exhausted ${MAX_RETRIES} retries)`
-      : ' (non-retryable)';
-    console.error(`[scheduler] Job ${job.meta.id} failed${retryNote}: ${job.runtime.last_error}`);
+    // #106 fix: detect permanent target-chat errors (bot kicked / chat
+    // archived / etc) and AUTO-PAUSE the job so it stops re-firing every
+    // tick. Pre-fix, the job stayed `active`; every scheduled run hit
+    // the same error, wasted retries, spammed stderr, and consumed
+    // tokens for type=prompt cronjobs that never produced output.
+    // The owner gets a one-shot DM with the failure reason so they
+    // can decide whether to re-target, re-create, or delete the job.
+    const apiCode = getFeishuApiCode(lastErr);
+    const isPermanentTarget = apiCode !== null && PERMANENT_TARGET_CODES.has(apiCode);
+    if (isPermanentTarget) {
+      job.meta.status = 'paused';
+      console.error(
+        `[scheduler] Job ${job.meta.id} AUTO-PAUSED — target chat ${job.meta.target_chat_id} ` +
+        `permanently unreachable (Feishu code ${apiCode}: ${getFeishuApiMsg(lastErr)}). ` +
+        `Owner ${job.meta.created_by} notified via DM (best-effort).`,
+      );
+    } else {
+      const retryNote = isRetryableError(lastErr)
+        ? ` (exhausted ${MAX_RETRIES} retries)`
+        : ' (non-retryable)';
+      console.error(`[scheduler] Job ${job.meta.id} failed${retryNote}: ${job.runtime.last_error}`);
+    }
 
     await writeJob(job);
+
+    // Best-effort owner notification AFTER the file is persisted so a
+    // DM failure (owner unreachable too) doesn't lose the paused-state
+    // write. Throws are swallowed — recovery must not abort.
+    if (isPermanentTarget) {
+      await this.notifyOwnerOnTargetFail(job, apiCode!, getFeishuApiMsg(lastErr));
+    }
+  }
+
+  /**
+   * Best-effort DM to the cronjob owner when the target chat becomes
+   * permanently unreachable (#106). Mirrors `notifyStaleSkip`'s shape
+   * but skips the chat-tier delivery (we already know the chat is the
+   * problem) — goes straight to owner DM. Silent if owner is unset
+   * (legacy job without `created_by`) — operator will only see the
+   * stderr line from executeJob.
+   */
+  private async notifyOwnerOnTargetFail(job: JobFile, code: number, reason: string): Promise<void> {
+    if (!job.meta.created_by) return;
+    const text = sanitizeOutboundText(
+      `⚠️ Scheduled job "${job.meta.id}" was AUTO-PAUSED after failing to deliver to chat ` +
+      `${job.meta.target_chat_id} (Feishu code ${code}: ${reason}). ` +
+      `Resume it with update_job after fixing the target (re-invite the bot, or change target_chat_id), ` +
+      `or delete with delete_job if it's no longer needed.`,
+    );
+    try {
+      await this.client.im.v1.message.create({
+        params: { receive_id_type: 'open_id' },
+        data: {
+          receive_id: job.meta.created_by,
+          content: JSON.stringify({ text }),
+          msg_type: 'text',
+        },
+      });
+    } catch (err) {
+      console.error(
+        `[scheduler] notifyOwnerOnTargetFail: DM to ${job.meta.created_by} also failed for ${job.meta.id}:`,
+        err,
+      );
+    }
   }
 
   /**
