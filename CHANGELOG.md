@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.26] - 2026-05-25
+
+### Fixed
+- **`addL2Rule` validates rule quality before write** (#90 — **MEDIUM, silent privacy-classifier corruption**). Pre-v1.0.26 `forget_memory(promote_to_rule=true)` appended ANY removed line's text to `privacy-rules.md` under `## Always private` with no length / substance check. A `forget_memory` on a 3-char common word like "工程师", "the", or "了" would write that as a private rule → `extractL2PrivatePhrases` (used by legacy-profile migration AND distillation prompt) would then mark every line containing those characters as private. End result: profile classification quietly over-broadened over time, with no operator-visible signal until they noticed legitimate public content sinking to private.md.
+
+  Fix: new `validateL2Rule(text)` heuristic in `src/privacy-rules.ts` — rules must have trim length >= 6 AND contain at least one run of 4+ Letter/Number code-points (Unicode-aware). REJECTS: `the` (3) / `了` (1) / `工程师` (3) / `家庭住址` (4) / `生日礼物` (4) by length; `!@#$%^&*` / `a a a a` by no-substantive-word. ACCEPTS: `salary` (6, single run) / `salary information` (18, multi-run) / `涉及人际冲突的表述` (8 CJK) / `kevin@acme.io` (13, runs `kevin`+`acme`+`io`).
+
+  `addL2Rule` signature changed: returns `Promise<AddL2RuleResult>` (`{added: true}` | `{added: false, reason: 'too-short' | 'no-substantive-word'}`) instead of `Promise<void>`. `forget_memory` handler branches on the result — rule rejection produces a clear `Rule promotion SKIPPED: "X" is too short...` message in the reply (the underlying profile-line removal still succeeds).
+
+  Manual operator edits to `privacy-rules.md` are NOT gated by this validation — operators authoring rules deliberately remain in control. The gate sits only at the programmatic `addL2Rule` write boundary.
+
+### Added
+- 1 new transparency-smoke assertion (suite 11 → 12) covering: 4 valid rule shapes accepted; 7 invalid shapes rejected with correct `reason`; end-to-end addL2Rule write-side-effect SKIPS the file mutation on rejection (verifies file content unchanged); end-to-end good case still writes correctly. Test #6 also tightened to check `addL2Rule`'s tagged result explicitly so future signature regressions are caught immediately.
+- New exports from `src/privacy-rules.ts`: `validateL2Rule`, `L2RuleValidationResult` type, `AddL2RuleResult` type.
+
+### R2-audit followups (closed in this PR)
+- **`audit.log` records `promote_result`**: previously the audit line only carried `promote_to_rule=true|false` (the REQUEST). Operators couldn't distinguish "rule was added" from "rule was rejected by validation" from "addL2Rule threw" when scanning logs. New field values: `not-requested` / `added` / `skipped:too-short` / `skipped:no-substantive-word` / `error:<msg>`.
+- **`forget_memory` tool description mentions the validation gate** so Claude reading the schema isn't surprised by the SKIPPED reply.
+- **Test #6 tightened**: pre-followup the test only checked the file CONTENT after `addL2Rule`; a signature regression that silently rejected the rule would have passed (the assertion happens to still find the rule from a prior test run in the same file). Now explicitly asserts `r.added === true`.
+
+### Operator notes
+- A `forget_memory(promote_to_rule=true)` on a short or generic phrase now returns the line "Rule promotion SKIPPED" with a hint pointing to manual editing of `privacy-rules.md`. The profile-line removal itself still succeeds — only the auto-rule is rejected.
+- Existing rules in `privacy-rules.md` from pre-v1.0.26 are NOT retroactively validated or removed. If you suspect over-broad past additions are causing classifier issues, open the file at `~/.claude/channels/lark/privacy-rules.md` and review/delete short generic entries manually.
+
 ## [1.0.25] - 2026-05-25
 
 ### Fixed

@@ -150,16 +150,83 @@ export function extractL2PrivatePhrases(markdown: string): string[] {
 }
 
 /**
+ * Validate that a candidate L2 rule is concrete enough not to poison
+ * the substring matcher (#90). Returns `{ ok: true }` for acceptable
+ * rules, `{ ok: false, reason }` for rules that would over-match.
+ *
+ * Two checks:
+ * - `too-short`: trim length must be >= 6 characters.
+ * - `no-substantive-word`: must contain at least one Unicode run of
+ *   4+ Letter/Number code-points. Catches all-punctuation/whitespace
+ *   inputs that clear the length floor (e.g. `"!?!?!?"`, `"a a a a"`).
+ *
+ * Examples:
+ *
+ *   REJECTED (too-short, len < 6):
+ *     "the" (3) · "了" (1) · "工程师" (3)
+ *     "我的生日" (4) · "家庭住址" (4) · "生日礼物" (4)
+ *
+ *   REJECTED (no-substantive-word, len >= 6 but no 4+ run):
+ *     "!@#$%^&*" · "a a a a" · "x x x x x x x"
+ *
+ *   ACCEPTED:
+ *     "salary" (6, single 6-run) · "salary information" (18, multi-run)
+ *     "涉及人际冲突的表述" (8 CJK) · "medical history" (15)
+ *     "kevin@acme.io" (13, runs `kevin`/`acme`/`io`)
+ *
+ * The 6-char floor is a deliberate trade-off: it rejects some
+ * legitimate short CJK compounds (`家庭住址` would be private) in
+ * exchange for catching the catastrophic short-common-word case
+ * (`工程师` would match every engineering-related line forever).
+ * Operators who want a short rule can edit `privacy-rules.md`
+ * directly — this gate is only on the programmatic write boundary.
+ *
+ * Exported for testing.
+ */
+export type L2RuleValidationResult =
+  | { ok: true }
+  | { ok: false; reason: 'too-short' | 'no-substantive-word' };
+
+export function validateL2Rule(text: string): L2RuleValidationResult {
+  const t = text.trim();
+  if (t.length < 6) return { ok: false, reason: 'too-short' };
+  if (!/[\p{Letter}\p{Number}]{4,}/u.test(t)) {
+    return { ok: false, reason: 'no-substantive-word' };
+  }
+  return { ok: true };
+}
+
+/**
  * Add a rule line to the L2 file under the given section. Creates the file
  * if missing; creates the section header if missing. New rules are inserted
  * at the TOP of their section (newest-first, changelog-style) so users who
  * open the file see their recent additions immediately.
+ *
+ * v1.0.26 (#90): now validates `rule` against {@link validateL2Rule}
+ * before writing. Rejected rules return `{ added: false, reason }`;
+ * the file is not modified. This defends against `forget_memory(
+ * promote_to_rule=true)` self-learning over-broadening — pre-v1.0.26,
+ * a single `forget_memory` on a 3-char common word like "工程师"
+ * would write that as a private rule, causing the substring matcher
+ * in `extractL2PrivatePhrases` to mark every line containing those
+ * three characters as private during distillation and legacy-profile
+ * migration. Manual operator edits to `privacy-rules.md` can still
+ * add ANY rule (this gate is at the programmatic write boundary
+ * only) — operators authoring rules deliberately remain in control.
  */
+export type AddL2RuleResult =
+  | { added: true }
+  | { added: false; reason: 'too-short' | 'no-substantive-word' };
+
 export async function addL2Rule(
   rule: string,
   section: 'Always private' | 'Always public',
   overridePath?: string,
-): Promise<void> {
+): Promise<AddL2RuleResult> {
+  const validity = validateL2Rule(rule);
+  if (!validity.ok) {
+    return { added: false, reason: validity.reason };
+  }
   const path = resolveL2Path(overridePath);
   await mkdir(dirname(path), { recursive: true });
   const existing = existsSync(path) ? await readFile(path, 'utf8') : '';
@@ -178,4 +245,5 @@ export async function addL2Rule(
   next = `${next.slice(0, insertAt)}- ${rule}\n${next.slice(insertAt)}`;
 
   await writeFile(path, next, 'utf8');
+  return { added: true };
 }
