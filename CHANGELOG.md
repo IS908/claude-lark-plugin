@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.28] - 2026-05-25
+
+### Fixed
+- **`create_job` rejects empty schedule + validates `every Nm` / `every Nh` for divisibility** (#95 + #79 — **HIGH spam-DoS + silent wrong-interval**). Two pre-fix failure modes in the schedule-parsing path:
+  - **#95 empty schedule → every-minute spam**: `z.string()` on the tool boundary accepted `''`; `expandSchedule('')` fell through to the raw-cron path; `CronExpressionParser.parse('')` SILENTLY produced every-minute behavior (`* * * * *` semantics). For `type=message` jobs that meant chat spam every 60 seconds; for `type=prompt` jobs that burned a full Claude turn every 60 seconds. Quickly observable but already-delivered N times before the operator could delete.
+  - **#79 `every Nm` / `every Nh` for non-divisor N produced uneven intervals**: cron `step` semantics are "value % N == 0", not "every N steps". `every 90m` → `*/90 * * * *` → minute=0 satisfies only at the top of each hour → fires every HOUR not every 90m. `every 7h` → hours {0,7,14,21} → intervals 7,7,7,**3**. Human label and actual behavior diverged silently.
+
+  Fix:
+  - **Zod boundary**: `create_job.schedule` now `.min(1).max(200).refine(s => s.trim().length > 0)`. Empty / whitespace-only rejected with a clear message.
+  - **`expandSchedule` defense in depth**: throws on empty/whitespace input (closes the gap if a future caller bypasses Zod). Throws on `every Nm` with N outside [1,59] or N that doesn't divide 60 (valid set: {1,2,3,4,5,6,10,12,15,20,30}). Throws on `every Nh` with N outside divisors of 24 (valid set: {1,2,3,4,6,8,12}). All errors include the valid-set inline so the operator (or Claude reading the failure) knows the exact fix.
+  - **Raw-cron shape guard**: fallback path rejects expressions that aren't 5 or 6 space-separated fields — catches `0 9 * *` (4 fields, often a typo) and similar that cron-parser would otherwise accept loosely. The 5/6 field accept set matches cron-parser's documented schema (5 = standard, 6 = with leading seconds field).
+
+### Added
+- 9 new job-smoke assertions (tests 17–25) covering: empty + whitespace-only rejection, `every Nm` out-of-range and non-divisor rejection, `every Nh` non-divisor rejection, exhaustive accept-set for both `every Nm` (11 divisors of 60) and `every Nh` (7 divisors of 24), 4-field cron shape rejection, 6-field cron passthrough preserved.
+
+### Operator notes
+- Pre-v1.0.28 jobs already in `~/.claude/channels/lark/jobs/` are NOT retroactively re-validated on startup — they continue to fire on whatever cron they were created with. If you suspect an existing job has the `every Nm` divisor bug (#79), check its `meta.schedule` and re-create via `update_job` if the actual cadence differs from the `meta.schedule_human` label.
+
 ## [1.0.27] - 2026-05-25
 
 ### Fixed

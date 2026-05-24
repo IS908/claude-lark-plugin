@@ -67,23 +67,76 @@ const DAY_MAP: Record<string, string> = {
  * Expand a human-friendly schedule alias to a standard 5-field cron expression.
  * If the input is already a valid cron expression, returns it as-is.
  * Returns { cron, human } where human is the display label.
+ *
+ * v1.0.28 (#95, #79): rejects empty input and validates the `every Nm`
+ * / `every Nh` aliases for divisibility. Pre-fix:
+ *
+ *   - empty input → cron-parser silently produced an every-minute
+ *     schedule (#95) — spam.
+ *   - `every 90m` → step-N=90 in the 0..59 minute field. Cron `step`
+ *     semantics are "value % N == 0", not "every N steps", so only
+ *     minute=0 satisfies — triggers every HOUR, not every 90m as the
+ *     human label claims (#79).
+ *   - `every 7h` → hours {0,7,14,21}, intervals 7,7,7,**3** instead
+ *     of uniformly 7. Same uneven behavior for any N not dividing
+ *     60 (minutes) or 24 (hours).
+ *
+ * Now: empty / whitespace-only input throws with a clear message;
+ * `every Nm` requires 1≤N≤59 AND N divides 60; `every Nh` requires
+ * N in {1,2,3,4,6,8,12} (divisors of 24). Cron literals (5 or 6
+ * space-separated fields) are still accepted as the escape hatch.
  */
 export function expandSchedule(input: string): { cron: string; human: string } {
   const trimmed = input.trim().toLowerCase();
+  // Empty / whitespace-only input: would otherwise reach
+  // CronExpressionParser.parse('') below, which silently produces
+  // every-minute behavior (#95). Reject early with a clear message.
+  if (!trimmed) {
+    throw new Error(
+      "schedule cannot be empty. Use a cron expression (e.g. '0 9 * * 1-5') or an alias " +
+      "(e.g. 'every 30m', 'every 2h', 'daily at 09:00', 'weekdays at 09:00', " +
+      "'weekly on mon at 09:00').",
+    );
+  }
   let result: { cron: string; human: string } | null = null;
 
-  // every Nm
+  // every Nm — divisibility-check (#79): cron-parser interprets
+  // `*/N` as "value ≡ 0 mod N", not "every N steps", so N must
+  // divide its field's modulus for uniform spacing. For minutes
+  // (field range 0-59), only N | 60 yields uniform intervals.
   let match = trimmed.match(/^every\s+(\d+)\s*m(?:in(?:ute)?s?)?$/);
   if (match) {
-    const n = match[1];
+    const n = parseInt(match[1], 10);
+    if (n < 1 || n > 59) {
+      throw new Error(
+        `'every Nm' requires 1 ≤ N ≤ 59; got ${n}. ` +
+        `For larger intervals use 'every Nh' or a raw cron expression like '0 */2 * * *'.`,
+      );
+    }
+    if (60 % n !== 0) {
+      throw new Error(
+        `'every ${n}m' produces UNEVEN intervals — cron-parser reads */${n} in the 0-59 minute field as ` +
+        `"minute ≡ 0 mod ${n}", not "every ${n} minutes". Use N ∈ {1,2,3,4,5,6,10,12,15,20,30} ` +
+        `or write the cron literal explicitly (e.g. '*/${n} * * * *' if that's actually what you mean).`,
+      );
+    }
     result = { cron: `*/${n} * * * *`, human: `every ${n}m` };
   }
 
-  // every Nh
+  // every Nh — divisibility-check (#79): same as above for the
+  // hours field (0-23). Only N ∈ {1,2,3,4,6,8,12} yields uniform
+  // intervals.
   if (!result) {
     match = trimmed.match(/^every\s+(\d+)\s*h(?:ours?)?$/);
     if (match) {
-      const n = match[1];
+      const n = parseInt(match[1], 10);
+      const validHours = [1, 2, 3, 4, 6, 8, 12];
+      if (!validHours.includes(n)) {
+        throw new Error(
+          `'every ${n}h' produces UNEVEN intervals — 24 hours is not divisible by ${n}. ` +
+          `Use N ∈ {${validHours.join(', ')}} or write the cron literal explicitly.`,
+        );
+      }
       result = { cron: `0 */${n} * * *`, human: `every ${n}h` };
     }
   }
@@ -118,8 +171,23 @@ export function expandSchedule(input: string): { cron: string; human: string } {
     }
   }
 
-  // Fallback: treat input as a raw cron expression
+  // Fallback: treat input as a raw cron expression. Defense in depth
+  // (#95): basic shape check — cron literals are 5 fields (standard)
+  // or 6 fields (with seconds prefix); anything else is a malformed
+  // alias / typo that cron-parser may silently accept (e.g. empty
+  // string, partial alias). The cron-parser .parse() below will also
+  // reject most malformed inputs but is permissive at certain edges.
   if (!result) {
+    const fields = trimmed.split(/\s+/).filter(Boolean);
+    if (fields.length !== 5 && fields.length !== 6) {
+      throw new Error(
+        `schedule "${input}" is not a recognized alias and is not a valid cron expression ` +
+        `(expected 5 or 6 space-separated fields, got ${fields.length}). ` +
+        `Aliases: 'every Nm' (N∈{1,2,3,4,5,6,10,12,15,20,30}), 'every Nh' (N∈{1,2,3,4,6,8,12}), ` +
+        `'daily at HH:MM', 'weekdays at HH:MM', 'weekly on <day> at HH:MM'. ` +
+        `Or write a raw 5-field cron like '0 9 * * 1-5'.`,
+      );
+    }
     result = { cron: trimmed, human: trimmed };
   }
 

@@ -1143,8 +1143,11 @@ export function registerTools(
         type: z.enum(['prompt', 'message']).describe('Job type'),
         schedule: z
           .string()
+          .min(1, 'schedule cannot be empty')
+          .max(200, 'schedule must be ≤ 200 chars')
+          .refine((s) => s.trim().length > 0, { message: 'schedule must contain non-whitespace' })
           .describe(
-            'Cron expression or alias: "0 9 * * 1-5", "every 30m", "daily at 09:00", "weekdays at 09:00", "weekly on mon at 09:00"'
+            'Cron expression or alias: "0 9 * * 1-5", "every 30m", "daily at 09:00", "weekdays at 09:00", "weekly on mon at 09:00". Empty/whitespace-only is rejected (#95) — pre-v1.0.28 it was silently treated as every-minute and spammed the chat.'
           ),
         prompt: z
           .string()

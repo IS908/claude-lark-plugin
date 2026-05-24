@@ -90,6 +90,88 @@ if (e8.cron !== '0 17 * * 5') fail(`expand weekly fri: got ${e8.cron}`);
 const e9 = expandSchedule('weekly on sun at 08:00');
 if (e9.cron !== '0 8 * * 0') fail(`expand weekly sun: got ${e9.cron}`);
 
+// ── v1.0.28 (#95, #79) — input validation ──
+
+// 17. expandSchedule — empty input throws (#95)
+//     Pre-fix, cron-parser silently produced '* * * * *' (every-minute spam).
+try {
+  expandSchedule('');
+  fail('17: expand empty must throw');
+} catch (err: any) {
+  if (!/cannot be empty/i.test(err.message)) fail(`17: wrong error: ${err.message}`);
+}
+
+// 18. expandSchedule — whitespace-only input throws (#95)
+//     Pre-fix, '   ' threw a confusing "Constraint error" from cron-parser
+//     (asymmetric vs '' which silently passed). Now both reject with the
+//     same clear message.
+try {
+  expandSchedule('   ');
+  fail('18: whitespace-only must throw');
+} catch (err: any) {
+  if (!/cannot be empty/i.test(err.message)) fail(`18: wrong error: ${err.message}`);
+}
+
+// 19. expandSchedule — 'every Nm' rejects N > 59 (#79)
+//     Pre-fix, 'every 90m' became '*/90 * * * *' which cron-parser reads
+//     as "minute % 90 == 0" → only minute=0 → every HOUR.
+try {
+  expandSchedule('every 90m');
+  fail('19: every 90m must throw');
+} catch (err: any) {
+  if (!/1 ≤ N ≤ 59/.test(err.message)) fail(`19: wrong error: ${err.message}`);
+}
+
+// 20. expandSchedule — 'every Nm' rejects N that doesn't divide 60 (#79)
+//     'every 7m' → '*/7 * * * *' → minutes {0,7,14,21,28,35,42,49,56},
+//     interval 7,7,7,7,7,7,7,7,**4** — uneven.
+try {
+  expandSchedule('every 7m');
+  fail('20: every 7m must throw');
+} catch (err: any) {
+  if (!/UNEVEN intervals/.test(err.message)) fail(`20: wrong error: ${err.message}`);
+}
+
+// 21. expandSchedule — 'every Nh' rejects N that doesn't divide 24 (#79)
+//     'every 5h' → '0 */5 * * *' → hours {0,5,10,15,20} → intervals
+//     5,5,5,5,**4** — uneven.
+try {
+  expandSchedule('every 5h');
+  fail('21: every 5h must throw');
+} catch (err: any) {
+  if (!/UNEVEN intervals/.test(err.message)) fail(`21: wrong error: ${err.message}`);
+}
+
+// 22. expandSchedule — 'every Nh' accepts every valid divisor of 24
+//     This catches a regression that narrows the valid set.
+for (const n of [1, 2, 3, 4, 6, 8, 12]) {
+  const r = expandSchedule(`every ${n}h`);
+  if (r.cron !== `0 */${n} * * *`) fail(`22: every ${n}h: got ${r.cron}`);
+}
+
+// 23. expandSchedule — 'every Nm' accepts every valid divisor of 60
+for (const n of [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30]) {
+  const r = expandSchedule(`every ${n}m`);
+  if (r.cron !== `*/${n} * * * *`) fail(`23: every ${n}m: got ${r.cron}`);
+}
+
+// 24. expandSchedule — fallback rejects malformed cron shape (#95 defense)
+//     "0 9 * *" is only 4 fields — cron-parser is occasionally permissive
+//     on partial input. Reject explicitly upstream.
+try {
+  expandSchedule('0 9 * *');
+  fail('24: 4-field cron must throw on shape check');
+} catch (err: any) {
+  if (!/expected 5 or 6 space-separated fields/.test(err.message)) {
+    fail(`24: wrong error: ${err.message}`);
+  }
+}
+
+// 25. expandSchedule — 6-field cron (with seconds) still accepted
+//     cron-parser supports a 6th leading second field. Don't break that.
+const r6 = expandSchedule('0 0 9 * * 1-5');
+if (r6.cron !== '0 0 9 * * 1-5') fail(`25: 6-field passthrough: got ${r6.cron}`);
+
 // 17. expandSchedule — human field preserved
 if (e1.human !== 'every 30m') fail(`expand human: got ${e1.human}`);
 if (e2.human !== 'daily at 09:00') fail(`expand human daily: got ${e2.human}`);
