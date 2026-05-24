@@ -77,11 +77,15 @@ Classification rules (apply in order; higher priority wins):
    - chatType=p2p → unknown facts default to private (never voluntarily shared beyond 1:1).
 5. When truly uncertain: choose private.
 
-Return the JSON object inline (no code fence). Then call save_memory exactly ONCE with type="profile_tiered" and pass the JSON object as the content string:
+Return the JSON object inline (no code fence). Then call save_memory once with type="profile_tiered" and pass the JSON object as the content string:
 
   save_memory(type="profile_tiered", content=<the JSON string>, reason=<why>, chat_id=<current>)
 
-The server parses the JSON, applies the L1 privacy safety net (anything classified public that matches a regex/keyword rule like phone numbers, IDs, credentials, salary keywords is forced into private), and atomically writes both tier files. Do NOT make two separate save_memory(type="profile") calls — that pre-v1.0.17 dual-call pattern races with the L1 safety net and silently drops the redirected lines (#97). Empty arrays are fine; the server truncates the corresponding tier file.`;
+The server parses the JSON, applies the L1 privacy safety net (anything classified public that matches a regex/keyword rule like phone numbers, IDs, credentials, salary keywords is forced into private), and writes the two tier files via sequential saveProfile calls. The writes are NOT a single atomic transaction — a concurrent getProfile in the window between them sees public-new + private-old — but each individual write IS atomic, and per-chat queueing serializes any other save_memory call on the same user.
+
+Do NOT make two separate save_memory(type="profile") calls. The pre-v1.0.17 dual-call pattern (public-replace then private-replace) races with the L1 safety net inside saveProfile: the first call's L1 redirect appends sensitive lines to private.md, then the second call's replace silently wipes them (#97).
+
+If the call returns isError (malformed JSON / non-array shape), fix the JSON and retry once. Both arrays empty is a NO-OP (existing tiers preserved) — emit at least one array element if you want to commit a real update.`;
 }
 
 /**

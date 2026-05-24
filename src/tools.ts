@@ -921,6 +921,15 @@ export function registerTools(
             .map((line) => (line.startsWith('-') ? line : `- ${line}`))
             .join('\n') +
           (arr.some((s) => oneLine(s).length > 0) ? '\n' : '');
+        // The two writes are sequential, NOT a single atomic transaction.
+        // A concurrent getProfile call in the window between them would
+        // see public-new + private-old (sub-ms window on a healthy
+        // filesystem). Per-chat queueing (src/queue.ts) serializes any
+        // other save_memory on the same user, so no save can race here,
+        // but read paths (memory enrichment in src/channel.ts) are
+        // unqueued. Tracked alongside the saveProfile TOCTOU at #54;
+        // a true atomic-pair write would need a per-user lock or a
+        // temp-dir-and-rename of profiles/<userId>/.
         await memoryStore.saveProfile(caller, fmt(tiered.public), 'public', 'replace');
         await memoryStore.saveProfile(caller, fmt(tiered.private), 'private', 'replace');
         void audit('save_memory', caller, auditArgs, 'ok');
