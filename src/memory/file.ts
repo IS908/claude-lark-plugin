@@ -256,6 +256,81 @@ export class MemoryStore {
     mode: 'append' | 'replace' = 'append',
   ): Promise<void> {
     await this.migrateIfNeeded(userId);
+
+    // L1 safety net (#75). CLAUDE.md promises a 3-layer defense
+    // (L1 > L2 > L3) for the privacy classifier, but pre-v1.0.13 the L1
+    // check only fired during legacy-profile migration — never on normal
+    // save_memory writes. The `parseTieredProfile` helper that was meant
+    // to be the L1 gate at write time is exported but no production path
+    // calls it (Claude calls save_memory directly with the LLM-chosen
+    // tier, fully trusted).
+    //
+    // Per-line server-side check: when the caller asks for `public`,
+    // applyL1 rejects any line whose content matches a blacklist regex
+    // or keyword (phone, ID, token, password, salary, ...) and forces
+    // it into the `private` tier instead. private-tier writes pass
+    // through unchanged — already private.
+    //
+    // Scope note: the check is intentionally PER-LINE. A bad actor (or
+    // a creative LLM) could in theory split sensitive content across
+    // lines so no single line matches an L1 regex (e.g. "the phone\n139\n
+    // 12345678"). The threat model here assumes a cooperative model,
+    // not an adversarial one — a per-line approach matches how
+    // distillation actually emits facts (one fact per bullet line).
+    // Future hardening would need cross-line context analysis.
+    //
+    // Replace semantics: when mode='replace' and the redirect splits
+    // content across tiers, public is still REPLACED (with the safe
+    // subset, possibly empty) — honoring the caller's intent to rewrite
+    // public from scratch. The redirected unsafe lines are APPENDED to
+    // private, because we only have the redirected subset, not the
+    // existing private content to safely replace it with.
+    if (tier === 'public') {
+      const lines = content.split('\n');
+      const safe: string[] = [];
+      const unsafe: string[] = [];
+      for (const line of lines) {
+        if (line.trim() && applyL1(line) === 'private') {
+          unsafe.push(line);
+        } else {
+          safe.push(line);
+        }
+      }
+      if (unsafe.length > 0) {
+        console.error(
+          `[memory] L1 safety net: redirected ${unsafe.length} line(s) from public to private ` +
+          `for ${userId} (LLM-classified public but L1 matched private rules — e.g. phone, ID, token, salary).`,
+        );
+        await this._writeProfileTier(userId, 'private', unsafe.join('\n'), 'append');
+        // Write the safe subset to public honoring caller's mode.
+        // If mode='replace' and safe is effectively empty, we still
+        // explicitly replace (to empty) so the caller's intent of
+        // "overwrite public" is honored. For append + empty safe, skip
+        // the call (no-op write anyway).
+        const safeContent = safe.join('\n');
+        if (mode === 'replace' || safeContent.trim()) {
+          await this._writeProfileTier(userId, 'public', safeContent, mode);
+        }
+        return;
+      }
+    }
+
+    await this._writeProfileTier(userId, tier, content, mode);
+  }
+
+  /**
+   * Internal: write a profile tier file. Extracted from saveProfile so
+   * the L1 safety net (#75) can split a single write across both tiers
+   * without duplicating the mkdir / merge / write logic.
+   *
+   * Callers MUST have already run {@link migrateIfNeeded}.
+   */
+  private async _writeProfileTier(
+    userId: string,
+    tier: Tier,
+    content: string,
+    mode: 'append' | 'replace',
+  ): Promise<void> {
     const dir = this.profileDir(userId);
     await fs.mkdir(dir, { recursive: true });
     const filePath = this.profileTierPath(userId, tier);

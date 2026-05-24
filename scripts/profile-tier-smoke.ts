@@ -333,6 +333,109 @@ passed++;
   passed++;
 }
 
+// ── 16. L1 safety net redirects public-tier writes containing private patterns (#75) ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-l1-redirect-'));
+  const s = new MemoryStore(r);
+  // LLM mis-classified a phone number as public → save_memory(tier="public")
+  await s.saveProfile('ou_l1a', '- phone is 13912345678', 'public');
+  const pubPath = join(r, 'profiles', 'ou_l1a', 'public.md');
+  const privPath = join(r, 'profiles', 'ou_l1a', 'private.md');
+  // public.md may not exist at all (whole input was redirected, append mode
+  // skips the public write entirely). If it exists, it must NOT contain
+  // the phone.
+  if (existsSync(pubPath)) {
+    const pub = readFileSync(pubPath, 'utf-8');
+    if (pub.includes('13912345678')) fail('16: phone must NOT land in public.md');
+  }
+  if (!existsSync(privPath)) fail('16: phone must be redirected — private.md not created');
+  const priv = readFileSync(privPath, 'utf-8');
+  if (!priv.includes('13912345678')) fail('16: phone must be redirected to private.md');
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 17. L1-safe content still writes to public unchanged ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-l1-clean-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_l1b', '- TikTok Live 团队的工程师', 'public');
+  const pub = readFileSync(join(r, 'profiles', 'ou_l1b', 'public.md'), 'utf-8');
+  if (!pub.includes('TikTok Live')) fail('17: clean public content must be written verbatim');
+  // private.md should not have been created (no redirect happened)
+  if (existsSync(join(r, 'profiles', 'ou_l1b', 'private.md'))) {
+    fail('17: no redirect → private.md must not be created');
+  }
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 18. private-tier writes pass through (no L1 check needed — already private) ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-l1-private-passthrough-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_l1c', '- phone 13912345678', 'private');
+  const priv = readFileSync(join(r, 'profiles', 'ou_l1c', 'private.md'), 'utf-8');
+  if (!priv.includes('13912345678')) fail('18: private-tier write must reach private.md unchanged');
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 19. mixed content with mode='replace': safe replaces public, unsafe appends to private ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-l1-replace-mixed-'));
+  const s = new MemoryStore(r);
+  // Seed both tiers
+  await s.saveProfile('ou_l1d', '- old-public-1\n- old-public-2', 'public', 'replace');
+  await s.saveProfile('ou_l1d', '- existing-private', 'private', 'replace');
+  // Now distiller flush passes mixed content as public with mode=replace
+  await s.saveProfile(
+    'ou_l1d',
+    '- safe fact one\n- phone 13912345678\n- safe fact two',
+    'public',
+    'replace',
+  );
+  const pub = readFileSync(join(r, 'profiles', 'ou_l1d', 'public.md'), 'utf-8');
+  const priv = readFileSync(join(r, 'profiles', 'ou_l1d', 'private.md'), 'utf-8');
+  // Public is REPLACED with only the safe subset; old-public-* are gone
+  if (pub.includes('old-public')) fail('19: replace must drop old public content');
+  if (!pub.includes('safe fact one') || !pub.includes('safe fact two')) {
+    fail(`19: safe lines must be in replaced public.md, got: ${pub}`);
+  }
+  if (pub.includes('13912345678')) fail('19: unsafe phone must NOT be in public.md after redirect');
+  // Private gets the redirected line APPENDED (existing kept)
+  if (!priv.includes('existing-private')) fail('19: redirect must not destroy existing private');
+  if (!priv.includes('13912345678')) fail('19: redirect must append unsafe to private');
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
+// ── 19b. mode='replace' + ALL lines unsafe → public truncated to empty, private gets all ──
+{
+  const r = mkdtempSync(join(tmpdir(), 'profile-l1-replace-all-unsafe-'));
+  const s = new MemoryStore(r);
+  await s.saveProfile('ou_l1e', '- old-public', 'public', 'replace');
+  // All input is L1-unsafe; replace mode → public is "replaced with nothing"
+  await s.saveProfile(
+    'ou_l1e',
+    '- phone 13912345678\n- 身份证 110101199001011239',
+    'public',
+    'replace',
+  );
+  const pub = readFileSync(join(r, 'profiles', 'ou_l1e', 'public.md'), 'utf-8');
+  const priv = readFileSync(join(r, 'profiles', 'ou_l1e', 'private.md'), 'utf-8');
+  // public.md replaced — must NOT contain old content and must NOT contain unsafe content
+  if (pub.includes('old-public')) fail('19b: replace must drop old content');
+  if (pub.includes('13912345678') || pub.includes('110101199001011239')) {
+    fail('19b: unsafe must not land in public after replace+redirect');
+  }
+  // private gets both
+  if (!priv.includes('13912345678')) fail('19b: phone must be in private');
+  if (!priv.includes('110101199001011239')) fail('19b: ID must be in private');
+  rmSync(r, { recursive: true, force: true });
+  passed++;
+}
+
 // ── parseTieredProfile: well-formed JSON ─────────────────────
 {
   const { public: pub, private: priv } = parseTieredProfile(
@@ -394,4 +497,4 @@ rmSync(legacyRoot, { recursive: true, force: true });
 rmSync(partialRoot, { recursive: true, force: true });
 rmSync(writeRoot, { recursive: true, force: true });
 
-console.log(`profile-tier smoke: ${passed}/25 PASS`);
+console.log(`profile-tier smoke: ${passed}/30 PASS`);

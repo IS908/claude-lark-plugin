@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.13] - 2026-05-24
+
+### Fixed
+- **`MemoryStore.saveProfile` now applies the L1 privacy safety net on every public-tier write** (#75 — **CRITICAL**). `CLAUDE.md` documented a 3-layer privacy classifier (L1 hardcoded regex/keyword > L2 user rules > L3 LLM judgment) with L1 promised as the always-on tier override. In practice — verified by repo-wide grep — the L1 check (`applyL1`) only ran during the **legacy-profile migration** path (`migrateIfNeeded`, v0.10.0). On the normal `save_memory(type="profile")` runtime path, `saveProfile` trusted whatever `tier` the LLM chose, with **zero** L1 enforcement. `parseTieredProfile` (the helper meant to gate distillation output) is exported but no `src/` code calls it — only tests do.
+
+  Consequence: a single LLM misclassification could land a phone number / ID card / API token / salary mention / credential into `public.md`, where any future `@mention` of that user surfaces it to other people in the chat.
+
+  Fix: `saveProfile(userId, content, tier='public', mode)` now runs `applyL1` per non-empty line. Lines matching a private rule (cn-mobile, us-phone, cn-id, credit-card, token-like, money-amount, salary/health/credential keywords, etc.) are **redirected** — written to `private.md` (append) — while safe lines are written to `public.md` honoring the caller's mode. `tier='private'` writes pass through unchanged (already private). Each redirect emits one stderr line so operators can audit how often the L1 gate fires.
+
+  Replace-mode semantics: when `mode='replace'` mixes safe + unsafe lines, public is still REPLACED with only the safe subset (honors the caller's intent to rewrite public from scratch); the redirected unsafe lines are APPENDED to private (cannot replace private without seeing its full existing content).
+
+### Added
+- 5 new smoke assertions in `scripts/profile-tier-smoke.ts` (25 → 30): public+phone redirected end-to-end; clean public content untouched and private.md not created; private-tier writes pass through unchanged; mixed replace-mode splits across both tiers (existing private preserved, public replaced with safe subset only); all-unsafe replace-mode truncates public to empty and routes everything to private.
+- Internal `MemoryStore._writeProfileTier` helper — extracted so the L1 split can write to both tiers without duplicating the mkdir / merge / write logic.
+
+### Operator note
+Already-saved `public.md` files written under v0.10.0–v1.0.12 may contain L1-class data that should have been private. v1.0.13 only protects FUTURE writes — it does NOT retroactively scan existing public tiers. Operators concerned about historical leaks can spot-check `~/.claude/channels/lark/memories/profiles/*/public.md` against the L1 patterns documented in `src/privacy-rules.ts`. A future release may ship a one-time rescan tool.
+
 ## [1.0.12] - 2026-05-24
 
 ### Fixed
