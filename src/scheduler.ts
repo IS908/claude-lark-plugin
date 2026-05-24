@@ -9,6 +9,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { appConfig } from './config.js';
 import { cronJobPrompt } from './prompts.js';
+import { sanitizeOutboundText } from './tools.js';
 import type { IdentitySession } from './identity-session.js';
 import {
   listAllJobs,
@@ -344,10 +345,16 @@ export class JobScheduler {
     } catch {
       nextRunLocal = job.runtime.next_run_at; // fall back to raw ISO
     }
-    const text =
+    // Stale-skip notice text is entirely server-built (no user input
+    // interpolated) — sanitize anyway as a defense-in-depth pattern so
+    // any future format-string change cannot quietly become an @-mention
+    // vector. job.meta.id was sanitized at create time by sanitizeJobId,
+    // so it's already alphanumeric+`-`.
+    const text = sanitizeOutboundText(
       `⏭️ Scheduled job "${job.meta.id}" missed a run — it was ${lateHours}h stale ` +
       `(beyond the ${RECOVERY_STALE_THRESHOLD_MS / 3_600_000}h crash-recovery window), ` +
-      `so the catch-up was skipped. The job resumes normally — next run: ${nextRunLocal}.`;
+      `so the catch-up was skipped. The job resumes normally — next run: ${nextRunLocal}.`,
+    );
     const content = JSON.stringify({ text });
 
     // Tier 1 — the job's chat.
@@ -394,8 +401,18 @@ export class JobScheduler {
    * message type: send fixed content via Feishu IM API.
    */
   private async executeMessageJob(job: JobFile): Promise<void> {
-    const content = job.meta.content ?? '';
+    const rawContent = job.meta.content ?? '';
     const msgType = job.meta.msg_type ?? 'text';
+
+    // Cronjob message-type bodies are author-controlled at create_job
+    // time, NOT runtime user input — but a `create_job` call itself
+    // is reachable from a prompt-injected Claude (e.g. user asks Claude
+    // to schedule a "polite reminder" and quietly slips `<at user_id="all">`
+    // into the content). The content lives in the job file forever,
+    // firing on every scheduled tick. Sanitize on send to defang any
+    // such payload that landed before #96 shipped, and to keep the
+    // contract that "bot's outbound text never @-mentions on its own".
+    const content = msgType === 'text' ? sanitizeOutboundText(rawContent) : rawContent;
 
     await this.client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },

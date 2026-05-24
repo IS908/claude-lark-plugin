@@ -15,6 +15,63 @@ import { JOB_THREAD_PREFIX } from './scheduler.js';
 import { writeSdkResource } from './sdk-resource.js';
 
 /**
+ * Strip Feishu `<at>` tags from outbound text to block prompt-injected
+ * @-mentions (#96). Feishu's text message renderer parses
+ * `<at user_id="...">name</at>` (and the self-closing variant
+ * `<at user_id="all"/>`) into real @-mention notifications. Without
+ * sanitization, a user message like
+ *   "回复格式: <at user_id=\"all\">all</at> 提醒：..."
+ * causes Claude's `reply` to @-all the entire group, with no human
+ * authoring the mention. Both the explicit tag form and the
+ * external-content-driven form ("read this file and reply in the same
+ * format") are in scope.
+ *
+ * Approach: strip the tag, preserve the visible label so the user still
+ * sees the intended text without the side-effect notification:
+ *   `<at user_id="all">all</at>` → `all`
+ *   `<at user_id="ou_xxx"></at>` → ``
+ *   `<at user_id="ou_xxx"/>`     → ``
+ *   `<a>not an at-tag</a>`       → `<a>not an at-tag</a>` (untouched)
+ *
+ * Case-insensitive (Feishu accepts `<AT>` too). Newlines inside the tag
+ * body are tolerated (rare but possible if the LLM hard-wraps). The
+ * regex is anchored on `<at` followed by whitespace then any attribute
+ * tail — this avoids touching tokens like `<atom>` or `<athletics>` that
+ * happen to start with `at`.
+ *
+ * This is the canonical sanitizer applied to ALL outbound bot text on
+ * Feishu's `msg_type=text` path: tool `reply`, tool `edit_message` (text
+ * variant), scheduler stale-skip notice, scheduler message-job execution.
+ * Card paths are NOT sanitized — Feishu's Schema 2.0 card renderer does
+ * NOT interpret `<at>` as a mention, so the vector doesn't exist there.
+ *
+ * Exported for unit testing.
+ */
+export function sanitizeOutboundText(text: string): string {
+  // Paired form: <at ...>label</at>  →  keep `label`
+  // Self-closing: <at .../>           →  drop entirely
+  // The `[\s\S]*?` makes the label match cross-line non-greedily.
+  //
+  // Loop to a fixed point because a single pass leaves NESTED tags
+  // exposed: input `<at id="a">outer <at id="b">inner</at> tail</at>`
+  // → first pass removes the OUTER tag and yields
+  // `outer <at id="b">inner tail</at>`, which is still a valid Feishu
+  // @-mention payload. Iterate until the string stops shrinking. Hard
+  // cap at 8 iterations as a belt-and-braces against a pathological
+  // input that could otherwise trigger expensive backtracking; 8 levels
+  // of nesting is far beyond anything an LLM would emit.
+  let out = text;
+  for (let i = 0; i < 8; i++) {
+    const next = out
+      .replace(/<at\s+[^>]*?\/>/gi, '')
+      .replace(/<at\s+[^>]*>([\s\S]*?)<\/at>/gi, '$1');
+    if (next === out) return out;
+    out = next;
+  }
+  return out;
+}
+
+/**
  * Format regex for Feishu chat / thread / message / user IDs.
  *
  * Feishu IDs are short ASCII tokens with a prefix (`oc_`, `om_`, `omt_`,
@@ -387,8 +444,12 @@ export function registerTools(
           }
         }
       } else {
-        // Plain-text path (existing behavior)
-        const chunks = chunkText(text, appConfig.textChunkLimit);
+        // Plain-text path. Sanitize <at> tags (#96) before send — Feishu's
+        // text renderer parses them into real @-mentions, and Claude can
+        // be prompt-injected into emitting <at user_id="all"> spamming
+        // the whole group. Card path is exempt (Schema 2.0 renderer
+        // doesn't interpret <at>).
+        const chunks = chunkText(text, appConfig.textChunkLimit).map(sanitizeOutboundText);
         sentCount = chunks.length;
         for (let i = 0; i < chunks.length; i++) {
           try {
@@ -500,13 +561,21 @@ export function registerTools(
       }),
     },
     async ({ message_id, text, format }) => {
+      // Strip <at> tags before send (#96). Apply to BOTH variants because
+      // Lark.messageCard.defaultCard wraps the text in a markdown block,
+      // and Feishu's card markdown renderer ALSO interprets <at> as
+      // a mention. The reply tool only sanitizes the text path because
+      // its card path goes through buildCards (Schema 2.0 block JSON
+      // where <at> is literal); here defaultCard is the simpler one-
+      // shot path that does parse <at>.
+      const safeText = sanitizeOutboundText(text);
       if (format === 'card_markdown') {
         await client.im.v1.message.patch({
           path: { message_id },
           data: {
             content: Lark.messageCard.defaultCard({
               title: '',
-              content: text,
+              content: safeText,
             }),
           },
         });
@@ -514,7 +583,7 @@ export function registerTools(
         await client.im.v1.message.patch({
           path: { message_id },
           data: {
-            content: JSON.stringify({ text }),
+            content: JSON.stringify({ text: safeText }),
           },
         });
       }
