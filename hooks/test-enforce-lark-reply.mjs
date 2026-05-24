@@ -687,6 +687,65 @@ console.log('\n[28] block-message hint matches REPLY_TOOLS (no edit_message ment
   }
 }
 
+// --- Test 29: ConversationBuffer auto-flush synthetic message → must NOT block (#74) ---
+// src/index.ts:111 injects a synthetic notification with chat_type='system'
+// and message_id='flush-<ts>' to ask Claude to distill a chat episode.
+// There is no Feishu user awaiting a reply; the hook must skip the tag,
+// not flag it as pending.
+console.log('\n[29] buffer auto-flush synthetic message → skipped, no block (#74)');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_flush" message_id="flush-1700000000000" chat_type="system" user="system">\n[Auto-memory-flush]\nDistill recent activity into a chat episode...\n</channel>';
+  const path = writeTranscript('flush-skipped', [
+    makeUserMsg(userContent),
+    // Claude correctly handles the distillation task (e.g. calls save_memory)
+    // and ends the turn without sending a `reply` to the synthetic message.
+    makeAssistantText('Distilled. (No reply needed — this is a system flush.)'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, 'system-flush tag is exempt — no block');
+  // The synthetic message_id MUST NOT appear in any block-message output
+  // (would prove the tag leaked into the pending list).
+  if (r.stderr.includes('flush-1700000000000')) {
+    console.log(`  ${RED}✗${RESET} flush message_id leaked into hook output. stderr: ${r.stderr.slice(0, 300)}`);
+    failed++;
+  } else {
+    passed++;
+  }
+}
+
+// --- Test 29b: real Feishu chat_type='group' must still be checked (regression guard for #74 fix) ---
+// Make sure the new chat_type='system' exemption didn't accidentally
+// loosen the check for real Feishu chat types.
+console.log('\n[29b] real chat_type="group" with no reply → still blocks');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_real" message_id="om_real_user_msg" chat_type="group" user="kk">\nreal user question\n</channel>';
+  const path = writeTranscript('group-still-blocks', [
+    makeUserMsg(userContent),
+    makeAssistantText('thinking...'),
+    // no reply tool call
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'real group message without reply still blocks');
+  assertContains(r.stderr, 'om_real_user_msg', 'real message_id surfaces in block message');
+}
+
+// --- Test 29c: real Feishu chat_type='p2p' must still be checked (symmetric to 29b) ---
+console.log('\n[29c] real chat_type="p2p" with no reply → still blocks');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_dm" message_id="om_p2p_msg" chat_type="p2p" user="kk">\nDM question\n</channel>';
+  const path = writeTranscript('p2p-still-blocks', [
+    makeUserMsg(userContent),
+    makeAssistantText('thinking...'),
+    // no reply tool call
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'real p2p message without reply still blocks');
+  assertContains(r.stderr, 'om_p2p_msg', 'real p2p message_id surfaces in block message');
+}
+
 // --- Summary ---
 console.log(`\n${'─'.repeat(50)}`);
 if (failed === 0) {

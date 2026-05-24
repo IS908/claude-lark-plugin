@@ -270,6 +270,16 @@ function shouldSkipChannelTag(attrs) {
   // Reaction events: chat_type === "reaction" → no reply expected
   // (verified: src/channel.ts:287 sets chat_type from inbound event)
   if (attrs.chat_type === 'reaction') return true;
+  // Buffer auto-flush (#74). ConversationBuffer's flush handler injects a
+  // synthetic notification (src/index.ts:111) with chat_type='system' to
+  // ask Claude to distill recent activity into a chat episode — there is
+  // no user awaiting a reply. Real Feishu inbound carries chat_type='p2p'
+  // or 'group' per SDK contract, never 'system', so this exemption is
+  // tight. If a future feature introduces a system-typed notification
+  // that DOES need a reply, narrow this to message_id.startsWith('flush-')
+  // (the flush handler's id format) — see src/index.ts:109 for the
+  // matching producer.
+  if (attrs.chat_type === 'system') return true;
   // Cronjob notifications: scheduler.ts:437 sets meta.source='cronjob'.
   // That meta value renders into the channel tag (where it may collide
   // with the outer source='plugin:lark:lark'). The unambiguous marker is

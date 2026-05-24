@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.12] - 2026-05-24
+
+### Fixed
+- **Stop hook spuriously blocked Claude on ConversationBuffer auto-flush messages** (#74). When the in-process buffer triggers an auto-flush after inactivity, `src/index.ts:111` injects a synthetic notification with `chat_type='system'` and `message_id='flush-<ts>'` asking Claude to distill recent activity into a chat episode. There is no Feishu user awaiting a reply — Claude correctly handles the distillation without sending one. But the Stop hook's `shouldSkipChannelTag` did not exempt `chat_type='system'`, so each flush ended with an `exit 2` block: Claude was then forced to either try `reply` (which the Feishu API would reject because `flush-<ts>` is not a real message_id), use `[LARK_DEFER]` to bypass, or otherwise re-iterate. Pure efficiency loss — no behaviour-safety impact, ~1 wasted round per flush.
+
+  Added `chat_type === 'system'` to `shouldSkipChannelTag`, sitting alongside the existing `chat_type === 'reaction'` exemption — same shape (both are non-Feishu-inbound synthetic notifications). Tight scope: real Feishu inbound carries `chat_type='p2p'` or `'group'` per SDK contract; the synthetic-system value is produced only by the flush handler, so no real user message can be wrongly dropped.
+
+### Added
+- Cross-reference comments at both ends of the contract: hook-side notes the assumption that `chat_type='system'` maps 1:1 to flush; index.ts-side reserves `chatType: 'system'` for the flush handler with an explicit "do NOT reuse" warning pointing back at the hook. Stops a future contributor from accidentally re-using `'system'` for a notification that does need a reply (which would be silently dropped).
+- Smoke test 29 — regression guard asserts the flush notification is exempt and its message_id does not leak into hook output. Tests 29b/29c verify the new exemption did not accidentally loosen handling of real `chat_type='group'` / `'p2p'` messages (both still block when unreplied). Suite 50 → 56.
+
 ## [1.0.11] - 2026-05-24
 
 ### Fixed

@@ -63,7 +63,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.11' },
+    { name: 'claude-lark-plugin', version: '1.0.12' },
     {
       capabilities: {
         logging: {},
@@ -108,6 +108,11 @@ async function main() {
       await channel['messageHandler']({
         messageId: `flush-${Date.now()}`,
         chatId,
+        // RESERVED: chatType='system' is the auto-flush distillation
+        // marker. The Stop hook (hooks/enforce-lark-reply.mjs #74)
+        // exempts chat_type='system' from its reply-obligation check.
+        // Do NOT reuse 'system' for other synthetic notifications that
+        // DO need a reply — they would be silently dropped.
         chatType: 'system',
         senderId: 'system',
         text: flushPrompt,
