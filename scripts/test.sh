@@ -86,4 +86,8 @@ echo "=== Path-traversal defense unit checks ==="
 npx tsx scripts/path-traversal-smoke.ts
 
 echo ""
+echo "=== <at> tag sanitization unit checks ==="
+npx tsx scripts/at-tag-sanitization-smoke.ts
+
+echo ""
 echo "All tests passed."

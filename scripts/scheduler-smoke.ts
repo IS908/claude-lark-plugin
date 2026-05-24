@@ -217,9 +217,51 @@ try {
     }
     passed++;
   }
+  // ── Part C: executeMessageJob hardening (v1.0.16, #96 R1-audit) ────
+  //   create_job hardcodes msg_type='text' so non-text msg_type is only
+  //   reachable via hand-edited job files. The runtime guard added in
+  //   src/scheduler.ts:416 refuses to send those, because Feishu's `post`
+  //   (and other rich) payloads also support <at> mentions but would
+  //   bypass the text-side sanitizeOutboundText.
+
+  // 14. msg_type='post' job is refused — no message sent, stderr line emitted.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent));
+    const postJob = makeJob('post-job', new Date(Date.now() + HOUR).toISOString());
+    (postJob.meta as any).msg_type = 'post';
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await (scheduler as any).executeMessageJob(postJob);
+    } finally {
+      console.error = origError;
+    }
+    if (sent.length !== 0) fail(`14: msg_type='post' must NOT send any message, got ${sent.length}`);
+    if (!errors.some((e) => e.includes('post-job') && /msg_type=post/.test(e))) {
+      fail(`14: refusal must log to stderr naming the job id and msg_type; got: ${errors.join(' | ')}`);
+    }
+    passed++;
+  }
+
+  // 15. msg_type='text' (default) still executes — and the sanitizer
+  //     strips <at> from the content. Regression guard that the text
+  //     happy path is intact AND that the sanitizer is wired.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent));
+    const textJob = makeJob('text-job', new Date(Date.now() + HOUR).toISOString());
+    textJob.meta.content = 'reminder <at user_id="all">all</at> meeting';
+    await (scheduler as any).executeMessageJob(textJob);
+    if (sent.length !== 1) fail(`15: text job must send exactly 1 message, got ${sent.length}`);
+    if (sent[0].text.includes('<at ')) fail(`15: <at> tag survived sanitization: ${sent[0].text}`);
+    if (!sent[0].text.includes('all meeting')) fail(`15: visible label lost from sanitization: ${sent[0].text}`);
+  }
+  passed++;
 } finally {
   (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }
 
-console.log(`scheduler smoke: ${passed}/13 PASS`);
+console.log(`scheduler smoke: ${passed}/15 PASS`);

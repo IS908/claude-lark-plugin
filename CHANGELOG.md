@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.16] - 2026-05-24
+
+### Security
+- **Outbound `msg_type=text` payloads now strip `<at user_id="...">` tags** (#96 — **HIGH — prompt-injected @-all**). Feishu's text-message renderer parses `<at user_id="...">label</at>` and the self-closing `<at user_id="..."/>` form into real @-mention notifications. Pre-v1.0.16 the `reply` tool, `edit_message` tool, and scheduler message-job paths sent Claude's text verbatim — a prompt-injected reply containing `<at user_id="all">all</at>` would @-all the entire group, with no human authoring the mention. External-content variants ("read this file and reply in the same format" where the file contains a tag) close the same vector. Issue raised after #82 (Stop-hook fenced-sentinel echo) confirmed prompt injection is a real surface for this plugin.
+
+  Fix: new `sanitizeOutboundText(text)` in `src/tools.ts` strips both tag forms case-insensitively, preserves the visible label (`<at user_id="ou_x">Kevin</at>` → `Kevin`), tolerates cross-line bodies, and **iterates to a fixed point** so nested tags can't survive — a single pass would leave the inner tag intact (e.g. `<at id="a">outer <at id="b">inner</at> tail</at>` → `outer <at id="b">inner tail</at>`, still a valid mention payload). Hard-cap at 8 iterations as a regex-backtracking guard. Untouched: `<atom>`, `<athletics>`, plain `<a>` — the regex requires `\s` after `<at` so non-mention tags starting with "at" are unaffected.
+
+  Applied at 4 outbound text sites:
+  1. `reply` tool plain-text chunks
+  2. `edit_message` tool — both `text` and `card_markdown` variants (the SDK's `Lark.messageCard.defaultCard` wraps content in a markdown block where Feishu's card renderer ALSO parses `<at>`; reply's separate Schema 2.0 `buildCards` path is exempt because that renderer does NOT)
+  3. Scheduler stale-skip notice (defense-in-depth — content is server-built but sanitizing now keeps future format-string changes from quietly becoming an @-mention vector)
+  4. Scheduler `executeMessageJob` text path (defangs any `<at>` payload that landed in a job file via a prompt-injected `create_job` before this fix shipped — message-type jobs persist their content across restarts)
+
+### Added
+- 18 smoke assertions in `scripts/at-tag-sanitization-smoke.ts` covering: paired tags with various labels, @-all attack, self-closing form, empty paired tags, multiple tags in one string, case insensitivity (`<AT>` / `<At>`), cross-line bodies, non-`<at>` tags (`<atom>`, `<athletics>`, `<a>`) untouched, bare `<at>` (no attrs) stripped (R1-audit defense-in-depth), plain-text passthrough, nested tags collapsed to fixed point, HTML-entity-encoded form left as literal text (harmless), single-quoted and unquoted attribute variants, triply-nested collapse, mixed self-closing + stray paired-close cleaned via orphan-tail sweep, whitespace-only passthrough, Cyrillic lookalike untouched (Feishu also won't render it), 1000-unclosed-tag backtracking-safety check.
+- `sanitizeOutboundText` exported from `src/tools.ts` for downstream test reuse and to let `src/scheduler.ts` import the canonical sanitizer rather than reimplement.
+
+### R1-audit followups (closed in this PR)
+- **Bare `<at>` (no attrs) now stripped too** — pre-followup the regex required `\s` after `at`, leaving `<at>x</at>` intact. Defense-in-depth against a future Feishu renderer leniency.
+- **Orphan `</at>` tail sweep** — a mixed-form input like `<at user_id="x"/>foo</at>` previously left a dangling `</at>` in the output. Cosmetic but worth fixing.
+- **`executeMessageJob` refuses non-`text` `msg_type`** — `post` rich-text payload also supports `<at>` and would have bypassed the sanitizer. `create_job` hardcodes text, so this is purely a defense against hand-edited job files. Refused jobs log a stderr message naming the file.
+
+### R2-audit followups (closed in this PR)
+- **ConversationBuffer records the SANITIZED form** — the `reply` tool's `recordAndRevokeAck` previously stored the raw `text` argument. Pre-fix, a prompt-injected `<at>` would land in the on-disk episode .md → re-injected into Claude's prompt by the enrichment path → Claude might quote it again. The outbound sanitizer caught the re-emission so this was defense-in-depth not a live exploit, but storing the sanitized form is cleaner and avoids audit-trail confusion.
+- **2 new scheduler-smoke tests** (suite 13 → 15): msg_type='post' is refused with stderr line naming the job id; msg_type='text' (default) still executes AND has `<at>` stripped end-to-end via the sanitizer.
+
+### Not addressed (separate issue)
+- **#105** — reply tool's raw-`card` JSON parameter does not gate Schema 2.0 `markdown`/`lark_md` element blocks, which Feishu's card-markdown renderer DOES interpret for `<at>`. Lower urgency because the path requires Claude to construct valid Schema 2.0 JSON (non-trivial prompt-inject target), but still worth closing in a future release with either JSON-tree sanitization or explicit refusal of `markdown` tags in raw cards.
+
+### Operator notes
+- Legitimate `<at>`-shaped content in bot replies (e.g. Claude explaining what an `<at>` tag IS) loses the angle-bracket wrapping. If you need to discuss `<at>` syntactically without it being processed as a mention, wrap the example differently (escape the brackets, or use a code fence and accept that the inner `<at>` is also stripped). A future release may add a fence-aware variant.
+- Card-mode replies (`buildCards` / Schema 2.0) are NOT sanitized — that renderer does not interpret `<at>` as a mention. If you need a mention inside a card you must use the card's explicit `at` block (not currently exposed through the tool API).
+
 ## [1.0.15] - 2026-05-24
 
 ### Security
