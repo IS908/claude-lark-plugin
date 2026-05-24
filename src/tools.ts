@@ -1454,8 +1454,8 @@ export function registerTools(
         };
       }
 
-      const removed = await memoryStore.removeProfileLine(caller, tier, hash);
-      if (!removed) {
+      const result = await memoryStore.removeProfileLine(caller, tier, hash);
+      if (result.removed === 0) {
         return {
           isError: true,
           content: [{ type: 'text' as const, text: `Failed to remove line "${hash}".` }],
@@ -1465,11 +1465,18 @@ export function registerTools(
       // Line removal above is the primary effect; rule promotion is
       // a best-effort enhancement. If addL2Rule fails, don't undo the
       // removal — just report the partial outcome so the user knows.
+      //
+      // Rule-promotion text choice (#88 followup): when multiple lines
+      // shared the hash, we use the sample text (first match) as the
+      // rule seed. The texts are normalized-equal after bullet-strip
+      // (that's why their hashes collide), so the sample is
+      // representative — but the operator should see the count so they
+      // can decide whether to manually add other variants.
       let tail = '';
       if (promote_to_rule) {
         try {
           const { addL2Rule } = await import('./privacy-rules.js');
-          await addL2Rule(target.text, 'Always private');
+          await addL2Rule(result.sample ?? target.text, 'Always private');
           tail = ' Also appended to privacy-rules.md under "Always private" — future distillations will classify similar content accordingly.';
         } catch (err) {
           tail = ` (Warning: removal succeeded but failed to append rule to privacy-rules.md: ${err instanceof Error ? err.message : String(err)}. You can add the rule manually.)`;
@@ -1477,13 +1484,19 @@ export function registerTools(
       }
 
       void audit('forget_memory', caller, auditArgs, 'ok');
+
+      // #88 fix: faithful confirmation that names the count when more
+      // than one line was deleted (hash collision via duplicate or
+      // 32-bit birthday-paradox match). Pre-fix the singular wording
+      // hid multi-deletes from the operator entirely.
+      const replyText =
+        result.removed === 1
+          ? `Removed "${result.sample}" from ${tier} profile.${tail}`
+          : `Removed ${result.removed} lines sharing hash "${hash}" from ${tier} profile (sample: "${result.sample}"). ` +
+            `If only one of these was the intended target, run what_do_you_know and re-add the others with save_memory.${tail}`;
+
       return {
-        content: [
-          {
-            type: 'text' as const,
-            text: `Removed "${target.text}" from ${tier} profile.${tail}`,
-          },
-        ],
+        content: [{ type: 'text' as const, text: replyText }],
       };
     }
   );

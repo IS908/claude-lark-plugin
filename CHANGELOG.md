@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.19] - 2026-05-25
+
+### Fixed
+- **`forget_memory` no longer silently deletes multiple lines that share an 8-char hash** (#88 — **MEDIUM, silent data loss**). Pre-v1.0.19 `MemoryStore.removeProfileLine` used `filter(l => l.hash !== hash)` which strips **every** matching line in one pass, but the tool reply was hardcoded singular `Removed "<text>" from <tier> profile.` — so a multi-delete was invisible to the operator. Collisions happen naturally (multiple `save_memory(profile, content="prefers tea", mode="append")` calls with mixed bullet formatting normalize to the same key after `listProfileLines`' bullet-strip) and could be triggered adversarially (8-char sha1 prefix is 32 bits — birthday paradox at ~77k lines, well above realistic profile size for an honest user but exploitable in principle).
+
+  Fix:
+  - `MemoryStore.removeProfileLine(ownerId, tier, hash)` now returns `{ removed: number, sample: string | null, allTexts: string[] }` instead of a bare boolean.
+  - `forget_memory` tool reply branches on `removed`: singular `Removed "<text>" from ${tier} profile.` when 1, plural `Removed N lines sharing hash "${hash}" from ${tier} profile (sample: "<text>"). If only one of these was the intended target, run what_do_you_know and re-add the others with save_memory.` when ≥2.
+  - `promote_to_rule=true` uses the sample text for the L2 rule append (the colliding texts are normalized-equal so the sample is representative — operator is told the count and can manually add other variants if needed).
+
+### Added
+- 1 new transparency-smoke assertion (#5b) covering the multi-delete path: two normalized-equal lines pre-populated via `mode='replace'` (bypasses `mergeProfileLines` dedup), `removeProfileLine` reports `removed: 2`, file ends empty, `allTexts` carries both originals.
+- Existing transparency tests updated to assert the new return shape (`result.removed === N` instead of `if (!ok)`).
+- Existing profile-tier test 14 updated to the new shape.
+- Transparency suite total: 9 → 10.
+
+### Operator notes
+- Existing on-disk profiles MAY contain hash collisions from past `save_memory` patterns. Calling `forget_memory` on a colliding hash now reports the count and a sample — if more than 1 was unintentionally swept, the operator can spot it in the reply text and recover via `save_memory(type='profile', tier, mode='append', content=...)` for the lost lines.
+- A future release may switch to per-line index-prefixed identifiers (e.g. `i17:abc12345`) to eliminate collisions entirely — would require updating `what_do_you_know`'s line-id rendering and `forget_memory`'s hash parameter semantics. Tracked separately if needed.
+
 ## [1.0.18] - 2026-05-25
 
 ### Security
