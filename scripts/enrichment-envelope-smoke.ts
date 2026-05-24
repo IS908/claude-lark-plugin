@@ -115,19 +115,17 @@ let testNum = 0;
   if (!out.includes('&lt;/memory_context&gt;')) fail(`embedded close not escaped: ${out}`);
 }
 
-// 7. wrapEnrichmentSection — label with quote chars is HTML-entity-escaped
-//    so it can't break out of the attribute.
+// 7. wrapEnrichmentSection — label with `"`, `>`, `<` is all escaped
+//    (R1-audit followup on #115). Pre-fix, `>` slipped through and an
+//    `evil> x=` label would visually appear to terminate the open tag.
 {
   testNum++;
-  const out = wrapEnrichmentSection('skill', 'name with " quotes', 'body');
-  // The quote in label must be escaped — otherwise it would close the
-  // attribute and allow extra attributes to be injected.
-  if (out.includes('label="name with " quotes"')) {
-    fail(`label quote breaks out of attribute: ${out}`);
-  }
-  if (!out.includes('label="name with &quot; quotes"')) {
-    fail(`label quote should be &quot;-escaped: ${out}`);
-  }
+  const out = wrapEnrichmentSection('skill', 'name with " and > and < chars', 'body');
+  if (out.includes('label="name with " ')) fail(`label " breaks out: ${out}`);
+  if (/label="[^"]*>[^"]*"/.test(out)) fail(`label > slipped through: ${out}`);
+  if (!out.includes('&quot;')) fail(`label " should be &quot;: ${out}`);
+  if (!out.includes('&gt;')) fail(`label > should be &gt;: ${out}`);
+  if (!out.includes('&lt;')) fail(`label < should be &lt;: ${out}`);
 }
 
 // 8. wrapEnrichmentSection — no label produces single-attr form
@@ -211,6 +209,25 @@ let testNum = 0;
   // And the user's actual message text must be OUTSIDE the envelope.
   const msgIdx = out.lastIndexOf('normal question');
   if (msgIdx < wrapClose) fail(`user message text leaked inside envelope`);
+}
+
+// 12. escapeEnvelopeBody — expanded denylist covers other Claude-/MCP-
+//     adjacent XML-ish envelopes (R1-audit followup). A stored episode
+//     with `</tool_result>` could otherwise confuse downstream
+//     consumers even when our own envelope stays intact.
+{
+  testNum++;
+  for (const tag of ['user_turn', 'tool_result', 'system', 'system_prompt', 'invoke', 'function_calls', 'parameter', 'cwd']) {
+    const out = escapeEnvelopeBody(`pre </${tag}> post`);
+    if (out.includes(`</${tag}>`)) fail(`expanded denylist missed </${tag}>: ${out}`);
+    if (!out.includes(`&lt;/${tag}&gt;`)) fail(`expanded denylist did not escape </${tag}>: ${out}`);
+  }
+  // Unrelated tags STILL pass through (atomic, html, code samples).
+  for (const tag of ['atom', 'div', 'span', 'a', 'pre', 'code']) {
+    const sample = `look at </${tag}> closely`;
+    const out = escapeEnvelopeBody(sample);
+    if (out !== sample) fail(`escape touched unrelated </${tag}>: ${out}`);
+  }
 }
 
 console.log(`enrichment envelope smoke: ${testNum}/${testNum} PASS`);

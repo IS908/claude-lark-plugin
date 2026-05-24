@@ -127,20 +127,43 @@ export function cronJobPrompt(jobName: string, sendChatId: string, prompt: strin
  * Memory enrichment wraps each piece of stored content in an XML-ish
  * `<memory_context type="...">` block so Claude can structurally
  * distinguish DATA from INSTRUCTIONS. A malicious body containing
- * `</memory_context>` or `</channel>` could otherwise prematurely close
- * the envelope and have the trailing content treated as outer context.
+ * `</memory_context>` or any other recognized envelope-close token
+ * could otherwise prematurely terminate the wrap and have its tail
+ * re-classified as outer context.
  *
- * We HTML-entity-escape the angle brackets (`<` → `&lt;`, `>` → `&gt;`)
- * only on these specific closing tag tokens — preserving the visible
- * text while neutralizing the parse hazard. Other `<...>` content
- * (Markdown, code samples) is unaffected.
+ * R1-audit followup on PR #115 expanded the denylist beyond
+ * `memory_context` / `channel` to include other XML-ish envelopes
+ * commonly used by Claude / MCP / the Anthropic harness — a stored
+ * episode containing `</tool_result>` etc. could confuse downstream
+ * consumers even when this plugin's own wrap stays intact. Denylist
+ * is conservative — only KNOWN envelope tokens get escaped; arbitrary
+ * `<...>` (code samples, plain math, `<atom>`, `<a>`) is preserved.
+ *
+ * Open tags are NOT escaped — escaping every `<` would corrupt code
+ * samples and is unnecessary given the close-tag asymmetry: a body
+ * with `<foo>` but no `</foo>` does not break our parent envelope.
  *
  * Exported for testing.
  */
+const ENVELOPE_CLOSE_DENYLIST = [
+  'memory_context',
+  'channel',
+  'user_turn',
+  'tool_result',
+  'system',
+  'system_prompt',
+  'invoke',
+  'function_calls',
+  'parameter',
+  'cwd',
+] as const;
+
 export function escapeEnvelopeBody(body: string): string {
-  return body
-    .replace(/<\/memory_context>/gi, '&lt;/memory_context&gt;')
-    .replace(/<\/channel>/gi, '&lt;/channel&gt;');
+  let out = body;
+  for (const tag of ENVELOPE_CLOSE_DENYLIST) {
+    out = out.replace(new RegExp(`</${tag}>`, 'gi'), `&lt;/${tag}&gt;`);
+  }
+  return out;
 }
 
 /**
@@ -157,7 +180,15 @@ export function wrapEnrichmentSection(
   label: string | undefined,
   body: string,
 ): string {
-  const attrs = label ? ` type="${kind}" label="${label.replace(/"/g, '&quot;')}"` : ` type="${kind}"`;
+  // Escape both `"` and `>` in the label attribute. The `>` would not
+  // close a properly-quoted attribute in XML/HTML spec terms, but Claude
+  // is not a formal HTML parser, and a label like `evil> ...` could
+  // visually appear to terminate the open tag mid-attribute. R1-audit
+  // followup on #115.
+  const safeLabel = label
+    ? label.replace(/"/g, '&quot;').replace(/>/g, '&gt;').replace(/</g, '&lt;')
+    : undefined;
+  const attrs = safeLabel ? ` type="${kind}" label="${safeLabel}"` : ` type="${kind}"`;
   return `<memory_context${attrs}>\n${escapeEnvelopeBody(body)}\n</memory_context>`;
 }
 

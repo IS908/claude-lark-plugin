@@ -539,6 +539,13 @@ export class LarkChannel {
       }
     }
 
+    // R1-audit followup on #115: scoreTag formatter guards against
+    // NaN / Infinity from a future score-normalization regression.
+    // Number.isFinite(undefined) returns false, so the chain naturally
+    // handles missing scores as "no score tag".
+    const scoreTag = (score: number | undefined): string =>
+      typeof score === 'number' && Number.isFinite(score) ? `score:${score.toFixed(2)} · ` : '';
+
     // 3. Thread episodes (cold injection — semantic search with score filtering)
     if (msg.threadId) {
       const threadEps = await this.memoryStore
@@ -546,9 +553,8 @@ export class LarkChannel {
         .catch(() => []);
       const filtered = threadEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
       for (const ep of filtered) {
-        const scoreTag = ep.score !== undefined ? `score:${ep.score.toFixed(2)} · ` : '';
         const dateTag = ep.timestamp.slice(0, 10);
-        parts.push(wrapEnrichmentSection('thread_episode', `${scoreTag}${dateTag}`, ep.content));
+        parts.push(wrapEnrichmentSection('thread_episode', `${scoreTag(ep.score)}${dateTag}`, ep.content));
       }
     }
 
@@ -558,9 +564,8 @@ export class LarkChannel {
       .catch(() => []);
     const filteredChat = chatEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
     for (const ep of filteredChat) {
-      const scoreTag = ep.score !== undefined ? `score:${ep.score.toFixed(2)} · ` : '';
       const dateTag = ep.timestamp.slice(0, 10);
-      parts.push(wrapEnrichmentSection('chat_episode', `${scoreTag}${dateTag}`, ep.content));
+      parts.push(wrapEnrichmentSection('chat_episode', `${scoreTag(ep.score)}${dateTag}`, ep.content));
     }
 
     // 5. Skills (cold injection — inject name + sanitized description + path)
@@ -573,7 +578,9 @@ export class LarkChannel {
     const filteredSkills = skills.filter(s => s.score === undefined || s.score >= appConfig.minSearchScore);
     const SKILL_DESC_MAX = 200;
     for (const skill of filteredSkills) {
-      const scoreTag = skill.score !== undefined ? ` · score:${skill.score.toFixed(2)}` : '';
+      const skillScoreTag = typeof skill.score === 'number' && Number.isFinite(skill.score)
+        ? ` · score:${skill.score.toFixed(2)}`
+        : '';
       const skillPath = `${appConfig.memoriesDir}/skills/${skill.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.md`;
       const safeDesc = (skill.description ?? '')
         .replace(/[\r\n]+/g, ' ')
@@ -582,14 +589,21 @@ export class LarkChannel {
       parts.push(
         wrapEnrichmentSection(
           'skill',
-          `${skill.name}${scoreTag}`,
+          `${skill.name}${skillScoreTag}`,
           `${safeDesc}\n→ ${skillPath}`,
         ),
       );
     }
 
-    // Assemble
-    if (parts.length === 0) return msg.text;
+    // Assemble.
+    // R1-audit followup on #115: the prior `if (parts.length === 0)
+    // return msg.text` shortcut skipped the envelope ENTIRELY even
+    // when `msg.parentContent` (the quoted-message body) was non-
+    // empty. parentContent is fetched from Feishu — content authored
+    // by some user — so a quoted-reply attack would bypass #114's
+    // fix when the sender has no other stored memory. Now: enter the
+    // wrap path whenever EITHER stored parts OR parentContent exists.
+    if (parts.length === 0 && !msg.parentContent) return msg.text;
 
     return enrichmentPrompt(
       parts.join('\n\n'),
