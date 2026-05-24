@@ -252,16 +252,14 @@ let passed = 0;
 
   // Invalid: too short OR no substantive word
   const badCases: Array<[string, 'too-short' | 'no-substantive-word']> = [
-    ['工程师', 'too-short'],    // 3 chars
-    ['the', 'too-short'],       // 3
-    ['了', 'too-short'],        // 1
-    ['salary', 'no-substantive-word'], // 6 chars but the only run is 6 letters — wait, that IS >=4. Should pass.
+    ['工程师', 'too-short'],            // 3 chars CJK
+    ['the', 'too-short'],               // 3 chars English
+    ['了', 'too-short'],                // 1 char particle
+    ['家庭住址', 'too-short'],          // 4 chars CJK compound
     ['!@#$%^&*', 'no-substantive-word'], // 8 chars, no letters/digits
     ['a a a a', 'no-substantive-word'],  // 7 chars but no run >=4
+    ['x x x x x x x', 'no-substantive-word'], // 13 chars, all 1-letter runs
   ];
-  // Adjust salary case — actually 'salary' is 6 chars, single 6-letter run, valid.
-  // Replace with a real failure case.
-  badCases[3] = ['x x x x x x x', 'no-substantive-word']; // 13 chars but no 4+ run
   for (const [text, expectedReason] of badCases) {
     const r = validateL2Rule(text);
     if (r.ok) fail(`12-bad: "${text}" should be rejected`);

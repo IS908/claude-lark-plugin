@@ -154,28 +154,32 @@ export function extractL2PrivatePhrases(markdown: string): string[] {
  * the substring matcher (#90). Returns `{ ok: true }` for acceptable
  * rules, `{ ok: false, reason }` for rules that would over-match.
  *
- * Heuristic:
- * - Trim length must be >= 6 characters. Rejects single short words
- *   like `the`, `了`, `工程师`, `salary` (6 chars borderline, but
- *   acceptable as a concrete category).
- * - Must contain at least one run of 4+ "substantive" code-points
- *   (Unicode Letter or Number). Rejects all-punctuation/whitespace
- *   inputs that happen to clear the length floor (e.g. `"!?!?!?"`,
- *   `"a a a a"`).
+ * Two checks:
+ * - `too-short`: trim length must be >= 6 characters.
+ * - `no-substantive-word`: must contain at least one Unicode run of
+ *   4+ Letter/Number code-points. Catches all-punctuation/whitespace
+ *   inputs that clear the length floor (e.g. `"!?!?!?"`, `"a a a a"`).
  *
- * The 6-char floor is a deliberate trade-off:
- * - REJECTS: `工程师` (3), `the` (3), `salary` (6 borderline — actually
- *   passes), short Chinese 4-char compounds like `生日礼物` (4 chars,
- *   borderline-private but still rejected — operator can add manually
- *   if they really want it).
- * - ACCEPTS: `salary at acme` (14), `家庭住址` (4 — wait, that's 4),
- *   ...
+ * Examples:
  *
- * Actually rechecking: `家庭住址` is 4 chars. Rejected by the 6-char floor
- * — operator must add manually. The trade-off favors false negatives
- * (operator manual edit) over false positives (poisoning substring
- * matcher for years). Empirically the matcher's catastrophic case is
- * short common words, so the 6-char floor catches the worst of it.
+ *   REJECTED (too-short, len < 6):
+ *     "the" (3) · "了" (1) · "工程师" (3)
+ *     "我的生日" (4) · "家庭住址" (4) · "生日礼物" (4)
+ *
+ *   REJECTED (no-substantive-word, len >= 6 but no 4+ run):
+ *     "!@#$%^&*" · "a a a a" · "x x x x x x x"
+ *
+ *   ACCEPTED:
+ *     "salary" (6, single 6-run) · "salary information" (18, multi-run)
+ *     "涉及人际冲突的表述" (8 CJK) · "medical history" (15)
+ *     "kevin@acme.io" (13, runs `kevin`/`acme`/`io`)
+ *
+ * The 6-char floor is a deliberate trade-off: it rejects some
+ * legitimate short CJK compounds (`家庭住址` would be private) in
+ * exchange for catching the catastrophic short-common-word case
+ * (`工程师` would match every engineering-related line forever).
+ * Operators who want a short rule can edit `privacy-rules.md`
+ * directly — this gate is only on the programmatic write boundary.
  *
  * Exported for testing.
  */
