@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { appConfig } from '../config.js';
 import { applyL1, loadL2Rules, extractL2PrivatePhrases } from '../privacy-rules.js';
@@ -629,9 +629,49 @@ export class MemoryStore {
     }
   }
 
+  /**
+   * Atomically write the sidecar JSON for a slug.
+   *
+   * R1-audit finding on PR #92 (v1.0.14): a plain `fs.writeFile` on the
+   * final `.meta.json` path is NOT atomic — two concurrent `saveSkill`
+   * calls on the same fresh slug can each pass the "no sidecar" check,
+   * then race to write the final file. The empirically-observed failure
+   * (3/50 of stress runs) was malformed JSON (`{...}\n}\n`-style mixed
+   * output), which {@link readSkillMeta} treats as null → the slug then
+   * falls into the `legacy-locked` branch on every subsequent save and
+   * becomes permanently un-recoverable without operator intervention.
+   *
+   * Mitigation: write to a per-process temp file in the same directory
+   * (so rename is intra-filesystem and atomic on POSIX), then rename onto
+   * the final path. The last writer's rename wins, but the file content
+   * is always a complete, valid JSON document — never a corrupt
+   * interleave. The security property is unchanged: the gate is
+   * `readSkillMeta`'s owner field, not the existence of the .tmp file.
+   *
+   * The race in "who wins ownership when two callers both see no
+   * sidecar" remains (analogous to the saveProfile TOCTOU in #54) — out
+   * of scope for this fix. What this DOES prevent is the much worse
+   * outcome where the racing writers brick the slug for everyone.
+   */
   private async writeSkillMeta(slug: string, meta: SkillMeta): Promise<void> {
     await fs.mkdir(this.skillsDir(), { recursive: true });
-    await fs.writeFile(this.skillMetaPath(slug), JSON.stringify(meta, null, 2) + '\n', 'utf-8');
+    const finalPath = this.skillMetaPath(slug);
+    // tmpPath MUST be unique per write — using only pid+timestamp collides
+    // when two parallel calls land in the same millisecond. Both would
+    // call fs.writeFile against the same tmp file, racing inside the
+    // syscall, and the second rename would then ENOENT because the first
+    // already moved the shared tmp away. randomBytes guarantees per-call
+    // uniqueness with negligible collision risk.
+    const tmpPath = `${finalPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+    try {
+      await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2) + '\n', 'utf-8');
+      await fs.rename(tmpPath, finalPath);
+    } catch (err) {
+      // Best-effort cleanup; ignore unlink failures (the tmp file may
+      // already be gone if rename partially succeeded).
+      try { await fs.unlink(tmpPath); } catch {}
+      throw err;
+    }
   }
 
   /**

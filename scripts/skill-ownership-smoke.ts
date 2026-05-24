@@ -316,4 +316,56 @@ let testNum = 0;
   if (meta?.migrated !== true) fail('migrated flag should persist across updates');
 }
 
+// 16. Atomic sidecar write (v1.0.14 R1 audit) — concurrent writes on a
+//     fresh slug never produce a corrupt sidecar. Pre-fix, a plain
+//     fs.writeFile on the final path could interleave two writers and
+//     emit malformed JSON (e.g. `{...}\n}\n`); readSkillMeta would then
+//     null out and the slug would be permanently legacy-locked. With
+//     tmp+rename, every observed sidecar must parse as valid SkillMeta.
+//
+//     We launch many parallel claims (alice + bob, alternating). At
+//     least one MUST win ownership cleanly; readSkillMeta must return a
+//     populated SkillMeta whose created_by is one of the two callers.
+//     The slug must remain operable by its eventual owner (no permanent
+//     lockout).
+{
+  testNum++;
+  const { store, baseDir } = freshStore();
+  const N = 20;
+  const callers = Array.from({ length: N }, (_, i) => (i % 2 === 0 ? 'ou_alice' : 'ou_bob'));
+  await Promise.all(
+    callers.map((c, i) =>
+      store.saveSkill('Shared', `desc-${i}`, `body-${i}`, {
+        caller: c,
+        ownerOpenId: 'ou_owner',
+      }),
+    ),
+  );
+  const meta = await readMeta(baseDir, 'shared');
+  if (!meta) fail('concurrent claims must not leave a null/corrupt sidecar');
+  if (meta.created_by !== 'ou_alice' && meta.created_by !== 'ou_bob') {
+    fail(`unexpected owner from race: ${meta.created_by}`);
+  }
+  // Owner can still update — proves the slug is NOT bricked.
+  const r = await store.saveSkill('Shared', 'post-race', 'post-race body', {
+    caller: meta.created_by,
+    ownerOpenId: 'ou_owner',
+  });
+  if (!r.ok || r.action !== 'updated') {
+    fail(`post-race owner update must succeed, got ${JSON.stringify(r)}`);
+  }
+}
+
+// 17. writeSkillMeta — no .tmp leftovers in the skills dir after a normal
+//     save. Tmp files in the directory would be cosmetic noise but also
+//     a hint at unclean failure paths; ensure rename consumed the tmp.
+{
+  testNum++;
+  const { store, baseDir } = freshStore();
+  await store.saveSkill('Quiet', 'd', 'c', { caller: 'ou_alice', ownerOpenId: 'ou_owner' });
+  const files = await fs.readdir(path.join(baseDir, 'skills'));
+  const stragglers = files.filter((f) => f.includes('.tmp'));
+  if (stragglers.length > 0) fail(`tmp files left behind after normal save: ${stragglers.join(', ')}`);
+}
+
 console.log(`skill ownership smoke: ${testNum}/${testNum} PASS`);
