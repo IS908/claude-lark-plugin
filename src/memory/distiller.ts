@@ -5,12 +5,16 @@ import { applyL1 } from '../privacy-rules.js';
 /**
  * Distillation Stage 1: Buffer → Episode.
  */
-export function buildFlushPrompt(chatId: string, messages: BufferedMessage[]): string {
+export function buildFlushPrompt(
+  chatId: string,
+  messages: BufferedMessage[],
+  flushThreadId: string,
+): string {
   const conversation = messages
     .map((m) => `[${m.timestamp}] ${m.role === 'user' ? m.senderId : 'bot'}: ${m.text}`)
     .join('\n');
 
-  return flushPrompt(chatId, conversation, messages.length);
+  return flushPrompt(chatId, conversation, messages.length, flushThreadId);
 }
 
 /**

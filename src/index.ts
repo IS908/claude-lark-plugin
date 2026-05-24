@@ -209,7 +209,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.23' },
+    { name: 'claude-lark-plugin', version: '1.0.24' },
     {
       capabilities: {
         logging: {},
@@ -229,7 +229,13 @@ async function main() {
   // 4. Create conversation buffer + wire flush handler
   const buffer = new ConversationBuffer();
   buffer.setFlushHandler(async (chatId, messages) => {
-    const flushPrompt = buildFlushPrompt(chatId, messages);
+    // Generate flushKey FIRST so it can be interpolated into the
+    // prompt (Claude is then told to pass it as `thread_id` in the
+    // save_memory call — R1-audit followup on #87, closes the prompt
+    // gap where Claude could omit thread_id and fall back to the
+    // chat-level slot which resolves to the last real user).
+    const flushKey = `flush-${Date.now()}`;
+    const flushPrompt = buildFlushPrompt(chatId, messages, flushKey);
     // In auto-flush, we inject the prompt as if it were a message
     // The channel's message handler will forward it to Claude
     console.error(`[distiller] Auto-flush for chat ${chatId}: ${messages.length} messages`);
@@ -238,21 +244,39 @@ async function main() {
     // this, save_memory(type=chat) inside the flush turn fails caller
     // resolution because:
     //   - User entries are stored by IdentitySession under (chatId, threadId).
-    //   - The flush notification carries chatId only (no threadId, since the
-    //     buffer is chat-scoped, not thread-scoped).
-    //   - getCaller(chatId, undefined) falls back to a chat-level entry,
-    //     which is only present in non-threaded chats. Threaded chats miss.
+    //   - getCaller resolves by thread-key first, falls back to chat-key.
     //
-    // Chat episodes are stored by (chatId, threadId?), NOT by caller, so a
-    // sentinel caller doesn't change WHERE the data goes — only WHAT the
-    // audit log records. Mirrors scheduler.executePromptJob's pattern of
-    // binding job.meta.created_by before the cronjob notification.
-    identitySession.setCaller(chatId, undefined, SYSTEM_FLUSH_CALLER);
+    // Pre-v1.0.24 the binding lived at chat-level (threadId=undefined),
+    // which leaked across subsequent non-flush messages on the SAME
+    // chat (#87): any tool call resolving via the chat-level fallback
+    // — e.g. a Claude cronjob calling create_job(chat_id, thread_id=T2)
+    // where T2 isn't bound — would resolve to the SYSTEM_FLUSH_CALLER
+    // sentinel and be denied with the confusing "not authorized for
+    // system-flush caller" error long after the flush turn ended.
+    //
+    // Fix (v1.0.24, #87): bind under a flush-specific thread-key, and
+    // pass the same key as `threadId` so the channel notification
+    // carries `thread_id=flush-<ts>` → save_memory's resolveCaller
+    // does an EXACT thread match → no chat-level fallback pollution.
+    // The chat-level slot stays whatever the last real user message
+    // wrote, preserving correct identity for unrelated tool calls in
+    // other threads or no-thread paths within the same chat.
+    //
+    // Chat episodes are stored by (chatId, threadId?), NOT by caller,
+    // so a sentinel caller doesn't change WHERE the data goes — only
+    // WHAT the audit log records. Mirrors scheduler.executePromptJob's
+    // pattern of binding job.meta.created_by before the cronjob
+    // notification. The thread-key `flush-<ts>` matches LARK_ID_REGEX
+    // (alphanumeric + dash) so save_memory's tool-boundary regex
+    // accepts it. flushKey was generated above (used to interpolate
+    // into the prompt's `thread_id="${flushKey}"` instruction so
+    // Claude reliably passes it back — R1-audit followup on #87).
+    identitySession.setCaller(chatId, flushKey, SYSTEM_FLUSH_CALLER);
 
     // Forward flush prompt through the normal message handler
     if (channel['messageHandler']) {
       await channel['messageHandler']({
-        messageId: `flush-${Date.now()}`,
+        messageId: flushKey,
         chatId,
         // RESERVED: chatType='system' is the auto-flush distillation
         // marker. The Stop hook (hooks/enforce-lark-reply.mjs #74)
@@ -261,6 +285,12 @@ async function main() {
         // DO need a reply — they would be silently dropped.
         chatType: 'system',
         senderId: 'system',
+        // threadId surfaces as `thread_id=flush-<ts>` in the channel
+        // notification meta → Claude's save_memory call carries the
+        // same value as `thread_id` → resolveCaller hits the exact
+        // (chatId, flushKey) entry instead of the chat-level slot
+        // (#87 fix).
+        threadId: flushKey,
         text: flushPrompt,
         messageType: 'text',
         rawContent: flushPrompt,
