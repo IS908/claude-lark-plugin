@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.17] - 2026-05-24
+
+### Fixed
+- **Distiller auto-flush no longer silently drops L1-redirected profile lines** (#97 — **MEDIUM, silent privacy data loss**). v1.0.13 (#75) added a per-line L1 safety net inside `MemoryStore.saveProfile` that redirects sensitive lines from a public-tier write to private (append). v1.0.10's distiller prompt instructed Claude to call `save_memory(type="profile", tier, mode="replace")` TWICE per flush — once for public, once for private. The interaction was catastrophic:
+  1. First call: `tier="public" mode="replace"` with content `"phone is 13912345678\nuses Python"` → L1 hits the phone → APPENDS phone to private.md → REPLACES public.md with the safe subset.
+  2. Second call: `tier="private" mode="replace"` with content `"likes tea"` → REPLACES private.md → **the just-redirected phone line is gone**.
+
+  End state: an L1-class fact (phone, ID, salary, credential, etc.) is missing from BOTH tiers. The user later checks `what_do_you_know`, sees nothing, re-tells the fact, the next flush runs the same race, the fact disappears again — a "forget→repeat→forget" trap. Silent because no error is raised and the user cannot tell what was distilled vs lost without inspecting `~/.claude/channels/lark/memories/profiles/<id>/private.md` between flushes.
+
+  Fix: **single atomic server-side call**. New `save_memory(type="profile_tiered", content=<JSON>)` accepts a `{"public": [...], "private": [...]}` payload, runs the existing (until-now-dead) `parseTieredProfile` to apply L1 BEFORE any disk write — moving hits from public to private at the array level. Then issues two `saveProfile(mode='replace')` calls with the already-segregated arrays. Because the public array no longer contains L1 hits when `saveProfile` sees it, the storage-layer redirect doesn't fire, and the two replaces are independent and idempotent.
+
+  Distiller prompt (`src/prompts.ts:80`) updated to call the new single tool. The old dual-call `save_memory(type="profile", tier, mode="replace")` path is preserved for single-fact user-initiated writes (e.g. `/lark` skill "remember this preference") where the race doesn't apply.
+
+### Added
+- 8 smoke assertions in `scripts/profile-tiered-smoke.ts` covering: the exact #97 reproducer (phone-in-public ends up in private, never lost), multi-L1 redirect, empty-public truncation, empty-both truncation (old facts dropped per the "fresh-read replace" semantic), malformed-JSON falls back to all-private, idempotency under repeated apply (no replace→append regression), true replace drops old facts, pre-bulleted array elements don't double-bullet.
+- `save_memory(type="profile_tiered", ...)` new MCP tool variant. SYSTEM_FLUSH_CALLER is denied for this type too (defense in depth — profile-tier writes need a real user identity).
+
+### Operator notes
+- An auto-flush running mid-upgrade (old prompt cached, new server) would still issue the old dual-call pattern — the bug would still trigger on those specific turns. After the next MCP server restart (or session refresh) the new prompt is in effect.
+- The new `parseTieredProfile` server-side path is the architecture envisioned by v1.0.13 R3 audit (the helper was already exported but unused — this PR wires it in).
+
 ## [1.0.16] - 2026-05-24
 
 ### Security

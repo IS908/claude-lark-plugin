@@ -11,6 +11,7 @@ import type { IdentitySession } from './identity-session.js';
 import { SYSTEM_FLUSH_CALLER } from './identity-session.js';
 import { audit } from './audit-log.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
+import { parseTieredProfile } from './memory/distiller.js';
 import { JOB_THREAD_PREFIX } from './scheduler.js';
 import { writeSdkResource } from './sdk-resource.js';
 
@@ -739,11 +740,11 @@ export function registerTools(
         'Save a memory entry for cross-session recall. Only save durable, reusable facts — user preferences, communication style, key decisions, ongoing projects, resolved problems. Do NOT save pleasantries, failed attempts, ephemeral details, or conversation filler. Profile writes always save facts about the CALLER of this tool (i.e. the Feishu user whose message triggered the current turn) — you cannot save profile facts about a different user. For profile writes, pass tier="public" only for facts that are safe for anyone mentioning this user to see (job title, tech stack, team); everything else defaults to "private" (owner-only).',
       inputSchema: z.object({
         type: z
-          .enum(['profile', 'chat', 'thread'])
+          .enum(['profile', 'profile_tiered', 'chat', 'thread'])
           .describe(
-            'Memory type: "profile" for facts about the caller, "chat" for conversation summary, "thread" for thread-level summary'
+            'Memory type: "profile" for a single fact about the caller (specify tier + mode), "profile_tiered" for the full-tier replacement used by auto-flush distillation (content is a JSON object {public:[...], private:[...]}, server splits + applies L1 + writes both tiers atomically), "chat" for conversation summary, "thread" for thread-level summary.'
           ),
-        content: z.string().describe('The memory content to save (concise, factual)'),
+        content: z.string().describe('The memory content to save (concise, factual). For type="profile_tiered" this is a JSON string {"public": [...], "private": [...]}.'),
         reason: z.string().describe('Why this is worth remembering'),
         chat_id: larkIdSchema('chat_id').describe('Chat ID — required; also used to resolve caller identity'),
         thread_id: larkIdSchema('thread_id')
@@ -773,6 +774,13 @@ export function registerTools(
         type === 'profile'
           ? { type, chat_id, thread_id, tier, mode }
           : { type, chat_id, thread_id };
+      // profile_tiered audit args: same shape as profile (caller-attributed
+      // write that ends up in profile/* dirs) but tier/mode are server-set,
+      // not user-supplied — omit them from audit to avoid implying they
+      // came from Claude.
+      if (type === 'profile_tiered') {
+        Object.assign(auditArgs, { type });
+      }
       const auth = resolveCaller('save_memory', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const { caller } = auth;
@@ -785,14 +793,14 @@ export function registerTools(
       // sentinel "writer" has no user identity to legitimately own
       // private-tier data. The flush prompt already forbids type=profile,
       // this is the server-side guard against Claude going off-script.
-      if (type === 'profile' && caller === SYSTEM_FLUSH_CALLER) {
+      if ((type === 'profile' || type === 'profile_tiered') && caller === SYSTEM_FLUSH_CALLER) {
         void audit('save_memory', caller, auditArgs, 'denied');
         return {
           content: [
             {
               type: 'text' as const,
               text:
-                'save_memory(type=profile) denied: caller is the system-flush sentinel. ' +
+                `save_memory(type=${type}) denied: caller is the system-flush sentinel. ` +
                 'Profile writes need a real user identity. If you reached this in an ' +
                 'auto-flush turn, restrict to type=chat or type=thread.',
             },
@@ -809,6 +817,49 @@ export function registerTools(
         return {
           content: [
             { type: 'text' as const, text: `Saved ${effectiveTier} profile for ${caller} (mode: ${effectiveMode}). Reason: ${reason}` },
+          ],
+        };
+      }
+
+      // profile_tiered: distiller auto-flush path (#97).
+      //
+      // Pre-v1.0.17 the distiller prompt told Claude to call save_memory
+      // twice — once with tier='public' mode='replace', once with
+      // tier='private' mode='replace'. With v1.0.13's L1 safety net
+      // (#75), the FIRST call could redirect L1-hit lines from public
+      // to private (append). Then the SECOND call's mode='replace' on
+      // private would OVERWRITE that just-redirected content with
+      // whatever Claude originally classified as private — silently
+      // losing the redirected data. End state: an L1-hit fact (phone,
+      // ID, credential) is gone from both tiers.
+      //
+      // Fix: one atomic server-side write using the existing (dead
+      // pre-v1.0.17) parseTieredProfile helper. Claude submits a JSON
+      // {"public":[...], "private":[...]}; the server runs L1 on the
+      // public array (moving hits to private), then writes both tiers
+      // in a single replace operation. Because the public array no
+      // longer contains L1 hits, saveProfile's internal redirect
+      // doesn't fire — the two replaces are independent and idempotent.
+      if (type === 'profile_tiered') {
+        const tiered = parseTieredProfile(content);
+        // Materialize each array as a markdown bullet list (saveProfile
+        // mode='replace' writes content verbatim — we owe the bullets).
+        // Empty array → empty content; saveProfile in replace mode will
+        // truncate the file to empty. That's the right semantic for the
+        // distiller's "this user has nothing in tier X" case.
+        const fmt = (arr: string[]) =>
+          arr.map((line) => (line.startsWith('-') ? line : `- ${line}`)).join('\n') +
+          (arr.length > 0 ? '\n' : '');
+        await memoryStore.saveProfile(caller, fmt(tiered.public), 'public', 'replace');
+        await memoryStore.saveProfile(caller, fmt(tiered.private), 'private', 'replace');
+        void audit('save_memory', caller, auditArgs, 'ok');
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `Saved tiered profile for ${caller}: ${tiered.public.length} public, ${tiered.private.length} private. Reason: ${reason}`,
+            },
           ],
         };
       }

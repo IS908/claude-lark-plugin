@@ -77,7 +77,11 @@ Classification rules (apply in order; higher priority wins):
    - chatType=p2p → unknown facts default to private (never voluntarily shared beyond 1:1).
 5. When truly uncertain: choose private.
 
-Return ONLY the JSON object, no prose or code fences. Then call save_memory(type="profile", content=<public-array-as-markdown-list>, reason=<why>, chat_id=<current>, tier="public", mode="replace") and again with tier="private" for the private array. Skip either call if its array is empty. mode="replace" is required — this flush rewrites the full tier from a fresh read of history, so the existing file should be overwritten rather than appended to.`;
+Return the JSON object inline (no code fence). Then call save_memory exactly ONCE with type="profile_tiered" and pass the JSON object as the content string:
+
+  save_memory(type="profile_tiered", content=<the JSON string>, reason=<why>, chat_id=<current>)
+
+The server parses the JSON, applies the L1 privacy safety net (anything classified public that matches a regex/keyword rule like phone numbers, IDs, credentials, salary keywords is forced into private), and atomically writes both tier files. Do NOT make two separate save_memory(type="profile") calls — that pre-v1.0.17 dual-call pattern races with the L1 safety net and silently drops the redirected lines (#97). Empty arrays are fine; the server truncates the corresponding tier file.`;
 }
 
 /**
