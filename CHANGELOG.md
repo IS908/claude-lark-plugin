@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.11] - 2026-05-24
+
+### Fixed
+- **Stop hook's remediation hint listed `edit_message` as a satisfying tool** (#72). v1.0.10 dropped `edit_message` from the hook's `REPLY_TOOLS` set (its `message_id` targets the bot's own card, not the user's inbound id), but the block-message text injected into Claude's context still said `"Call mcp__plugin_lark_lark__reply (or edit_message / react targeting the same message_id) ..."`. Claude reading that hint after a block could call `edit_message` and get blocked again on the very next Stop event — a one-extra-round UX cost, no behavior-safety impact. Updated the hint to recommend only `reply` and `react`, with an explicit note that `edit_message` does NOT satisfy and why.
+
+  Also synced two adjacent stale doc/prompt strings carrying the same v1.0.10-era conflation (found during PR #73 audit):
+
+  - `src/prompts.ts` `mcpServerInstructions` — was "Interact via reply / edit_message / react" (listing three tools as peers, implying equivalence). The new wording distinguishes the three by role: reply = canonical substantive answer; react = ack-only for trivial messages that need no answer; edit_message = patches a prior bot card and does NOT count as responding to a user. The instruction string is in Claude's context every session; the old triad was leading Claude to occasionally substitute the wrong tool.
+  - `CLAUDE.md` Stop-hook description — was "not answered by `reply` / `edit_message` / `react`" → "not answered by `reply` or `react`" with an inline note on why `edit_message` is excluded. Was stale since v1.0.10 itself.
+
+  Also synced the stale `collectReplies` code comment (still mentioned "edit_message and react").
+
+  New smoke test 28 asserts the hint string does not list `edit_message` as a satisfying option. The regression guard catches the specific bad pattern (`"(or edit_message"`) without false-positiving the new corrective phrasing that legitimately mentions `edit_message` in a NEGATIVE context.
+
 ## [1.0.10] - 2026-05-23
 
 ### Added

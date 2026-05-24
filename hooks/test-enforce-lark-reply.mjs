@@ -654,6 +654,39 @@ console.log('\n[27] large transcript (> 2 MB) → tail-only read still finds cur
   assertContains(r.stderr, 'om_tail_pending', 'tail-pending id surfaces in block message');
 }
 
+// --- Test 28: block message text stays in sync with REPLY_TOOLS (#72) ---
+// The injected remediation hint MUST NOT mention `edit_message` as a
+// satisfying tool — REPLY_TOOLS deliberately excludes it (its message_id
+// targets the bot's previous card, not the user's inbound id). Listing
+// it in the hint would mislead Claude into calling edit_message after a
+// block, getting blocked AGAIN on the next Stop event — a UX regression
+// that v1.0.10 shipped accidentally.
+console.log('\n[28] block-message hint matches REPLY_TOOLS (no edit_message mention) — #72 regression guard');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_h" message_id="om_h" user="kk" chat_type="group">\nplease help\n</channel>';
+  const path = writeTranscript('hint-no-edit-message', [
+    makeUserMsg(userContent),
+    // No reply tool call — should block, surfacing the remediation hint.
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'unreplied message blocks');
+  // The hint MUST recommend reply and react, but NOT list edit_message
+  // as a way to satisfy the obligation. (If a future change re-adds
+  // edit_message to REPLY_TOOLS, update both the code and this guard.)
+  assertContains(r.stderr, 'mcp__plugin_lark_lark__reply', 'hint mentions reply');
+  // The OLD bad phrasing was `"reply (or edit_message / react ..."` —
+  // listing edit_message as a satisfying option. The corrective phrasing
+  // mentions edit_message only in a NEGATIVE context ("does NOT satisfy").
+  // Detect the specific bad pattern, not edit_message in general.
+  if (/\(or\s+edit_message\b/.test(r.stderr) || /edit_message\s*\/\s*react\s+targeting/.test(r.stderr)) {
+    console.log(`  ${RED}✗${RESET} hint lists edit_message as a satisfying tool (bug #72 regressed). stderr: ${r.stderr.slice(0, 300)}`);
+    failed++;
+  } else {
+    passed++;
+  }
+}
+
 // --- Summary ---
 console.log(`\n${'─'.repeat(50)}`);
 if (failed === 0) {

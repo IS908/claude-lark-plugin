@@ -311,8 +311,11 @@ function collectReplies(entries, fromIndex) {
     for (const t of tools) {
       if (!REPLY_TOOLS.has(t.name)) continue;
       const input = t.input || {};
-      // For edit_message and react, the target message_id is in `message_id`
-      // not `reply_to` — both fields are accepted as the target.
+      // For react the target message_id is in `message_id` (the user's
+      // message being reacted to), not `reply_to` — both fields are accepted
+      // as the target. (edit_message is excluded from REPLY_TOOLS above —
+      // its message_id targets the BOT's previous message, not the user's
+      // inbound id, so it cannot satisfy a pending reply obligation.)
       const targetMessageId = input.reply_to || input.message_id || '';
       replies.push({
         tool: t.name,
@@ -419,7 +422,7 @@ function buildBlockMessage(unanswered) {
   }
   lines.push(
     '',
-    'Call mcp__plugin_lark_lark__reply (or edit_message / react targeting the same message_id) for each pending message before ending the turn.',
+    'Call mcp__plugin_lark_lark__reply (or react targeting the same message_id) for each pending message before ending the turn. Note: edit_message does NOT satisfy this — its message_id targets the bot\'s own card, not the user\'s inbound id, so calling edit_message will leave the user unaddressed and re-trigger this block.',
     'If you intentionally do NOT want to reply (async handling / non-actionable event),',
     'put the literal sentinel [LARK_DEFER] or [LARK_NO_REPLY] on its OWN LINE in your text output for this turn.'
   );
