@@ -17,7 +17,8 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { Readable } from 'node:stream';
-import { writeSdkResource, describeSdkResource } from '../src/sdk-resource.js';
+import { writeSdkResource, describeSdkResource, WriteSdkResourceTooLargeError } from '../src/sdk-resource.js';
+import { statSync, existsSync } from 'node:fs';
 import { capSanitizedFilename } from '../src/tools.js';
 import { registerTools } from '../src/tools.js';
 import type { MemoryStore } from '../src/memory/file.js';
@@ -318,8 +319,97 @@ function setup(respFor: (fileKey: string, type: string) => unknown) {
   passed++;
 }
 
+// ── #108 (v1.0.20): size cap + streaming + partial-file cleanup ──
+
+// 11. Buffer branch enforces maxBytes BEFORE write — file is NOT created.
+{
+  const filePath = path.join(tmpInbox, 'too-big-buffer.bin');
+  const big = Buffer.alloc(2048, 'x');
+  let threw = false;
+  try {
+    await writeSdkResource(big, filePath, { maxBytes: 1024 });
+  } catch (err) {
+    threw = true;
+    if (!(err instanceof WriteSdkResourceTooLargeError)) {
+      fail(`11: expected WriteSdkResourceTooLargeError, got ${err}`);
+    }
+    if ((err as WriteSdkResourceTooLargeError).maxBytes !== 1024) {
+      fail(`11: error.maxBytes wrong`);
+    }
+  }
+  if (!threw) fail('11: Buffer over-cap must throw');
+  // File MUST NOT exist — Buffer branch checks before any write.
+  if (existsSync(filePath)) fail(`11: file should NOT have been created: ${filePath}`);
+  passed++;
+}
+
+// 12. Stream branch enforces maxBytes mid-stream + cleans up partial file.
+//     Pre-fix (v1.0.19), the stream branch buffered EVERY chunk into
+//     `Buffer.concat(chunks)` — heap = file size. Five concurrent
+//     30MB downloads → 150MB heap → OOM on a 1GB VM.
+{
+  const filePath = path.join(tmpInbox, 'too-big-stream.bin');
+  // 4 chunks × 512 bytes = 2048 total, cap at 1024.
+  const stream = Readable.from([
+    Buffer.alloc(512, 'a'),
+    Buffer.alloc(512, 'b'),
+    Buffer.alloc(512, 'c'),
+    Buffer.alloc(512, 'd'),
+  ]);
+  let threw = false;
+  try {
+    await writeSdkResource(stream, filePath, { maxBytes: 1024 });
+  } catch (err) {
+    threw = true;
+    if (!(err instanceof WriteSdkResourceTooLargeError)) {
+      fail(`12: expected WriteSdkResourceTooLargeError, got ${err}`);
+    }
+  }
+  if (!threw) fail('12: stream over-cap must throw');
+  // Partial file CLEANED UP — next caller doesn't see truncated payload.
+  if (existsSync(filePath)) {
+    const size = statSync(filePath).size;
+    fail(`12: partial file not cleaned up (size=${size}): ${filePath}`);
+  }
+  passed++;
+}
+
+// 13. Stream branch — under-cap stream writes successfully (regression
+//     guard: the new pipeline+sizeCap+createWriteStream chain must
+//     produce identical output to the pre-fix Buffer.concat path for
+//     normal-sized payloads).
+{
+  const filePath = path.join(tmpInbox, 'ok-stream.bin');
+  const stream = Readable.from([Buffer.from('chunk1-'), Buffer.from('chunk2')]);
+  await writeSdkResource(stream, filePath, { maxBytes: 1024 });
+  const written = readFileSync(filePath, 'utf-8');
+  if (written !== 'chunk1-chunk2') fail(`13: stream under-cap mismatch: ${written}`);
+  passed++;
+}
+
+// 14. Default cap is Infinity (back-compat — callers that don't pass
+//     opts get the pre-v1.0.20 behavior, modulo the new stream-to-disk
+//     memory characteristics).
+{
+  const filePath = path.join(tmpInbox, 'no-cap.bin');
+  const huge = Buffer.alloc(10 * 1024 * 1024, 'z'); // 10MB
+  // No opts → maxBytes defaults to Infinity → succeeds.
+  await writeSdkResource(huge, filePath);
+  if (statSync(filePath).size !== huge.length) fail(`14: default-cap write should succeed`);
+  passed++;
+}
+
+// 15. opts.maxBytes=Infinity explicitly opts out of the cap.
+{
+  const filePath = path.join(tmpInbox, 'infinity.bin');
+  const stream = Readable.from([Buffer.alloc(2048, 'x')]);
+  await writeSdkResource(stream, filePath, { maxBytes: Infinity });
+  if (statSync(filePath).size !== 2048) fail(`15: infinity cap should accept any size`);
+  passed++;
+}
+
 rmSync(tmpInbox, { recursive: true, force: true });
 delete process.env.LARK_INBOX_DIR;
 
-console.log(`download-attachment smoke: ${passed}/15 PASS`);
+console.log(`download-attachment smoke: ${passed}/20 PASS`);
 

@@ -74,6 +74,18 @@ export const appConfig = {
   cronScanInterval: optionalNumber('LARK_CRON_SCAN_INTERVAL', 60),
   cronTimezone: optional('LARK_CRON_TIMEZONE', Intl.DateTimeFormat().resolvedOptions().timeZone),
 
+  // Attachment download (#108)
+  //   maxDownloadBytes: per-file upper bound enforced INSIDE writeSdkResource.
+  //     Feishu allows 30MB images / 50MB files / 300MB videos; default 50MB
+  //     covers images+files comfortably and refuses pathological/video.
+  //   downloadTimeoutMs: timeout for the inline-in-event-handler image
+  //     download. If exceeded, the notification is forwarded WITHOUT
+  //     image_path (Claude won't have the local file); the download
+  //     continues in the background so a later Read may still succeed
+  //     if it lands within the inbox-GC window.
+  maxDownloadBytes: optionalNumber('LARK_MAX_DOWNLOAD_BYTES', 50 * 1024 * 1024),
+  downloadTimeoutMs: optionalNumber('LARK_DOWNLOAD_TIMEOUT_MS', 10_000),
+
   // Memory
   minSearchScore: optionalNumber('LARK_MIN_SEARCH_SCORE', 0.3),
   maxSearchResults: optionalNumber('LARK_MAX_SEARCH_RESULTS', 2),

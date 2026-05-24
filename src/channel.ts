@@ -622,18 +622,55 @@ export class LarkChannel {
    * the bot itself uploaded — not images users send to the bot.
    */
   private async downloadImage(imageKey: string, messageId: string): Promise<string | undefined> {
+    // Bounded-time inline download (#108 fix, v1.0.20). Pre-fix this
+    // was a naked `await` inside handleMessageEvent, so a 30MB image
+    // could stall the event-loop processing of NEW messages from
+    // OTHER users in the same chat / other chats — observed 5–30s
+    // "bot ignored me" latency in active groups. Now: race against
+    // LARK_DOWNLOAD_TIMEOUT_MS (default 10s). On timeout the inline
+    // path returns undefined so the channel notification fires WITHOUT
+    // image_path; the actual download continues in the background and
+    // may still complete in time for Claude's Read tool to find it.
     try {
       mkdirSync(appConfig.inboxDir, { recursive: true });
-      const resp = await this.client.im.v1.messageResource.get({
-        path: { message_id: messageId, file_key: imageKey },
-        params: { type: 'image' },
-      } as any);
-      if (!resp) return undefined;
       const filename = `${Date.now()}-${imageKey}.png`;
       const filePath = path.join(appConfig.inboxDir, filename);
-      await writeSdkResource(resp, filePath);
-      debugLog(`[channel] Downloaded image ${imageKey} → ${filePath}`);
-      return filePath;
+
+      const downloadPromise = (async () => {
+        const resp = await this.client.im.v1.messageResource.get({
+          path: { message_id: messageId, file_key: imageKey },
+          params: { type: 'image' },
+        } as any);
+        if (!resp) return undefined;
+        await writeSdkResource(resp, filePath, { maxBytes: appConfig.maxDownloadBytes });
+        debugLog(`[channel] Downloaded image ${imageKey} → ${filePath}`);
+        return filePath;
+      })();
+
+      // The timeout doesn't abort the underlying SDK call (the Lark
+      // SDK does not expose AbortController); it just bounds how long
+      // the event handler waits. The download keeps running and the
+      // file appears in inbox once it completes — Claude's Read tool
+      // can still pick it up if the operator's prompt comes after.
+      let timer: NodeJS.Timeout | undefined;
+      const timeoutPromise = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => {
+          debugLog(
+            `[channel] Image ${imageKey} download exceeded ${appConfig.downloadTimeoutMs}ms — continuing in background`,
+          );
+          resolve(undefined);
+        }, appConfig.downloadTimeoutMs);
+      });
+
+      // Detach errors from background continuation so they don't
+      // become unhandled rejections after the timeout fires.
+      downloadPromise.catch((err) => {
+        debugLog(`[channel] Background image download ${imageKey} failed: ${err}`);
+      });
+
+      const result = await Promise.race([downloadPromise, timeoutPromise]);
+      if (timer) clearTimeout(timer);
+      return result;
     } catch (err) {
       debugLog(`[channel] Failed to download image ${imageKey}: ${err}`);
       return undefined;

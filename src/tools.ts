@@ -13,7 +13,7 @@ import { audit } from './audit-log.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
 import { parseTieredProfile } from './memory/distiller.js';
 import { JOB_THREAD_PREFIX } from './scheduler.js';
-import { writeSdkResource } from './sdk-resource.js';
+import { writeSdkResource, WriteSdkResourceTooLargeError } from './sdk-resource.js';
 
 /**
  * Strip Feishu `<at>` tags from outbound text to block prompt-injected
@@ -736,9 +736,27 @@ export function registerTools(
             isError: true,
           };
         }
-        await writeSdkResource(data, filePath);
+        await writeSdkResource(data, filePath, { maxBytes: appConfig.maxDownloadBytes });
         return { content: [{ type: 'text' as const, text: `Downloaded to ${filePath}` }] };
       } catch (err: any) {
+        // Size-cap rejection is a recognizable error with a clean user-
+        // facing message (#108 — pre-fix this would have been a generic
+        // failure or worse, an OOM crash).
+        if (err instanceof WriteSdkResourceTooLargeError) {
+          console.error(`[tools] download rejected: ${err.message}`);
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `Download rejected: file exceeds the ${err.maxBytes}-byte cap ` +
+                  `(LARK_MAX_DOWNLOAD_BYTES). Either raise the limit in .env (for trusted senders) ` +
+                  `or skip this attachment. file_key=${file_key}`,
+              },
+            ],
+          };
+        }
         const apiError = err?.response?.data ?? err?.data;
         if (apiError?.code && apiError?.msg) {
           console.error(`[tools] download failed [${apiError.code}]: ${apiError.msg}`);
