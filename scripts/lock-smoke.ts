@@ -135,4 +135,40 @@ let testNum = 0;
   }
 }
 
+// 9. R1-audit followup: getProcessStartTime pins LC_ALL=C / LANG=C
+//    internally so its output is stable regardless of the operator's
+//    environment LANG/LC_ALL. Two consecutive reads of the SAME pid
+//    under arbitrary outer LANG should yield IDENTICAL output.
+//    Pre-fix, sudo / systemd / non-English locale would yield a
+//    localized string that differed from the writer's value → false
+//    "stale, overwrite" → two bots run.
+{
+  testNum++;
+  const selfStart = getProcessStartTime(process.pid);
+  if (selfStart === null) {
+    console.error('SKIP 9: ps unavailable on this platform');
+  } else {
+    // Temporarily set non-English LANG; helper should still return
+    // the C-locale string (same as the unset / default read).
+    const origLang = process.env.LANG;
+    const origLcAll = process.env.LC_ALL;
+    process.env.LANG = 'zh_CN.UTF-8';
+    process.env.LC_ALL = 'zh_CN.UTF-8';
+    try {
+      const underNonEnglish = getProcessStartTime(process.pid);
+      if (underNonEnglish !== selfStart) {
+        fail(
+          `9: LC_ALL pinning failed — outer LANG=zh_CN.UTF-8 produced ` +
+          `"${underNonEnglish}" vs default "${selfStart}"`,
+        );
+      }
+    } finally {
+      if (origLang === undefined) delete process.env.LANG;
+      else process.env.LANG = origLang;
+      if (origLcAll === undefined) delete process.env.LC_ALL;
+      else process.env.LC_ALL = origLcAll;
+    }
+  }
+}
+
 console.log(`lock smoke: ${testNum}/${testNum} PASS`);

@@ -37,9 +37,17 @@ import { execFileSync } from 'node:child_process';
 export function getProcessStartTime(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
+    // R1-audit followup on PR #124: pin LC_ALL=C / LANG=C so the
+    // locale-formatted output is stable regardless of the operator's
+    // environment. Pre-pin, a writer under default LANG and a reader
+    // under sudo / systemd (which often clears LANG → C, or sets a
+    // non-English locale like zh_CN.UTF-8) would see DIFFERENT
+    // start-time strings for the SAME live process — the equality
+    // check would fail → "stale, overwrite" → two bots run.
     const out = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
     }).trim();
     return out || null;
   } catch {

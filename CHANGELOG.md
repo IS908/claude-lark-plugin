@@ -19,8 +19,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   New module `src/lock.ts` holds the pure helpers (`getProcessStartTime`, `buildLockToken`, `parseLockToken`) so unit tests can exercise them without importing `src/index.ts` (which would trigger `main()` and connect to Feishu).
 
 ### Added
-- 8 smoke assertions in new `scripts/lock-smoke.ts` covering: malformed-input rejection, legacy PID-only parse → empty start-time, well-formed pid|start-time round-trip, whitespace tolerance, invalid-pid rejection in `getProcessStartTime`, self-PID start-time non-empty (skipped on platforms without `ps`), definitely-dead PID returns null, `buildLockToken` round-trips through `parseLockToken`.
+- 9 smoke assertions in new `scripts/lock-smoke.ts` covering: malformed-input rejection, legacy PID-only parse → empty start-time, well-formed pid|start-time round-trip, whitespace tolerance, invalid-pid rejection in `getProcessStartTime`, self-PID start-time non-empty (skipped on platforms without `ps`), definitely-dead PID returns null, `buildLockToken` round-trips through `parseLockToken`, LC_ALL pinning consistency under non-English outer LANG (R1-audit followup).
 - New exports from `src/lock.ts`: `getProcessStartTime`, `buildLockToken`, `parseLockToken`.
+
+### R1-audit followups (closed in this PR)
+- **Startup-race TOCTOU**: two bots starting simultaneously could both hit EEXIST, both read the same stale token, both decide stale, and both overwrite — the last writer wins on the FILE but BOTH processes proceeded past `acquireLock`. Fix: after writing, re-read and confirm the file contents equal `myToken`; mismatch means another bot won, exit cleanly.
+- **`process.kill(pid, 0)` EPERM on Linux**: the bare `catch` swallowed EPERM (process exists but we lack permission to signal — e.g. cross-uid) as "process gone", which would overwrite a legitimate other-user lock. Fix: distinguish `err.code === 'EPERM'` (exists) from ESRCH (gone). When EPERM is paired with unreadable start-time (cross-uid `ps` also typically returns nothing), refuse with a clear "manually delete the lock after confirming the other instance is stopped" message rather than silently overwriting.
+- **`ps -o lstart=` locale instability**: the output is locale-formatted (`Sun May 25 02:30:00 2026` under en_US vs `日 5月/25 02:30:00 2026` under zh_CN). A writer under default LANG and a reader under sudo/systemd (which often clears LANG → C, or sets non-English) would compare DIFFERENT strings for the SAME live process → false stale → overwrite. Fix: `execFileSync` env now pins `LC_ALL=C` and `LANG=C` so output is stable across operator environments.
 
 ### Operator notes
 - After upgrading, a stale legacy lock file is auto-overwritten on first startup with a `[lock] Stale lock for PID N (legacy pre-v1.0.23 lock file) — overwriting.` stderr line. No manual cleanup needed.

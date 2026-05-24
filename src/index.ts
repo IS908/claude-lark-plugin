@@ -41,12 +41,23 @@ async function acquireLock(): Promise<void> {
       await fs.writeFile(LOCK_FILE, myToken);
     } else {
       const { pid: recordedPid, startTime: recordedStart } = parsed;
+      // Distinguish "process gone" (ESRCH) from "process exists but
+      // I can't signal it" (EPERM, cross-uid). R1-audit followup on
+      // PR #124: pre-fix the catch swallowed both, so a Linux bot
+      // started under a different uid would see the lock holder's
+      // EPERM as "gone" and overwrite → two bots running.
       let pidExists = false;
       try {
         process.kill(recordedPid, 0);
         pidExists = true;
-      } catch {
-        // Process is gone.
+      } catch (err: any) {
+        if (err?.code === 'EPERM') {
+          // Process exists but we lack permission to signal it. Treat
+          // as alive — the recorded start-time check below still
+          // applies for identity disambiguation.
+          pidExists = true;
+        }
+        // ESRCH (or any other code) → process is gone.
       }
       if (pidExists) {
         const currentStart = getProcessStartTime(recordedPid);
@@ -55,9 +66,27 @@ async function acquireLock(): Promise<void> {
         // same process that wrote the lock → refuse. Otherwise PID
         // has been recycled OR the recorded value is from a legacy
         // pre-v1.0.23 PID-only lock → overwrite.
+        //
+        // EPERM edge: if `process.kill` failed with EPERM, `ps -p`
+        // also typically returns no rows for the cross-uid PID, so
+        // currentStart is null → falls through to overwrite. That's
+        // wrong (the lock holder IS alive); but the legitimate
+        // recovery path is "another user owns the lock — refuse",
+        // not "overwrite". Tighten by also refusing when pidExists
+        // is true AND currentStart is null AND recordedStart is
+        // non-empty (means: we know the process is alive but can't
+        // verify start-time, so err on the side of refusing).
         if (currentStart !== null && currentStart === recordedStart && recordedStart !== '') {
           console.error(
             `[lock] Another instance is running (PID ${recordedPid}, started ${recordedStart}). Exiting.`,
+          );
+          process.exit(1);
+        }
+        if (currentStart === null && recordedStart !== '') {
+          console.error(
+            `[lock] Lock holder PID ${recordedPid} exists but its start-time is unreadable ` +
+            `(likely owned by a different user). Refusing to overwrite — manually delete ` +
+            `${LOCK_FILE} after confirming the other instance is stopped.`,
           );
           process.exit(1);
         }
@@ -71,6 +100,30 @@ async function acquireLock(): Promise<void> {
       }
       await fs.writeFile(LOCK_FILE, myToken);
     }
+  }
+
+  // TOCTOU verify-after-write (R1-audit followup on PR #124): two
+  // bots starting simultaneously can both hit EEXIST, both read the
+  // same stale token, both decide stale, both overwrite — last
+  // writer wins but BOTH proceed past acquireLock. Re-read the file
+  // and confirm we're the winner; if not, exit cleanly.
+  try {
+    const persisted = await fs.readFile(LOCK_FILE, 'utf-8');
+    if (persisted.trim() !== myToken.trim()) {
+      console.error(
+        `[lock] Lost the startup race (another instance wrote the lock ` +
+        `between our read and our write). Exiting.`,
+      );
+      process.exit(1);
+    }
+  } catch {
+    // Lock file disappeared between our write and our verify (very
+    // unusual — would require an external rm). Treat as a refusal
+    // so we don't proceed without a valid lock.
+    console.error(
+      `[lock] Lock file vanished after we wrote it — refusing to start.`,
+    );
+    process.exit(1);
   }
 
   // Cleanup runs on every path that can take down the process —
