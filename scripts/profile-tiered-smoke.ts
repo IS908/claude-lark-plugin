@@ -46,13 +46,36 @@ function freshStore(): { store: MemoryStore; baseDir: string; userId: string } {
 // to stand up the full MCP server. If this drifts from the real handler
 // the test gives false confidence — so re-check after any tools.ts edit
 // to the profile_tiered branch.
-async function applyTieredProfile(store: MemoryStore, userId: string, json: string): Promise<void> {
-  const tiered = parseTieredProfile(json);
+//
+// Mirrors the R1-audit-hardened semantics:
+//   - malformed JSON / non-array tiers → throw (handler returns isError)
+//   - empty-both arrays → no-op (preserves existing)
+//   - single-side empty → still REPLACES the other tier with the new data
+//   - newlines collapsed in array elements (one fact per bullet line)
+async function applyTieredProfile(store: MemoryStore, userId: string, json: string): Promise<{ noop?: true }> {
+  const raw = json.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  let parsed: { public?: unknown; private?: unknown };
+  try { parsed = JSON.parse(raw); } catch (err) { throw new Error(`malformed JSON: ${(err as Error).message}`); }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.public) || !Array.isArray(parsed.private)) {
+    throw new Error('shape: needs {public:[...], private:[...]}');
+  }
+  const arrPublic = parsed.public as string[];
+  const arrPrivate = parsed.private as string[];
+  if (arrPublic.length === 0 && arrPrivate.length === 0) {
+    return { noop: true };
+  }
+  const tiered = parseTieredProfile(JSON.stringify({ public: arrPublic, private: arrPrivate }));
+  const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
   const fmt = (arr: string[]) =>
-    arr.map((line) => (line.startsWith('-') ? line : `- ${line}`)).join('\n') +
-    (arr.length > 0 ? '\n' : '');
+    arr
+      .map(oneLine)
+      .filter(Boolean)
+      .map((line) => (line.startsWith('-') ? line : `- ${line}`))
+      .join('\n') +
+    (arr.some((s) => oneLine(s).length > 0) ? '\n' : '');
   await store.saveProfile(userId, fmt(tiered.public), 'public', 'replace');
   await store.saveProfile(userId, fmt(tiered.private), 'private', 'replace');
+  return {};
 }
 
 async function readTier(baseDir: string, userId: string, tier: 'public' | 'private'): Promise<string> {
@@ -119,9 +142,9 @@ let testNum = 0;
   }
 }
 
-// 3. Empty public array — public.md is truncated to empty, private gets
-//    its full content. The distiller emits empty arrays for "no facts in
-//    this tier this cycle"; the server must honor that.
+// 3. Empty public array, populated private — public truncated to
+//    empty, private fully replaced. Single-side empty is the
+//    "rewrite from fresh read" semantic that the distiller intends.
 {
   testNum++;
   const { store, baseDir, userId } = freshStore();
@@ -137,9 +160,12 @@ let testNum = 0;
   if (!priv.includes('private only fact')) fail(`empty public: private missing fact: ${priv}`);
 }
 
-// 4. Empty BOTH arrays — both tier files truncated to empty.
-//    Honors the distiller's "this user produced no extractable facts"
-//    case rather than carrying old facts forward.
+// 4. Empty BOTH arrays — NO-OP, existing tiers preserved.
+//    R1-audit hardening: pre-fix would have truncated both tiers,
+//    nuking the user's entire profile on a low-content distillation
+//    cycle. New semantics treat empty-both as "produced no extractable
+//    facts" rather than "wipe the profile" — operator can still do an
+//    explicit wipe via forget_memory or by editing the files directly.
 {
   testNum++;
   const { store, baseDir, userId } = freshStore();
@@ -148,26 +174,65 @@ let testNum = 0;
   await store.saveProfile(userId, '- old private\n', 'private', 'replace');
 
   const json = JSON.stringify({ public: [], private: [] });
-  await applyTieredProfile(store, userId, json);
+  const result = await applyTieredProfile(store, userId, json);
+  if (!result.noop) fail('empty both should be a no-op');
 
   const pub = await readTier(baseDir, userId, 'public');
   const priv = await readTier(baseDir, userId, 'private');
-  if (pub.trim() !== '' || priv.trim() !== '') {
-    fail(`empty both: tiers should be empty, got pub="${pub}" priv="${priv}"`);
-  }
+  if (!pub.includes('old public')) fail(`empty-both no-op: prior public dropped: "${pub}"`);
+  if (!priv.includes('old private')) fail(`empty-both no-op: prior private dropped: "${priv}"`);
 }
 
-// 5. Malformed JSON — parseTieredProfile falls back to "treat as private"
-//    rather than throwing. The server still writes (no exception leaks
-//    to the tool handler), so the caller doesn't get a confusing crash.
+// 5. Malformed JSON — REJECTED, existing tiers preserved.
+//    R1-audit hardening: pre-fix the fallback path REPLACED public→empty
+//    and private→raw blob on any transient LLM JSON hiccup, silently
+//    destroying the user's existing public profile. New behavior is to
+//    refuse the write so Claude/operator sees a signal and can retry.
 {
   testNum++;
   const { store, baseDir, userId } = freshStore();
-  await applyTieredProfile(store, userId, 'NOT JSON {{{');
+  // Seed with prior content.
+  await store.saveProfile(userId, '- preserved public\n', 'public', 'replace');
+  await store.saveProfile(userId, '- preserved private\n', 'private', 'replace');
+
+  let threw = false;
+  try {
+    await applyTieredProfile(store, userId, 'NOT JSON {{{');
+  } catch (err) {
+    threw = true;
+    if (!/malformed JSON/.test(String(err))) {
+      fail(`malformed JSON: wrong error: ${err}`);
+    }
+  }
+  if (!threw) fail('malformed JSON must throw (handler returns isError)');
+
+  // Both prior tiers MUST be preserved — no destructive partial write.
   const pub = await readTier(baseDir, userId, 'public');
   const priv = await readTier(baseDir, userId, 'private');
-  if (pub.trim() !== '') fail(`malformed: public should be empty, got "${pub}"`);
-  if (!priv.includes('NOT JSON')) fail(`malformed: raw fell-back content not in private: "${priv}"`);
+  if (!pub.includes('preserved public')) fail(`malformed JSON: prior public destroyed: "${pub}"`);
+  if (!priv.includes('preserved private')) fail(`malformed JSON: prior private destroyed: "${priv}"`);
+}
+
+// 5b. Structurally-invalid JSON (e.g. public is a string instead of an
+//     array) — REJECTED, existing tiers preserved.
+//     R1-audit hardening: parseTieredProfile's default-to-[] would have
+//     silently emptied the public tier on a Claude shape-error.
+{
+  testNum++;
+  const { store, baseDir, userId } = freshStore();
+  await store.saveProfile(userId, '- preserved public\n', 'public', 'replace');
+
+  let threw = false;
+  try {
+    await applyTieredProfile(store, userId, JSON.stringify({ public: 'oops', private: [] }));
+  } catch (err) {
+    threw = true;
+    if (!/shape/.test(String(err))) fail(`shape-invalid: wrong error: ${err}`);
+  }
+  if (!threw) fail('shape-invalid JSON must throw');
+
+  const pub = await readTier(baseDir, userId, 'public');
+  if (!pub.includes('preserved public')) fail(`shape-invalid: prior public destroyed: "${pub}"`);
 }
 
 // 6. Idempotency — applying the same JSON twice produces the same files.
@@ -229,6 +294,28 @@ let testNum = 0;
   const pub = await readTier(baseDir, userId, 'public');
   if (pub.includes('- - fact A')) fail(`double-bullet bug: pub=${pub}`);
   if (!pub.includes('- fact A') || !pub.includes('- fact B')) fail(`pre-bulleted lost: pub=${pub}`);
+}
+
+// 9. Embedded newlines in array elements are collapsed to a single
+//    space — preserves one-fact-per-line semantics so listProfileLines
+//    can still address each line by hash. R1-audit nit #4.
+{
+  testNum++;
+  const { store, baseDir, userId } = freshStore();
+  const json = JSON.stringify({
+    public: ['multi\nline\nfact', 'normal fact'],
+    private: ['secret with\ttabs and  spaces'],
+  });
+  await applyTieredProfile(store, userId, json);
+  const pub = await readTier(baseDir, userId, 'public');
+  const priv = await readTier(baseDir, userId, 'private');
+  // The multi-line fact must collapse to one bullet line.
+  if (!pub.includes('- multi line fact')) fail(`newline collapse failed in public: ${pub}`);
+  // Each line in public.md is one fact — count non-empty lines.
+  const pubLines = pub.split('\n').filter((l) => l.trim());
+  if (pubLines.length !== 2) fail(`public should have exactly 2 bullet lines, got ${pubLines.length}: ${pub}`);
+  // Private side also normalized.
+  if (!priv.includes('- secret with tabs and spaces')) fail(`whitespace collapse failed in private: ${priv}`);
 }
 
 console.log(`profile-tiered smoke: ${testNum}/${testNum} PASS`);

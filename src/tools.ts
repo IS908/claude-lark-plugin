@@ -774,13 +774,6 @@ export function registerTools(
         type === 'profile'
           ? { type, chat_id, thread_id, tier, mode }
           : { type, chat_id, thread_id };
-      // profile_tiered audit args: same shape as profile (caller-attributed
-      // write that ends up in profile/* dirs) but tier/mode are server-set,
-      // not user-supplied — omit them from audit to avoid implying they
-      // came from Claude.
-      if (type === 'profile_tiered') {
-        Object.assign(auditArgs, { type });
-      }
       const auth = resolveCaller('save_memory', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const { caller } = auth;
@@ -841,15 +834,93 @@ export function registerTools(
       // longer contains L1 hits, saveProfile's internal redirect
       // doesn't fire — the two replaces are independent and idempotent.
       if (type === 'profile_tiered') {
-        const tiered = parseTieredProfile(content);
-        // Materialize each array as a markdown bullet list (saveProfile
-        // mode='replace' writes content verbatim — we owe the bullets).
-        // Empty array → empty content; saveProfile in replace mode will
-        // truncate the file to empty. That's the right semantic for the
-        // distiller's "this user has nothing in tier X" case.
+        // R1-audit hardening on PR #107 — refuse to write when the JSON
+        // is structurally invalid. parseTieredProfile's fallback path
+        // returns `{public:[], private:[raw blob]}` on parse failure,
+        // which my v1.0.17 first cut then mass-REPLACED both tiers,
+        // nuking the user's existing public profile on a single
+        // transient LLM JSON hiccup. Soft-fail instead: validate shape
+        // first, return a tool error if invalid, and let Claude retry
+        // (or the operator inspect logs) rather than silently destroy.
+        let parsed: { public?: unknown; private?: unknown };
+        try {
+          const raw = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          void audit('save_memory', caller, auditArgs, 'denied');
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `save_memory(type="profile_tiered") rejected: content is not valid JSON (${err instanceof Error ? err.message : String(err)}). ` +
+                  `Expected a {"public": [...], "private": [...]} object. No tiers were modified.`,
+              },
+            ],
+          };
+        }
+        if (
+          !parsed || typeof parsed !== 'object' ||
+          !Array.isArray(parsed.public) || !Array.isArray(parsed.private)
+        ) {
+          void audit('save_memory', caller, auditArgs, 'denied');
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `save_memory(type="profile_tiered") rejected: JSON must be an object with BOTH "public" and "private" as arrays of strings. ` +
+                  `No tiers were modified.`,
+              },
+            ],
+          };
+        }
+        // R1-audit hardening: empty-both is a no-op rather than a
+        // mass-truncate. The pre-v1.0.17 dual-call pattern naturally
+        // skipped empty-array calls ("Skip either call if its array is
+        // empty"); the new single-call default of "replace both" was
+        // strictly more destructive. The distiller's intent for empty-
+        // both is "produced no extractable facts this cycle", not
+        // "wipe the user's profile". Preserve existing facts; future
+        // explicit-nuke can be done via forget_memory or by editing the
+        // file. Single-side empty (one tier had no facts but the other
+        // produced facts) is still REPLACED — that's the intended
+        // "fresh rewrite" semantic.
+        const arrPublic = parsed.public as string[];
+        const arrPrivate = parsed.private as string[];
+        if (arrPublic.length === 0 && arrPrivate.length === 0) {
+          void audit('save_memory', caller, auditArgs, 'ok');
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `save_memory(type="profile_tiered"): both arrays empty — no-op (existing profile preserved). Reason: ${reason}`,
+              },
+            ],
+          };
+        }
+        // Re-run the L1 safety net via the existing helper (it accepts
+        // a raw string for tolerance with the LLM, but we already
+        // parsed; reconstruct from the parsed object so we don't
+        // re-parse our own JSON.stringify).
+        const tiered = parseTieredProfile(JSON.stringify({ public: arrPublic, private: arrPrivate }));
+        // Sanitize embedded newlines in array elements (R1-audit nit #4).
+        // A `\n` inside an element would create a multi-line bullet
+        // that listProfileLines splits into orphan lines on read,
+        // confusing what_do_you_know / forget_memory hash addressing.
+        // Collapse runs of whitespace (including \n, \r, \t) to a
+        // single space to keep one fact per line.
+        const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
         const fmt = (arr: string[]) =>
-          arr.map((line) => (line.startsWith('-') ? line : `- ${line}`)).join('\n') +
-          (arr.length > 0 ? '\n' : '');
+          arr
+            .map(oneLine)
+            .filter(Boolean)
+            .map((line) => (line.startsWith('-') ? line : `- ${line}`))
+            .join('\n') +
+          (arr.some((s) => oneLine(s).length > 0) ? '\n' : '');
         await memoryStore.saveProfile(caller, fmt(tiered.public), 'public', 'replace');
         await memoryStore.saveProfile(caller, fmt(tiered.private), 'private', 'replace');
         void audit('save_memory', caller, auditArgs, 'ok');
