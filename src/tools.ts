@@ -12,7 +12,7 @@ import { SYSTEM_FLUSH_CALLER } from './identity-session.js';
 import { audit } from './audit-log.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
 import { parseTieredProfile } from './memory/distiller.js';
-import { JOB_THREAD_PREFIX } from './scheduler.js';
+import { JOB_THREAD_PREFIX, PERMANENT_TARGET_CODES, getFeishuApiCode, getFeishuApiMsg } from './scheduler.js';
 import { writeSdkResource, WriteSdkResourceTooLargeError } from './sdk-resource.js';
 
 /**
@@ -136,6 +136,56 @@ export const LARK_ID_REGEX = /^[A-Za-z0-9_:-]{1,128}$/;
  * - `removed === 0`: caller should NOT call this — it's reserved for
  *   the success path.
  */
+/**
+ * If `err` is a Feishu API error indicating the target chat is
+ * permanently unreachable from the bot's POV (bot kicked, chat
+ * archived, no permission), return a tool-result object that defers
+ * gracefully instead of throwing back into the MCP framework (#106).
+ *
+ * Pre-fix, reply throws on permanent target errors propagated to
+ * Claude's turn as a generic exception; the Stop hook saw the inbound
+ * still unanswered and forced Claude to retry reply on the next turn —
+ * the same failing API call — until the turn budget was exhausted
+ * (Case 2 in #106).
+ *
+ * The returned isError text embeds `[LARK_DEFER]` on its own line so
+ * Claude can echo the sentinel in its own assistant text (per the Stop
+ * hook's documented bypass at `hooks/enforce-lark-reply.mjs`). The
+ * hook only scans assistant text blocks — NOT tool_result content —
+ * so this is best-effort; Claude must cooperate. But the text also
+ * names the failure mode plainly so Claude has every reason to defer
+ * rather than re-call the same failing tool.
+ *
+ * Returns `null` for non-permanent errors so the caller can rethrow.
+ */
+export function handlePermanentTargetError(
+  err: unknown,
+  context: { tool: 'reply' | 'edit_message'; chat_id?: string; message_id?: string },
+): { isError: true; content: { type: 'text'; text: string }[] } | null {
+  const code = getFeishuApiCode(err);
+  if (code === null || !PERMANENT_TARGET_CODES.has(code)) return null;
+  const reason = getFeishuApiMsg(err);
+  const target = context.chat_id ?? context.message_id ?? '<unknown>';
+  console.error(
+    `[tools] ${context.tool} hit permanent target error [${code}] on ${target}: ${reason}`,
+  );
+  return {
+    isError: true,
+    content: [
+      {
+        type: 'text' as const,
+        text:
+          `Target unreachable [${code}]: ${reason}.\n\n` +
+          `This is a PERMANENT error — the bot is kicked / the chat is archived / permission was revoked. ` +
+          `Retrying will hit the same code. To prevent the Stop hook from forcing a retry, emit the line below ` +
+          `on its OWN line in your text output for this turn:\n\n[LARK_DEFER]\n\n` +
+          `Then briefly explain to your operator (in chat-side text Claude sees, not bot-side reply) that the ` +
+          `target became unreachable. Do not call reply / edit_message again on this target this turn.`,
+      },
+    ],
+  };
+}
+
 export function formatForgetMemoryReply(
   result: { removed: number; sample: string | null; allTexts: string[] },
   hash: string,
@@ -446,6 +496,8 @@ export function registerTools(
           const sentId = resp?.data?.message_id;
           if (sentId && botMessageTracker) botMessageTracker.add(sentId);
         } catch (err: any) {
+          const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
+          if (defer) return defer;
           const apiError = err?.response?.data ?? err?.data;
           if (apiError?.code && apiError?.msg) {
             console.error(`[tools] Feishu API error [${apiError.code}]: ${apiError.msg}`);
@@ -485,6 +537,8 @@ export function registerTools(
             const sentId = resp?.data?.message_id;
             if (sentId && botMessageTracker) botMessageTracker.add(sentId);
           } catch (err: any) {
+            const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
+            if (defer) return defer;
             const apiError = err?.response?.data ?? err?.data;
             if (apiError?.code && apiError?.msg) {
               console.error(
@@ -529,6 +583,8 @@ export function registerTools(
             const sentId = resp?.data?.message_id;
             if (sentId && botMessageTracker) botMessageTracker.add(sentId);
           } catch (err: any) {
+            const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
+            if (defer) return defer;
             const apiError = err?.response?.data ?? err?.data;
             if (apiError?.code && apiError?.msg) {
               console.error(
@@ -627,23 +683,42 @@ export function registerTools(
       // where <at> is literal); here defaultCard is the simpler one-
       // shot path that does parse <at>.
       const safeText = sanitizeOutboundText(text);
-      if (format === 'card_markdown') {
-        await client.im.v1.message.patch({
-          path: { message_id },
-          data: {
-            content: Lark.messageCard.defaultCard({
-              title: '',
-              content: safeText,
-            }),
-          },
-        });
-      } else {
-        await client.im.v1.message.patch({
-          path: { message_id },
-          data: {
-            content: JSON.stringify({ text: safeText }),
-          },
-        });
+      // #106 fix: wrap in try/catch. Pre-fix, edit_message had no error
+      // handling at all — a Feishu API error (permission revoked, target
+      // message deleted, bot kicked) propagated as a raw stack trace into
+      // Claude's context, which is hard to act on and could re-trigger
+      // Stop-hook remediation loops. Now: detect permanent target codes
+      // and return a clean isError + LARK_DEFER hint; rethrow other
+      // errors with the diagnostic shape reply uses.
+      try {
+        if (format === 'card_markdown') {
+          await client.im.v1.message.patch({
+            path: { message_id },
+            data: {
+              content: Lark.messageCard.defaultCard({
+                title: '',
+                content: safeText,
+              }),
+            },
+          });
+        } else {
+          await client.im.v1.message.patch({
+            path: { message_id },
+            data: {
+              content: JSON.stringify({ text: safeText }),
+            },
+          });
+        }
+      } catch (err: any) {
+        const defer = handlePermanentTargetError(err, { tool: 'edit_message', message_id });
+        if (defer) return defer;
+        const apiError = err?.response?.data ?? err?.data;
+        if (apiError?.code && apiError?.msg) {
+          console.error(`[tools] edit_message Feishu API error [${apiError.code}]: ${apiError.msg}`);
+          throw new Error(`Feishu API [${apiError.code}]: ${apiError.msg}`);
+        }
+        console.error(`[tools] edit_message failed:`, err?.message ?? String(err));
+        throw err;
       }
 
       return {
