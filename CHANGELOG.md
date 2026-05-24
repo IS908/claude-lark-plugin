@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.20] - 2026-05-25
+
+### Fixed
+- **`writeSdkResource` stream branch now streams to disk instead of buffering the full payload in heap** (#108 — **HIGH — OOM / DoS**). Pre-v1.0.20 the stream branch collected every chunk into `Buffer.concat(chunks)` before `fs.writeFile`, so peak heap = file size. A user posting 5 × 25MB images in a group (Feishu allows 30MB images) pushed transient heap to 125MB+ — small VMs (1GB) were OOM-killed. The Buffer branch had the same in-memory characteristic by definition but is only used for already-allocated payloads.
+
+  Fix: stream branch switched to `pipeline(source, sizeCapTransform, createWriteStream)`. Peak memory drops to O(SDK chunk size, ~64KB default).
+
+- **All download paths now enforce a configurable size cap** via `LARK_MAX_DOWNLOAD_BYTES` (default 50MB). The Buffer branch checks `data.length` before write; the stream branch counts bytes across chunks and throws mid-stream on exceed. The opaque `object{writeFile()}` branch (Lark SDK's convenience wrapper for files/PDFs) cannot enforce inline — callers requiring stricter limits should pre-check the Feishu message metadata's `file_size` field. Exceeding the cap throws the new `WriteSdkResourceTooLargeError` (exported); `download_attachment` tool catches it and returns a clean user-facing error naming the cap, instead of a generic failure or worse, an OOM crash. Partial files are deleted (best-effort) so the next caller doesn't read a truncated payload.
+
+- **Inline image download in `handleMessageEvent` is now bounded by `LARK_DOWNLOAD_TIMEOUT_MS`** (default 10s). Pre-v1.0.20 the event handler `await`-ed `downloadImage` directly, so a 30MB image stalled processing of NEW inbound messages from other users in the same chat (and other chats sharing the same event-loop tick) — observed 5–30s "bot ignored me" latency in active groups. Now: the inline path races against the timeout. On timeout the notification fires WITHOUT `image_path` (Claude won't have the local file on first read), but the download CONTINUES in the background and the file will appear in inbox once it lands — a follow-up `Read` may still succeed if it falls within the inbox-GC window. The timeout does NOT abort the underlying SDK call (the Lark SDK does not expose an AbortController hook); it only bounds the event-handler wait.
+
+### Added
+- 6 new download-attachment smoke assertions (15 → 21): Buffer-over-cap throws and creates no file, stream-over-cap throws and cleans up partial file, stream-under-cap writes successfully (regression guard for the new pipeline path), default `maxBytes` is `Infinity` (back-compat for callers that pre-date opts), explicit `Infinity` opts out of cap, partial-opts footgun regression (R1-audit followup — `{}` or spread-without-maxBytes must still default to Infinity, not silently bypass the cap via `undefined > undefined === false`).
+- `WriteSdkResourceTooLargeError` class exported so callers can `instanceof`-discriminate size-rejection from malformed-SDK or IO errors.
+- Two new config knobs in `src/config.ts`: `maxDownloadBytes` and `downloadTimeoutMs`, both documented inline.
+
+### R1-audit followup (closed in this PR)
+- **Partial-opts footgun closed** — `writeSdkResource`'s `opts` default `= { maxBytes: Infinity }` only fired when the WHOLE `opts` arg was absent. A future caller passing `{}` or `{ ...someOtherField }` got `opts.maxBytes === undefined`, and the `>` comparisons returned `false` for both branches → silent cap bypass. Switched to per-field default `const { maxBytes = Infinity } = opts ?? {}` so partial opts still get the cap.
+
+### R2-audit followups (closed in this PR)
+- **HIGH: `imageKey` from Feishu webhook is now validated against `LARK_ID_REGEX` before reaching path construction** — pre-fix, a malicious payload `image_key='../../../tmp/evil'` would be appended to `${Date.now()}-${imageKey}.png` and `path.join`'d into `inboxDir` with classic path-traversal collapse, escaping the inbox and landing the downloaded bytes (or worse, a Feishu-supplied script disguised as `.png`) outside the sandbox. Same vulnerability class as #93 but on a side channel that #93's regex didn't cover. Now: the `image` and `post` parse paths in `handleMessageEvent` validate `image_key` shape and skip with a debug log on mismatch. Additionally, `downloadImage` asserts the resolved filePath stays inside `inboxDir` as a storage-layer defense in depth.
+- **MEDIUM: post-type multi-image no longer aborts on first failure** — pre-fix, a 3-image post where one exceeded `LARK_MAX_DOWNLOAD_BYTES` or otherwise failed would throw out of the `for…await` and the outer try/catch dropped `imagePaths` to undefined for ALL siblings. Now uses `Promise.allSettled` over concurrent downloads — failed images are logged, successful ones still propagate. Also drops worst-case wait from N × `downloadTimeoutMs` (serial) to 1 × (concurrent).
+- **MEDIUM: `optionalNumber` config helper now rejects NaN / non-finite values** — pre-fix, `LARK_MAX_DOWNLOAD_BYTES="abc"` parsed to `NaN`; downstream `bytesSeen > NaN` was always `false` → silent cap bypass identical to the R1 partial-opts footgun. Now: invalid values log a `[config]` warning and fall back to the safe default.
+- 1 new smoke test #17 documents that NaN passed directly to `writeSdkResource.maxBytes` still disables the cap — but the config-layer sanitization prevents NaN from reaching the helper in normal operation. Suite 21 → 22.
+
+### Not addressed (out of scope for this PR)
+- AbortController plumbing on Lark SDK calls — would actually cancel oversized/hung downloads instead of just letting them run in the background after timeout. Tracked separately if needed.
+- #89 inbox-directory GC (background downloads keep landing files; without GC the disk fills). Same surface; separate issue.
+
+### Operator notes
+- A 25MB attachment that fits under the default 50MB cap still downloads successfully but with bounded heap impact. The timeout means Claude may NOT have `image_path` on its first turn after a very large image; the file lands later and Claude's next message can `Read` it. Operators handling many huge files can raise `LARK_DOWNLOAD_TIMEOUT_MS` (and/or `LARK_MAX_DOWNLOAD_BYTES`) in `.env`.
+- A future release should add AbortController support once the Lark SDK exposes it — currently the inline timeout is the bound on event-handler wait but the background download continues.
+
 ## [1.0.19] - 2026-05-25
 
 ### Fixed

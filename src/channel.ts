@@ -5,6 +5,7 @@ import os from 'node:os';
 import { appConfig } from './config.js';
 import { enrichmentPrompt, wrapEnrichmentSection } from './prompts.js';
 import { MessageQueue } from './queue.js';
+import { LARK_ID_REGEX } from './tools.js';
 import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
@@ -374,9 +375,15 @@ export class LarkChannel {
       try {
         const parsed = JSON.parse(rawContent);
         const imageKey = parsed.image_key;
-        if (imageKey) {
+        // Validate imageKey shape before passing into path construction
+        // (R2-audit followup on #108 — same class as #93). Feishu image
+        // keys are `img_xxx` alphanumeric; reject anything that could
+        // escape the inbox dir via path-join collapse.
+        if (typeof imageKey === 'string' && LARK_ID_REGEX.test(imageKey)) {
           const downloaded = await this.downloadImage(imageKey, messageId);
           if (downloaded) imagePath = downloaded;
+        } else if (imageKey) {
+          debugLog(`[channel] Rejected malformed image_key=${String(imageKey).slice(0, 40)} for ${messageId}`);
         }
       } catch {
         debugLog(`[channel] Failed to parse image content for auto-download`);
@@ -385,13 +392,32 @@ export class LarkChannel {
       try {
         const parsed = JSON.parse(rawContent);
         const content = parsed.content ?? parsed.zh_cn?.content ?? parsed.en_us?.content ?? [];
-        const downloadedPaths: string[] = [];
+        // Collect all img nodes first; run downloads concurrently with
+        // allSettled so a single oversized / failed image (e.g. one of
+        // three exceeds LARK_MAX_DOWNLOAD_BYTES) does NOT drop the
+        // siblings (R2-audit followup #3 on #108). Also concurrent
+        // download keeps the worst-case wait at ONE downloadTimeoutMs
+        // rather than N × downloadTimeoutMs serial.
+        const imageKeys: string[] = [];
         for (const line of content) {
           for (const node of line as any[]) {
-            if (node.tag === 'img' && node.image_key) {
-              const downloaded = await this.downloadImage(node.image_key, messageId);
-              if (downloaded) downloadedPaths.push(downloaded);
+            if (node.tag === 'img' && typeof node.image_key === 'string') {
+              if (LARK_ID_REGEX.test(node.image_key)) {
+                imageKeys.push(node.image_key);
+              } else {
+                debugLog(`[channel] Rejected malformed post image_key=${String(node.image_key).slice(0, 40)} for ${messageId}`);
+              }
             }
+          }
+        }
+        const settled = await Promise.allSettled(
+          imageKeys.map((k) => this.downloadImage(k, messageId)),
+        );
+        const downloadedPaths: string[] = [];
+        for (const r of settled) {
+          if (r.status === 'fulfilled' && r.value) downloadedPaths.push(r.value);
+          else if (r.status === 'rejected') {
+            debugLog(`[channel] Post image download failed: ${r.reason}`);
           }
         }
         if (downloadedPaths.length === 1) {
@@ -622,18 +648,66 @@ export class LarkChannel {
    * the bot itself uploaded — not images users send to the bot.
    */
   private async downloadImage(imageKey: string, messageId: string): Promise<string | undefined> {
+    // Bounded-time inline download (#108 fix, v1.0.20). Pre-fix this
+    // was a naked `await` inside handleMessageEvent, so a 30MB image
+    // could stall the event-loop processing of NEW messages from
+    // OTHER users in the same chat / other chats — observed 5–30s
+    // "bot ignored me" latency in active groups. Now: race against
+    // LARK_DOWNLOAD_TIMEOUT_MS (default 10s). On timeout the inline
+    // path returns undefined so the channel notification fires WITHOUT
+    // image_path; the actual download continues in the background and
+    // may still complete in time for Claude's Read tool to find it.
     try {
       mkdirSync(appConfig.inboxDir, { recursive: true });
-      const resp = await this.client.im.v1.messageResource.get({
-        path: { message_id: messageId, file_key: imageKey },
-        params: { type: 'image' },
-      } as any);
-      if (!resp) return undefined;
       const filename = `${Date.now()}-${imageKey}.png`;
       const filePath = path.join(appConfig.inboxDir, filename);
-      await writeSdkResource(resp, filePath);
-      debugLog(`[channel] Downloaded image ${imageKey} → ${filePath}`);
-      return filePath;
+
+      // Defense in depth (R2-audit followup #1 on #108): even though
+      // the inbound parse layer now validates imageKey via LARK_ID_REGEX,
+      // the storage call site asserts the resolved path stays inside
+      // inboxDir — any future code path that bypasses the parse-time
+      // check still cannot land bytes outside the configured inbox.
+      const inboxResolved = path.resolve(appConfig.inboxDir) + path.sep;
+      if (!path.resolve(filePath).startsWith(inboxResolved)) {
+        debugLog(`[channel] downloadImage path escape blocked: ${filePath}`);
+        return undefined;
+      }
+
+      const downloadPromise = (async () => {
+        const resp = await this.client.im.v1.messageResource.get({
+          path: { message_id: messageId, file_key: imageKey },
+          params: { type: 'image' },
+        } as any);
+        if (!resp) return undefined;
+        await writeSdkResource(resp, filePath, { maxBytes: appConfig.maxDownloadBytes });
+        debugLog(`[channel] Downloaded image ${imageKey} → ${filePath}`);
+        return filePath;
+      })();
+
+      // The timeout doesn't abort the underlying SDK call (the Lark
+      // SDK does not expose AbortController); it just bounds how long
+      // the event handler waits. The download keeps running and the
+      // file appears in inbox once it completes — Claude's Read tool
+      // can still pick it up if the operator's prompt comes after.
+      let timer: NodeJS.Timeout | undefined;
+      const timeoutPromise = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => {
+          debugLog(
+            `[channel] Image ${imageKey} download exceeded ${appConfig.downloadTimeoutMs}ms — continuing in background`,
+          );
+          resolve(undefined);
+        }, appConfig.downloadTimeoutMs);
+      });
+
+      // Detach errors from background continuation so they don't
+      // become unhandled rejections after the timeout fires.
+      downloadPromise.catch((err) => {
+        debugLog(`[channel] Background image download ${imageKey} failed: ${err}`);
+      });
+
+      const result = await Promise.race([downloadPromise, timeoutPromise]);
+      if (timer) clearTimeout(timer);
+      return result;
     } catch (err) {
       debugLog(`[channel] Failed to download image ${imageKey}: ${err}`);
       return undefined;

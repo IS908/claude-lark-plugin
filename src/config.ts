@@ -22,7 +22,18 @@ function optionalList(key: string): string[] {
 
 function optionalNumber(key: string, fallback: number): number {
   const val = process.env[key];
-  return val ? Number(val) : fallback;
+  if (!val) return fallback;
+  const n = Number(val);
+  // R2-audit followup on #108: reject NaN/non-finite so a misconfigured
+  // env var (e.g. LARK_MAX_DOWNLOAD_BYTES="abc") falls back to the
+  // safe default rather than silently disabling the consumer's
+  // numeric guard. Pre-fix, NaN propagated to `length > NaN === false`,
+  // identical to the partial-opts footgun R1 just closed.
+  if (!Number.isFinite(n)) {
+    console.error(`[config] ${key}="${val}" is not a finite number — using fallback ${fallback}.`);
+    return fallback;
+  }
+  return n;
 }
 
 /**
@@ -73,6 +84,18 @@ export const appConfig = {
   botMessageTrackerSize: optionalNumber('LARK_BOT_MESSAGE_TRACKER_SIZE', 500),
   cronScanInterval: optionalNumber('LARK_CRON_SCAN_INTERVAL', 60),
   cronTimezone: optional('LARK_CRON_TIMEZONE', Intl.DateTimeFormat().resolvedOptions().timeZone),
+
+  // Attachment download (#108)
+  //   maxDownloadBytes: per-file upper bound enforced INSIDE writeSdkResource.
+  //     Feishu allows 30MB images / 50MB files / 300MB videos; default 50MB
+  //     covers images+files comfortably and refuses pathological/video.
+  //   downloadTimeoutMs: timeout for the inline-in-event-handler image
+  //     download. If exceeded, the notification is forwarded WITHOUT
+  //     image_path (Claude won't have the local file); the download
+  //     continues in the background so a later Read may still succeed
+  //     if it lands within the inbox-GC window.
+  maxDownloadBytes: optionalNumber('LARK_MAX_DOWNLOAD_BYTES', 50 * 1024 * 1024),
+  downloadTimeoutMs: optionalNumber('LARK_DOWNLOAD_TIMEOUT_MS', 10_000),
 
   // Memory
   minSearchScore: optionalNumber('LARK_MIN_SEARCH_SCORE', 0.3),
