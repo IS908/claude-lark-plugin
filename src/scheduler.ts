@@ -15,6 +15,7 @@ import {
   listAllJobs,
   writeJob,
   computeNextRun,
+  mostRecentMissedSlot,
   type JobFile,
 } from './job-store.js';
 
@@ -249,7 +250,48 @@ export class JobScheduler {
           continue;
         }
 
-        console.error(`[scheduler] Recovering missed job: ${job.meta.id}`);
+        // #103 fix (v1.0.22): catch-up runs the MOST RECENT missed slot,
+        // not the OLDEST. Pre-fix, recoverMissedJobs called executeJob
+        // with the stored next_run_at unchanged — for an hourly job that
+        // was down 03:00→08:30, that meant delivering "03:00 content" at
+        // 08:30 (5h time-shift) while silently dropping the 04:00–08:00
+        // slots. Now: fast-forward next_run_at to the latest pre-now
+        // slot so the catch-up reflects "what should have just fired".
+        // executeJob still advances to the next future slot after success.
+        const recovered = mostRecentMissedSlot(job.meta.schedule, nextRun, now);
+        // R1-audit followup: re-check stale after fast-forward. The
+        // `isMissedRunStale` gate at line 234 ran on the ORIGINAL nextRun
+        // (fresh). If `mostRecentMissedSlot` hit its 1000-iter cap (per-
+        // second crons over a few minutes, or per-minute crons over a
+        // few hours), the returned `recovered` slot can be hours-to-
+        // days behind now even though the original wasn't stale —
+        // delivering content keyed to an arbitrary past slot. Treat as
+        // stale and route through the existing skip-and-notify path.
+        if (isMissedRunStale(recovered, now)) {
+          const lateHours = ((now - recovered) / 3_600_000).toFixed(1);
+          console.error(
+            `[scheduler] Skipping job ${job.meta.id}: post-fast-forward slot ` +
+            `${new Date(recovered).toISOString()} is ${lateHours}h late (cap hit on pathological schedule). ` +
+            `Rescheduling to next occurrence.`,
+          );
+          job.runtime.next_run_at = computeNextRun(job.meta.schedule);
+          await writeJob(job);
+          await this.notifyStaleSkip(job, lateHours);
+          continue;
+        }
+        if (recovered !== nextRun) {
+          const skippedH = ((recovered - nextRun) / 3_600_000).toFixed(1);
+          console.error(
+            `[scheduler] Recovering missed job ${job.meta.id}: fast-forwarded next_run_at ` +
+            `from ${new Date(nextRun).toISOString()} to ${new Date(recovered).toISOString()} ` +
+            `(skipped ~${skippedH}h of intermediate slots — only the most-recent missed run is delivered).`,
+          );
+          job.runtime.next_run_at = new Date(recovered).toISOString();
+        } else {
+          console.error(
+            `[scheduler] Recovering missed job ${job.meta.id} (no intermediate slots to skip)`,
+          );
+        }
         await this.executeJob(job);
       } catch (err) {
         console.error(`[scheduler] Failed to recover job ${job.meta.id}:`, err);

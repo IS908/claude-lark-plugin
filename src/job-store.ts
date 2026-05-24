@@ -143,6 +143,45 @@ export function computeNextRun(cronExpr: string): string {
   return expr.next().toISOString()!;
 }
 
+/**
+ * Find the most recent slot of `cronExpr` that is `< now`, starting the
+ * search from `fromTime` (which is typically a stored `next_run_at` that
+ * itself IS a valid slot in the past). Returns the timestamp (ms) of the
+ * latest pre-now slot, or `fromTime` itself if no later pre-now slot
+ * exists (i.e. `fromTime` is already the most recent missed slot).
+ *
+ * Used by `recoverMissedJobs` (#103 fix, v1.0.22) to compensate for a
+ * downtime gap: pre-v1.0.22 the recovery path ran a single catch-up
+ * using the stored `next_run_at` as-is, which for a long-running hourly
+ * job that was down 5 hours would deliver content keyed to the OLDEST
+ * missed slot (5 hours ago) while silently dropping 4 intermediate
+ * slots. The user got content with the wrong timestamp.
+ *
+ * Hard-capped at 1000 iterations as a runaway guard for pathological
+ * schedules (e.g. every-minute cron over a long downtime). Returns the
+ * fast-forwarded value at the cap with a warning, so the bot still
+ * makes progress instead of hanging at startup.
+ */
+export function mostRecentMissedSlot(cronExpr: string, fromTime: number, now: number): number {
+  if (fromTime >= now) return fromTime;
+  const MAX_ITER = 1000;
+  let latest = fromTime;
+  const expr = CronExpressionParser.parse(cronExpr, {
+    currentDate: new Date(fromTime),
+    tz: appConfig.cronTimezone,
+  });
+  for (let i = 0; i < MAX_ITER; i++) {
+    const next = expr.next().toDate().getTime();
+    if (next >= now) return latest;
+    latest = next;
+  }
+  console.error(
+    `[scheduler] mostRecentMissedSlot: schedule "${cronExpr}" produced ${MAX_ITER}+ slots between ` +
+    `${new Date(fromTime).toISOString()} and ${new Date(now).toISOString()} — capping at iteration ${MAX_ITER}.`,
+  );
+  return latest;
+}
+
 // ─── CRUD ───────────────────────────────────────────────────
 
 async function ensureJobsDir(): Promise<string> {

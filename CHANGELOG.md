@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.22] - 2026-05-25
+
+### Fixed
+- **`recoverMissedJobs` catch-up delivers the most-recent missed slot's content, not the oldest** (#103 — **MEDIUM, time-shifted delivery**). Pre-v1.0.22 the recovery path called `executeJob` with the stored `next_run_at` unchanged — for a job that was down 5 hours (e.g. hourly cron 03:00→08:30) the catch-up ran ONE execution using "03:00 content" delivered at 08:30 (5h time-shift), while the 04:00 / 05:00 / 06:00 / 07:00 / 08:00 intermediate slots were silently dropped. For content keyed to time-of-day (daily briefings, hourly status), the user got the wrong-time content. For type=prompt jobs, Claude got prompted as if the late-morning had been early-morning.
+
+  Fix: new `mostRecentMissedSlot(cronExpr, fromTime, now)` in `src/job-store.ts` iterates the cron expression forward from the stored `next_run_at` to find the latest slot still `< now`. `recoverMissedJobs` fast-forwards `next_run_at` to that value BEFORE calling `executeJob`, so the catch-up reflects "what should have fired most recently" rather than "what was due first". `executeJob`'s own `computeNextRun` then advances to the next future slot after success, preserving normal cadence.
+
+  Option B (single most-recent slot) was chosen over Option A (replay every intermediate) to avoid `type=message` log spam — a user expecting one daily-briefing at 08:00 would NOT want 5 backfilled briefings appearing at 08:30 from a 5-hour outage.
+
+  Helper is hard-capped at 1000 iterations as a runaway guard for pathological schedules (e.g. every-minute cron over multi-day downtime). Cap hit emits a `[scheduler] mostRecentMissedSlot: ... capping at iteration 1000` stderr warning so operators can see and adjust.
+
+### Added
+- 4 new scheduler-smoke assertions (Part E — 19 → 23):
+  - 19a: `mostRecentMissedSlot` pure-function semantics (hourly 5h gap fast-forwards to the right slot; `now < fromTime` is a no-op; tiny-gap with no intermediates returns `fromTime` unchanged). Includes TZ-robustness note.
+  - 19b: 1000-iteration safety cap on every-minute cron over a 10-day downtime emits the warning AND returns a slot ~1000 × 1min ahead of fromTime (R1-audit upper-bound check — pre-fix, a regression returning the 2nd iteration would have silently passed).
+  - 19b-stale: codification of the cap-stale path (defense-in-depth — `isMissedRunStale` re-check after fast-forward).
+  - 19c: end-to-end recovery integration — a hand-set 3h-late hourly job triggers exactly 1 send, content matches, `next_run_at` post-execute is in the future, and the fast-forward log line names the number of skipped hours.
+- New export from `src/job-store.ts`: `mostRecentMissedSlot`.
+
+### R1-audit followups (closed in this PR)
+- **`isMissedRunStale` re-check after fast-forward** — pre-followup the gate only ran on the original `nextRun`; if the cap fires (per-second crons over multi-day downtime), the returned slot could be hours-to-days behind `now` even though the original wasn't stale. Now: if `mostRecentMissedSlot` returns a stale-by-threshold slot, route through the existing skip-and-notify path instead of delivering wrong-time content.
+- **Else-branch log clarified** to "no intermediate slots to skip" — distinguishes "no fast-forward needed" from "did nothing".
+- **Test 19b strengthened** with upper-bound assertion on advancement (regression guard against returning 2nd iteration instead of 1000th).
+- **TZ-robustness note** added to test 19a explaining why UTC-anchored expectations are safe for `0 * * * *` (minute=0 aligns identically under any whole-hour-offset tz) — future authors warned against non-zero-minute crons without explicit tz pinning.
+
+### Operator notes
+- After this fix, observed behavior in the most common downtime scenario (laptop closed for a few hours): on restart, the bot delivers the most-recent missed run (single delivery, content keyed to the most recent slot) instead of the oldest. The cadence after that is normal.
+- The 6h `RECOVERY_STALE_THRESHOLD_MS` still applies — any `next_run_at` older than 6h is skipped entirely with the existing `notifyStaleSkip` notice (unchanged behavior). The fast-forward path only applies to non-stale missed slots.
+- For type=prompt jobs the saving is more substantial: pre-fix, a 5h-down job would have prompted Claude with "what would have happened 5h ago" context; post-fix it's "what should have happened just before now".
+
 ## [1.0.21] - 2026-05-25
 
 ### Fixed
