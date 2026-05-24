@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 - 9 new job-smoke assertions (tests 17–25) covering: empty + whitespace-only rejection, `every Nm` out-of-range and non-divisor rejection, `every Nh` non-divisor rejection, exhaustive accept-set for both `every Nm` (11 divisors of 60) and `every Nh` (7 divisors of 24), 4-field cron shape rejection, 6-field cron passthrough preserved.
 
+### R1-audit followups (closed in this PR)
+- **`update_job.schedule` Zod schema mirrored from create_job** — pre-followup `update_job.schedule` was bare `z.string().optional()`. Functionally fine because `expandSchedule` rejects at the storage boundary, but the boundary-level constraint produces a clearer error for the LLM. Now both create_job and update_job apply `.min(1).max(200).refine(s => s.trim().length > 0).optional()`.
+- **`create_job.schedule` description trimmed** of historical context ("pre-v1.0.28 it was silently treated...") in favor of the prescriptive valid-set so Claude reading the schema isn't confused by version-archaeology.
+
 ### Operator notes
 - Pre-v1.0.28 jobs already in `~/.claude/channels/lark/jobs/` are NOT retroactively re-validated on startup — they continue to fire on whatever cron they were created with. If you suspect an existing job has the `every Nm` divisor bug (#79), check its `meta.schedule` and re-create via `update_job` if the actual cadence differs from the `meta.schedule_human` label.
 

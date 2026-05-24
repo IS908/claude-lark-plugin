@@ -1147,7 +1147,7 @@ export function registerTools(
           .max(200, 'schedule must be ≤ 200 chars')
           .refine((s) => s.trim().length > 0, { message: 'schedule must contain non-whitespace' })
           .describe(
-            'Cron expression or alias: "0 9 * * 1-5", "every 30m", "daily at 09:00", "weekdays at 09:00", "weekly on mon at 09:00". Empty/whitespace-only is rejected (#95) — pre-v1.0.28 it was silently treated as every-minute and spammed the chat.'
+            'Cron expression or alias: "0 9 * * 1-5", "every 30m", "daily at 09:00", "weekdays at 09:00", "weekly on mon at 09:00". Must be non-empty. "every Nm" requires N in {1,2,3,4,5,6,10,12,15,20,30}; "every Nh" requires N in {1,2,3,4,6,8,12} (divisors of 60 / 24 — otherwise the actual cadence diverges from the human label).'
           ),
         prompt: z
           .string()
@@ -1341,7 +1341,13 @@ export function registerTools(
       inputSchema: z.object({
         id: larkIdSchema('id').describe('Job ID'),
         status: z.enum(['active', 'paused']).optional().describe('Set status'),
-        schedule: z.string().optional().describe('New cron expression or alias'),
+        schedule: z
+          .string()
+          .min(1, 'schedule cannot be empty')
+          .max(200, 'schedule must be ≤ 200 chars')
+          .refine((s) => s.trim().length > 0, { message: 'schedule must contain non-whitespace' })
+          .optional()
+          .describe('New cron expression or alias. Same validation rules as create_job (must be non-empty; "every Nm" requires N divides 60; "every Nh" requires N in {1,2,3,4,6,8,12}).'),
         prompt: z.string().optional().describe('New prompt (type=prompt)'),
         content: z.string().optional().describe('New content (type=message)'),
         name: z.string().optional().describe('New display name'),
