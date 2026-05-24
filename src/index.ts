@@ -31,13 +31,34 @@ async function acquireLock(): Promise<void> {
     // an unclean shutdown + PID reuse, the bot would refuse to start
     // forever and need manual `rm /tmp/claude-lark-*.lock`.
     let parsed: { pid: number; startTime: string } | null = null;
+    let readError: NodeJS.ErrnoException | null = null;
     try {
       parsed = parseLockToken(await fs.readFile(LOCK_FILE, 'utf-8'));
-    } catch {
-      // Lock file unreadable — fall through to overwrite.
+    } catch (err: any) {
+      readError = err;
+    }
+    // R2-audit followup: distinguish a permission error (EACCES —
+    // file exists but owned by another uid in /tmp with restrictive
+    // mode) from genuine missing/malformed content. Pre-followup
+    // EACCES fell through to overwrite → writeFile then threw EACCES
+    // uncaught → main() saw stack trace instead of the polished
+    // "manually delete the lock" message we provide for the EPERM
+    // path below. Treat EACCES the same way: refuse with operator
+    // guidance.
+    if (readError && readError.code === 'EACCES') {
+      console.error(
+        `[lock] Lock file ${LOCK_FILE} exists but is not readable by this process ` +
+        `(likely owned by another user's bot). Refusing to overwrite — manually delete the ` +
+        `lock after confirming the other instance is stopped.`,
+      );
+      process.exit(1);
     }
     if (parsed === null) {
-      // Malformed / empty lock — overwrite.
+      // Malformed / empty lock OR read failed for some other reason
+      // (ENOENT shouldn't happen since wx-create just hit EEXIST) —
+      // overwrite. writeFile may STILL fail with EACCES on cross-uid
+      // /tmp + restrictive parent; we let that propagate to main()'s
+      // fatal handler since it's an environment-level problem.
       await fs.writeFile(LOCK_FILE, myToken);
     } else {
       const { pid: recordedPid, startTime: recordedStart } = parsed;
@@ -320,13 +341,22 @@ async function main() {
     process.exit(0);
   }
 
-  // 7. Connect MCP server via stdio
+  // 7. Acquire single-instance lock BEFORE the MCP transport is
+  //    connected (R2-audit followup on #101). Pre-followup acquireLock
+  //    ran after server.connect, so any of the 3 acquireLock refuse
+  //    paths (legacy-lock collision, EPERM cross-uid, lost startup
+  //    race) would call process.exit(1) with a live stdio transport
+  //    already handshaking with Claude Code — operator saw a half-
+  //    connected server. Moving the lock up to before the transport
+  //    keeps the exit clean.
+  await acquireLock();
+
+  // 8. Connect MCP server via stdio
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('[index] MCP server connected via stdio');
 
-  // 8. Acquire single-instance lock and start Lark WebSocket
-  await acquireLock();
+  // 9. Start Lark WebSocket
   await channel.start();
 
   // 9. Re-arm flush timers from persisted episodes

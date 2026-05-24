@@ -55,7 +55,23 @@ export function getProcessStartTime(pid: number): string | null {
   }
 }
 
-/** Serialize a lock token. Format: `<pid>|<start-time-string>`. */
+/**
+ * Serialize a lock token. Format: `<pid>|<start-time-string>`.
+ *
+ * Degraded modes (R2-audit followup on PR #124):
+ * - **Windows / minimal containers (no `ps`)**: start-time component
+ *   is empty (`'<pid>|'`). The PID-reuse disambiguation collapses to
+ *   "PID exists" (no identity proof) and the cross-uid EPERM-refuse
+ *   path in acquireLock NEVER triggers (it gates on
+ *   `recordedStart !== ''`). On these platforms the v1.0.23 PID-
+ *   reuse fix degrades to pre-v1.0.23 behavior (single-PID match
+ *   suffices to refuse) but the signal-cleanup fix still applies.
+ *   On Linux/macOS `ps` is always present, so this is theoretical
+ *   for the primary supported platforms.
+ * - **Non-ASCII operator names with locale `ps`**: pinning LC_ALL=C
+ *   in getProcessStartTime forces ASCII output regardless of outer
+ *   LANG, so the writer/reader equality check is stable.
+ */
 export function buildLockToken(pid: number): string {
   const startTime = getProcessStartTime(pid);
   return `${pid}|${startTime ?? ''}`;
