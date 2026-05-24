@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.21] - 2026-05-25
+
+### Fixed
+- **Cronjobs auto-pause when target chat becomes permanently unreachable** (#106 Case 1 — **HIGH — token waste + log spam + invisible failure**). Pre-v1.0.21 a job targeting a chat the bot was later kicked from (or whose chat was archived / permission revoked) kept firing on every tick — each scheduled run hit the same Feishu API error (`230002`, `230020`, `99991672`, `9499`, `190005`), the retry-or-fail flow recorded `last_error` and advanced `next_run_at`, and the job stayed `active`. For `type=message` jobs that meant log spam every interval; for `type=prompt` jobs that meant a full Claude turn burned on every interval, with no operator-visible signal.
+
+  Fix: new `PERMANENT_TARGET_CODES` classifier in `src/scheduler.ts` (5 codes). When `executeJob`'s final failure path matches, the job is auto-paused (`status='paused'` persisted to disk) and the owner receives a one-shot DM (`receive_id_type='open_id'`, `receive_id=job.meta.created_by`) explaining the cause and offering recovery steps (update_job to re-target, delete_job to remove). Empty `created_by` jobs (legacy) skip the DM but still auto-pause. Transient errors continue through the existing retry+last_error path — auto-pause is reserved for the permanent-target codes.
+
+- **`reply` tool returns a graceful defer signal when the target chat is permanently unreachable** (#106 Case 2 — **HIGH — Stop hook infinite loop**). Pre-v1.0.21 `reply` threw a generic `Feishu API [code]: msg` on permanent target errors; the Stop hook (`hooks/enforce-lark-reply.mjs`) saw the inbound unanswered and forced Claude to retry on the next turn — the same failing call — until the turn budget was exhausted, with the user seeing only bot silence.
+
+  Fix: new `handlePermanentTargetError` helper detects the permanent codes and returns `isError: true` with text that includes the `[LARK_DEFER]` sentinel on its own line. Claude is explicitly instructed (in the error text) to echo the sentinel in its assistant text so the Stop hook bypasses the unanswered check for this turn. Best-effort — the hook scans assistant text blocks, not tool_result content, so Claude must cooperate by emitting the sentinel — but the error text names the failure mode plainly so Claude has every reason to defer rather than re-call the failing tool.
+
+  Applied at all 3 reply send sites (raw card JSON path, buildCards multi-card path, plain-text chunks path).
+
+- **`edit_message` tool now has try/catch** (#106 polish). Pre-v1.0.21 a Feishu API failure in `edit_message` propagated as a raw stack trace into Claude's context. Now uses the same `handlePermanentTargetError` + diagnostic-shape pattern as `reply`.
+
+### Added
+- 4 new scheduler-smoke assertions (Part D — 15 → 19): single permanent target code triggers auto-pause + owner DM with full diagnostic text; spot-checks of every code in `PERMANENT_TARGET_CODES` (230002 / 230020 / 99991672 / 190005 / 9499); empty-owner job still auto-pauses without DM attempt; non-permanent-but-non-retryable error (230001 param) does NOT auto-pause (regression guard against classifier widening).
+- New exports from `src/scheduler.ts`: `PERMANENT_TARGET_CODES`, `getFeishuApiCode`, `getFeishuApiMsg`.
+- New export from `src/tools.ts`: `handlePermanentTargetError(err, context)`.
+
+### Operator notes
+- After the fix, a previously-failing job that you re-target via `update_job` will resume on its next tick. You can also re-activate a paused job in place (`update_job status='active'`).
+- The Stop hook's defer-sentinel route requires Claude to echo `[LARK_DEFER]` in its assistant text. The reply tool's error message embeds the sentinel with explicit instructions; Claude historically cooperates with this pattern. If a hung-loop is observed despite the fix, the hook itself could be extended to read a per-turn defer file written by the tool — tracked as a possible future hardening.
+- The two failure surfaces (Case 1: forever-failing jobs; Case 2: Stop hook loop) often co-occur after a bot kick — the cronjob keeps trying, AND any concurrent user @mention in the same chat triggers the Stop loop. Both are now bounded.
+
 ## [1.0.20] - 2026-05-25
 
 ### Fixed
