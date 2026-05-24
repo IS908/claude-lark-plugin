@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import fs from 'node:fs/promises';
 import { unlinkSync } from 'node:fs';
+import { getProcessStartTime, buildLockToken, parseLockToken } from './lock.js';
 import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
@@ -17,30 +18,92 @@ import { mcpServerInstructions } from './prompts.js';
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
 
 async function acquireLock(): Promise<void> {
+  const myToken = buildLockToken(process.pid);
   try {
     // Try to create lock file exclusively
-    await fs.writeFile(LOCK_FILE, String(process.pid), { flag: 'wx' });
+    await fs.writeFile(LOCK_FILE, myToken, { flag: 'wx' });
   } catch {
-    // Lock file exists — check if the process is still alive
+    // Lock file exists — check if the process is still alive AND is
+    // the same process that wrote the lock (#101). Pre-v1.0.23 only
+    // `process.kill(pid, 0)` was used, which says "some process with
+    // this PID exists" but cannot distinguish the original lock-
+    // holder from a recycled-PID bash/python/launchd child. After
+    // an unclean shutdown + PID reuse, the bot would refuse to start
+    // forever and need manual `rm /tmp/claude-lark-*.lock`.
+    let parsed: { pid: number; startTime: string } | null = null;
     try {
-      const pid = parseInt(await fs.readFile(LOCK_FILE, 'utf-8'), 10);
-      try {
-        process.kill(pid, 0); // Check if process exists
-        console.error(`[lock] Another instance is running (PID ${pid}). Exiting.`);
-        process.exit(1);
-      } catch {
-        // Process is dead — stale lock, overwrite
-        await fs.writeFile(LOCK_FILE, String(process.pid));
-      }
+      parsed = parseLockToken(await fs.readFile(LOCK_FILE, 'utf-8'));
     } catch {
-      await fs.writeFile(LOCK_FILE, String(process.pid));
+      // Lock file unreadable — fall through to overwrite.
+    }
+    if (parsed === null) {
+      // Malformed / empty lock — overwrite.
+      await fs.writeFile(LOCK_FILE, myToken);
+    } else {
+      const { pid: recordedPid, startTime: recordedStart } = parsed;
+      let pidExists = false;
+      try {
+        process.kill(recordedPid, 0);
+        pidExists = true;
+      } catch {
+        // Process is gone.
+      }
+      if (pidExists) {
+        const currentStart = getProcessStartTime(recordedPid);
+        // Compare ps-reported start time against the recorded one.
+        // If they match (and recorded is non-empty), it's truly the
+        // same process that wrote the lock → refuse. Otherwise PID
+        // has been recycled OR the recorded value is from a legacy
+        // pre-v1.0.23 PID-only lock → overwrite.
+        if (currentStart !== null && currentStart === recordedStart && recordedStart !== '') {
+          console.error(
+            `[lock] Another instance is running (PID ${recordedPid}, started ${recordedStart}). Exiting.`,
+          );
+          process.exit(1);
+        }
+        console.error(
+          `[lock] Stale lock for PID ${recordedPid} ` +
+          (recordedStart === ''
+            ? '(legacy pre-v1.0.23 lock file)'
+            : '(PID has been recycled to a different process)') +
+          ' — overwriting.',
+        );
+      }
+      await fs.writeFile(LOCK_FILE, myToken);
     }
   }
-  // Clean up lock on exit
-  const cleanup = () => { try { unlinkSync(LOCK_FILE); } catch {} };
+
+  // Cleanup runs on every path that can take down the process —
+  // pre-v1.0.23 only `exit` / SIGINT / SIGTERM were covered, which
+  // leaked the lock on SIGPIPE (very common when Claude Code closes
+  // the child's stdio), SIGHUP (terminal disconnect), SIGQUIT, and
+  // uncaught exceptions / unhandled rejections (#101 Case B).
+  const cleanup = () => {
+    try { unlinkSync(LOCK_FILE); } catch { /* best-effort */ }
+  };
   process.on('exit', cleanup);
-  process.on('SIGINT', () => { cleanup(); process.exit(0); });
-  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+  // 128 + signal-number is the conventional shell exit code for
+  // signal-induced termination. Looked up via os.constants.signals
+  // so a custom Node build with non-standard numbers still works.
+  const exitOnSignal = (sig: NodeJS.Signals) => {
+    cleanup();
+    const code = (os.constants.signals as Record<string, number | undefined>)[sig];
+    process.exit(typeof code === 'number' ? 128 + code : 1);
+  };
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT', 'SIGPIPE'] as const) {
+    process.on(sig, () => exitOnSignal(sig));
+  }
+  // Fatal error handlers — last-chance cleanup before crash.
+  process.on('uncaughtException', (err) => {
+    console.error('[fatal] uncaughtException:', err);
+    cleanup();
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[fatal] unhandledRejection:', reason);
+    cleanup();
+    process.exit(1);
+  });
 }
 
 async function main() {
@@ -72,7 +135,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.22' },
+    { name: 'claude-lark-plugin', version: '1.0.23' },
     {
       capabilities: {
         logging: {},
