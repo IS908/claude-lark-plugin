@@ -94,4 +94,8 @@ echo "=== <at> tag sanitization unit checks ==="
 npx tsx scripts/at-tag-sanitization-smoke.ts
 
 echo ""
+echo "=== Enrichment envelope unit checks ==="
+npx tsx scripts/enrichment-envelope-smoke.ts
+
+echo ""
 echo "All tests passed."

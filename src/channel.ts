@@ -3,7 +3,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
-import { enrichmentPrompt } from './prompts.js';
+import { enrichmentPrompt, wrapEnrichmentSection } from './prompts.js';
 import { MessageQueue } from './queue.js';
 import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
@@ -504,13 +504,22 @@ export class LarkChannel {
       }
     }
 
+    // Every enrichment section below is wrapped in a <memory_context>
+    // envelope (#114). The envelope marks the content as DATA so Claude
+    // does not execute imperatives buried inside stored profiles /
+    // episodes / skill descriptions / mentioned-user profiles — those
+    // are all derived from user input and the episode path is in a
+    // self-reinforcing loop (user msg → distill → episode → enrichment
+    // → Claude). The preamble at the top of `enrichmentPrompt` tells
+    // Claude how to read these blocks.
+
     // 1. User profile (hot injection — always loaded)
     // The caller is the sender themselves, so they see both public and private tiers.
     const profile = await this.memoryStore
       .getProfile(msg.senderId, msg.senderId)
       .catch(() => null);
     if (profile) {
-      parts.push(`[User Profile]\n${profile}`);
+      parts.push(wrapEnrichmentSection('profile', `self:${msg.senderId}`, profile));
     }
 
     // 2. Mentioned user profiles (hot injection)
@@ -522,11 +531,20 @@ export class LarkChannel {
             .getProfile(mention.id, msg.senderId)
             .catch(() => null);
           if (mentionProfile) {
-            parts.push(`[Mentioned User: ${mention.name}]\n${mentionProfile}`);
+            parts.push(
+              wrapEnrichmentSection('mentioned_profile', `${mention.name} (${mention.id})`, mentionProfile),
+            );
           }
         }
       }
     }
+
+    // R1-audit followup on #115: scoreTag formatter guards against
+    // NaN / Infinity from a future score-normalization regression.
+    // Number.isFinite(undefined) returns false, so the chain naturally
+    // handles missing scores as "no score tag".
+    const scoreTag = (score: number | undefined): string =>
+      typeof score === 'number' && Number.isFinite(score) ? `score:${score.toFixed(2)} · ` : '';
 
     // 3. Thread episodes (cold injection — semantic search with score filtering)
     if (msg.threadId) {
@@ -535,9 +553,8 @@ export class LarkChannel {
         .catch(() => []);
       const filtered = threadEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
       for (const ep of filtered) {
-        const scoreTag = ep.score !== undefined ? ` · score:${ep.score.toFixed(2)}` : '';
         const dateTag = ep.timestamp.slice(0, 10);
-        parts.push(`[Thread Context${scoreTag} · ${dateTag}]\n${ep.content}`);
+        parts.push(wrapEnrichmentSection('thread_episode', `${scoreTag(ep.score)}${dateTag}`, ep.content));
       }
     }
 
@@ -547,22 +564,46 @@ export class LarkChannel {
       .catch(() => []);
     const filteredChat = chatEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
     for (const ep of filteredChat) {
-      const scoreTag = ep.score !== undefined ? ` · score:${ep.score.toFixed(2)}` : '';
       const dateTag = ep.timestamp.slice(0, 10);
-      parts.push(`[Chat Context${scoreTag} · ${dateTag}]\n${ep.content}`);
+      parts.push(wrapEnrichmentSection('chat_episode', `${scoreTag(ep.score)}${dateTag}`, ep.content));
     }
 
-    // 5. Skills (cold injection — inject name + description + path only, not full content)
+    // 5. Skills (cold injection — inject name + sanitized description + path)
+    //    Skill description is creator-controlled free text (#84 limited
+    //    create authority; OWNER themselves can still be social-engineered
+    //    into save_skill via prompt injection). Cap at 200 chars and
+    //    collapse newlines so a multi-line "description" can't smuggle
+    //    extra context into the envelope.
     const skills = await this.memoryStore.searchSkills(searchQuery).catch(() => []);
     const filteredSkills = skills.filter(s => s.score === undefined || s.score >= appConfig.minSearchScore);
+    const SKILL_DESC_MAX = 200;
     for (const skill of filteredSkills) {
-      const scoreTag = skill.score !== undefined ? ` · score:${skill.score.toFixed(2)}` : '';
+      const skillScoreTag = typeof skill.score === 'number' && Number.isFinite(skill.score)
+        ? ` · score:${skill.score.toFixed(2)}`
+        : '';
       const skillPath = `${appConfig.memoriesDir}/skills/${skill.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.md`;
-      parts.push(`[Skill: ${skill.name}${scoreTag}]\n${skill.description}\n→ ${skillPath}`);
+      const safeDesc = (skill.description ?? '')
+        .replace(/[\r\n]+/g, ' ')
+        .trim()
+        .slice(0, SKILL_DESC_MAX);
+      parts.push(
+        wrapEnrichmentSection(
+          'skill',
+          `${skill.name}${skillScoreTag}`,
+          `${safeDesc}\n→ ${skillPath}`,
+        ),
+      );
     }
 
-    // Assemble
-    if (parts.length === 0) return msg.text;
+    // Assemble.
+    // R1-audit followup on #115: the prior `if (parts.length === 0)
+    // return msg.text` shortcut skipped the envelope ENTIRELY even
+    // when `msg.parentContent` (the quoted-message body) was non-
+    // empty. parentContent is fetched from Feishu — content authored
+    // by some user — so a quoted-reply attack would bypass #114's
+    // fix when the sender has no other stored memory. Now: enter the
+    // wrap path whenever EITHER stored parts OR parentContent exists.
+    if (parts.length === 0 && !msg.parentContent) return msg.text;
 
     return enrichmentPrompt(
       parts.join('\n\n'),
@@ -605,7 +646,14 @@ export class LarkChannel {
    */
   private async handleReactionEvent(data: any): Promise<void> {
     const messageId = data?.message_id ?? '';
-    const emojiType = data?.reaction_type?.emoji_type ?? '';
+    // emoji_type is Feishu-supplied; for standard emojis it's a short
+    // ASCII codename (e.g. "THUMBSUP"), but tenant-custom emojis can
+    // carry arbitrary characters including envelope-breaking markup.
+    // The reaction text is injected into Claude context at line below;
+    // restrict to a safe shape and label anything else as a generic
+    // placeholder so it can't smuggle markup into the prompt (#114).
+    const rawEmoji = data?.reaction_type?.emoji_type ?? '';
+    const emojiType = /^[A-Za-z0-9_-]{1,64}$/.test(rawEmoji) ? rawEmoji : '<custom-emoji>';
     const operatorType = data?.operator_type ?? '';
     // app reactions: operator_type=app; user reactions: operator_type=user, user_id.open_id=ou_xxx
     const operatorId = data?.user_id?.open_id ?? '';
