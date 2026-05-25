@@ -150,10 +150,13 @@ export interface Skill {
    * skills with appropriate skepticism (per the audit's stated
    * acceptance criterion).
    *
-   * Undefined for skills with no sidecar (also indicates lower
-   * provenance — but channel.ts treats undefined the same as
-   * `migrated: true` for safety: any non-OWNER-authored skill gets
-   * the marker).
+   * Undefined for skills with no sidecar at all (legacy skill +
+   * LARK_OWNER_OPEN_ID unset → no claim happens, no sidecar written).
+   * Those skills are equally low-provenance, but the marker
+   * specifically signals the migration-claim path — channel.ts uses
+   * a strict truthy check (`if (skill.migrated)`) so orphan-no-sidecar
+   * skills do NOT get the marker. Operator-review tooling for that
+   * separate category is deferred (#98 option 3).
    */
   migrated?: boolean;
 }
@@ -994,9 +997,12 @@ export class MemoryStore {
       // appropriate skepticism. Reads happen ONLY for the top-N
       // results (default 2) so the IO cost is bounded.
       //
-      // Sidecar read returns null for legacy skills with no sidecar
-      // — those predate v1.0.14 too, treated as migrated for safety
-      // (see channel.ts's || true branch).
+      // Sidecar read returns null for skills with no sidecar (orphan
+      // case: legacy .md + LARK_OWNER_OPEN_ID unset → no claim
+      // happened). Those return `migrated: undefined`; channel.ts
+      // uses a strict `if (skill.migrated)` truthy check so the
+      // marker does NOT fire for orphans. Orphan-skill review is
+      // deferred to #98 option 3 (operator tooling).
       const withMeta = await Promise.all(top.map(async (r) => {
         const slug = MemoryStore.sanitizeSkillSlug(r.skill.name);
         let migrated: boolean | undefined;
