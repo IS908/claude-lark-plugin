@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.54] - 2026-05-26
+
+### Fixed
+- **Stop hook required Claude to voluntarily echo `[LARK_DEFER]` in assistant text — `tool_result` containing the sentinel was ignored** (#122). PR #120 (v1.0.21, #106 Case 2) added `handlePermanentTargetError` which returns `isError: true` with `[LARK_DEFER]` inline in the tool_result text + an instruction asking Claude to echo the sentinel in its assistant turn. The hook's defer bypass only scanned **assistant text + thinking blocks** — `tool_result` blocks were unscanned. So when Claude ignored the instruction (busy generating an action plan that called `reply` again) the loop resurfaced. Best-effort cooperation; not a mechanical guarantee.
+
+  Fix: hook now ALSO scans `tool_result` blocks for the sentinel, scoped to lark-plugin tool_uses (`reply` / `react` / `edit_message`). When the tool itself emits `[LARK_DEFER]` in its result, the hook bypasses mechanically — no Claude cooperation required.
+
+  Implementation:
+  - New `collectLarkToolUseIds(entries, fromIndex)` — pre-pass that collects tool_use_id Set for lark-plugin tools in the scan window.
+  - New `collectLarkToolResultText(entries, fromIndex, larkIds)` — extracts text from `tool_result` blocks whose `tool_use_id` matches the lark set. Handles both content shapes: `string` and `array of {type:'text',text}` blocks.
+  - `main()` checks `hasDeferSentinel(toolResultText)` after `hasDeferSentinel(assistantText)`. New audit reason: `defer-tool-result`.
+
+  **Scope rationale**: scoping to lark-plugin tools prevents an unrelated MCP plugin returning the literal `[LARK_DEFER]` string from spuriously bypassing the unanswered-message block. Test 47 explicitly pins this.
+
+  **Sentinel-line contract preserved**: the existing `^\s*[LARK_DEFER]\s*$` `m`-flag regex (and the `stripCodeContent` pre-pass) applies identically to `toolResultText`. An inline mention like `For docs see [LARK_DEFER] usage notes.` in tool_result does NOT trigger bypass. Test 48 pins this.
+
+### Added
+- New `LARK_TOOLS_WITH_DEFER` Set in `hooks/enforce-lark-reply.mjs` — lark tools that can emit defer signals (distinct from `REPLY_TOOLS` which is "tools that fulfill a reply obligation"). Includes `reply`, `react`, `edit_message`.
+- Hook tests grow from 83 → 91 (+8 for #122):
+  - **Test 45**: reply tool_result with `[LARK_DEFER]` (Claude does NOT echo) → defers (mechanical guarantee).
+  - **Test 46**: reply tool_result without sentinel → still blocks (control).
+  - **Test 47**: non-lark plugin's tool_result with `[LARK_DEFER]` → still blocks (scope check).
+  - **Test 48**: inline `[LARK_DEFER]` mention in lark tool_result (not on own line) → still blocks (sentinel-line contract preserved).
+  - **Test 49**: lark tool_result with array-of-text content shape + sentinel on own line → defers (both content shapes supported).
+  - **Test helpers**: `makeAssistantToolUseWithId(name, id, input)` + `makeUserToolResult(toolUseId, text)` for paired tool_use ↔ tool_result fixtures.
+
+### Operator notes
+- **No behavior change in the cooperation path.** If Claude already echoes the sentinel in assistant text, the hook still bypasses via the existing assistantText scan. The new tool_result scan is an ADDITIONAL bypass condition — strictly more lenient.
+- **Audit log new value**: `reason=defer-tool-result` (vs the existing `reason=defer-sentinel` for assistant-text bypass). Operators grepping audit log can distinguish the two paths.
+- **Adversarial concern addressed**: a malicious Lark user can't trigger the tool_result bypass — it only fires from lark-plugin tool_uses Claude actually made. Non-lark MCP outputs are scope-filtered out.
+
+---
+
 ## [1.0.53] - 2026-05-26
 
 ### Fixed

@@ -1031,6 +1031,173 @@ console.log('\n[41] column-0 unclosed ``` + [LARK_DEFER] (legit code-block open)
   assertContains(r.stderr, 'om_col0', 'still flagged');
 }
 
+// --- #122 helpers — paired tool_use + tool_result for the mechanical defer ---
+function makeAssistantToolUseWithId(name, id, input) {
+  return {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id, name, input }],
+    },
+  };
+}
+
+function makeUserToolResult(toolUseId, text) {
+  return {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: toolUseId, content: text },
+      ],
+    },
+  };
+}
+
+// --- Test 45: #122 mechanical defer via tool_result (lark tool) ---
+console.log('\n[45] reply tool_result contains [LARK_DEFER] (Claude did NOT echo) → defers (#122)');
+{
+  // PR #120's handlePermanentTargetError returns a defer payload in
+  // tool_result. Pre-#122, the Stop hook only bypassed when Claude
+  // VOLUNTARILY echoed [LARK_DEFER] in assistant text. Post-fix the
+  // tool_result itself bypasses the hook — mechanical guarantee.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_122" message_id="om_122" user="kk" chat_type="group">\nq\n</channel>';
+  const toolUseId = 'tu_122_test';
+  const path = writeTranscript('tool-result-defer', [
+    makeUserMsg(userContent),
+    makeAssistantToolUseWithId('mcp__plugin_lark_lark__reply', toolUseId, {
+      chat_id: 'oc_122',
+      reply_to: 'om_122',
+      text: 'attempting reply',
+    }),
+    // Simulate handlePermanentTargetError's return: isError=true with
+    // [LARK_DEFER] inline. Tool result content is a string here.
+    makeUserToolResult(
+      toolUseId,
+      'Target unreachable [230002]: chat_not_found.\n\n[LARK_DEFER]\n\nDo not retry.',
+    ),
+    // Claude does NOT echo the sentinel in assistant text
+    makeAssistantText('I tried but the chat is unreachable. Moving on.'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, 'tool_result defer must bypass even without assistant echo');
+}
+
+// --- Test 46: #122 tool_result without sentinel → still blocks ---
+console.log('\n[46] reply tool_result WITHOUT [LARK_DEFER] → still blocks (control)');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_122b" message_id="om_122b" user="kk" chat_type="group">\nq\n</channel>';
+  const toolUseId = 'tu_122b';
+  const path = writeTranscript('tool-result-no-defer', [
+    makeUserMsg(userContent),
+    makeAssistantToolUseWithId('mcp__plugin_lark_lark__reply', toolUseId, {
+      chat_id: 'oc_122b',
+      reply_to: 'om_other',  // wrong reply_to — doesn't satisfy
+      text: 'reply',
+    }),
+    makeUserToolResult(toolUseId, 'Sent 1 message(s)'),
+    makeAssistantText('Done.'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'no defer + wrong reply_to → blocks');
+  assertContains(r.stderr, 'om_122b', 'still flagged');
+}
+
+// --- Test 47: #122 non-lark tool_result with [LARK_DEFER] → still blocks ---
+console.log('\n[47] OTHER plugin tool_result with [LARK_DEFER] → still blocks (scope check)');
+{
+  // An unrelated MCP plugin returning the literal "[LARK_DEFER]" string
+  // in its output must NOT spuriously bypass the hook. The scope check
+  // gates on tool_use_id matching a lark-plugin tool.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_122c" message_id="om_122c" user="kk" chat_type="group">\nq\n</channel>';
+  const path = writeTranscript('non-lark-tool-result-defer', [
+    makeUserMsg(userContent),
+    makeAssistantToolUseWithId('mcp__plugin_other_other__some_tool', 'tu_other', { x: 1 }),
+    makeUserToolResult('tu_other', 'unrelated output that mentions [LARK_DEFER] in text'),
+    makeAssistantText('Done.'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'unrelated plugin\'s [LARK_DEFER] string must NOT bypass');
+  assertContains(r.stderr, 'om_122c', 'still flagged');
+}
+
+// --- Test 48: #122 inline sentinel in tool_result (not on own line) → still blocks ---
+console.log('\n[48] reply tool_result with INLINE [LARK_DEFER] mention (not on own line) → still blocks');
+{
+  // Even when the lark tool_result is scoped-scanned, the sentinel
+  // regex still requires the literal token to be on its OWN LINE.
+  // An inline mention (e.g. tool returning "see [LARK_DEFER] doc")
+  // must NOT trigger a bypass — preserves the v1.0.31 #82 contract.
+  // Pair with a non-matching reply_to so the inbound is unanswered.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_122d" message_id="om_122d" user="kk" chat_type="group">\nq\n</channel>';
+  const toolUseId = 'tu_122d';
+  const path = writeTranscript('tool-result-inline-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantToolUseWithId('mcp__plugin_lark_lark__reply', toolUseId, {
+      chat_id: 'oc_122d',
+      reply_to: 'om_other',  // doesn't satisfy om_122d
+      text: 'attempting',
+    }),
+    {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: [
+              { type: 'text', text: 'For docs see [LARK_DEFER] usage notes.' },
+            ],
+          },
+        ],
+      },
+    },
+    makeAssistantText('Done.'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'inline [LARK_DEFER] mention does NOT bypass');
+  assertContains(r.stderr, 'om_122d', 'still flagged');
+}
+
+// --- Test 49: #122 tool_result with sentinel on its own line in array content ---
+console.log('\n[49] reply tool_result array-content with [LARK_DEFER] on own line → defers');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_122e" message_id="om_122e" user="kk" chat_type="group">\nq\n</channel>';
+  const toolUseId = 'tu_122e';
+  const path = writeTranscript('tool-result-array-defer-real', [
+    makeUserMsg(userContent),
+    makeAssistantToolUseWithId('mcp__plugin_lark_lark__reply', toolUseId, {
+      chat_id: 'oc_122e',
+      reply_to: 'om_122e',
+      text: 'attempting',
+    }),
+    {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: [
+              { type: 'text', text: 'Target unreachable [230002].\n\n[LARK_DEFER]\n\nDo not retry.' },
+            ],
+          },
+        ],
+      },
+    },
+    makeAssistantText('Done.'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, 'array-content sentinel on own line bypasses');
+}
+
 // --- Test 42: #139 unmatched-backtick + sentinel → must NOT defer ---
 console.log('\n[42] unmatched ` followed by [LARK_DEFER] on next line → must NOT defer (#139)');
 {
