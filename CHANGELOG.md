@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.49] - 2026-05-25
+
+### Cleanup batch #2 — drain audit-followup queue
+
+Second deliberate "drain the LOW queue" pass (the first was v1.0.45 / PR #162). Per the established cadence — one cleanup batch every 3-4 main-loop PRs — runs after v1.0.46 / v1.0.47 / v1.0.48 to keep the followup queue reflective of actual residual work.
+
+Closes #156, closes #164. (#159 / #160 stay deferred — they share unbuilt `recentInboundIds` TTL infra and deserve their own focused PR.)
+
+- **#156 — `recoverMissedJobs` boot-time recycle window**. Pre-fix the boot recovery loop iterated jobs from a single `listAllJobs()` snapshot, then called `executeJob(job)` per job. Between the snapshot and the per-job execute, a `delete_job + create_job` race could land a NEW job at the same path — `executeJob`'s `isRecycledJob` guard (v1.0.43) caught the runtime writeback but the OLD snapshot's `executeMessageJob` ALREADY fired OLD content to OLD target before that guard ran. The window is small (only the few ms of tier-1/tier-2 `notifyStaleSkip` sends per iteration), but symmetric with the executeJob fix would be cleaner. Post-fix: re-read + `isRecycledJob` check immediately before the `await this.executeJob(job)` call inside `recoverMissedJobs`. On recycle (different `created_at`) or deleted-file: log + skip — NO send. Two new tests in `scripts/scheduler-race-smoke.ts` (test 13: recycle skip; test 14: deleted-file skip).
+
+- **#164 — `profileDistillationPrompt` raw-interpolated `episodeSummaries`** (same envelope hygiene gap as #116/#117 closed in PR #163). Episode summaries are LLM-distilled from buffered user messages — two LLM hops removed from attacker text but still consistent with the envelope pattern. Post-fix mirrors PR #163: each episode summary wrapped in `<memory_context type="episode_summary" label="[N]">`, `currentProfile` wrapped in `<memory_context type="current_profile" label="user:${userId}">`, `l2Rules` wrapped in `<memory_context type="l2_rules" label="operator-edited">`. New `[Trust boundary — #164]` preamble names the target user as the only valid `chat_id`/identity for this turn (anti-imperative gate). Three new tests in `scripts/envelope-cluster-smoke.ts` (test 12: wrap structure; test 13: empty profile/L2 degrades gracefully; test 14: adversarial `</memory_context>` escape defanged + preamble overrides embedded fake target).
+
+### Deferred to a future batch
+
+- **#159 / #160** — race protection for `react` and `reply.reply_to` validation share unbuilt `recentInboundIds: TTLCache<messageId, true>` infra on `LarkChannel`. Better to pair them in their own focused PR with the TTL helper built once.
+
+### Process note
+
+Per the discipline established in v1.0.45's process note: file-followup queue should reflect actual residual work, not audit-cycle noise. Two consecutive zero-followup PRs (#165, #166) since the v1.0.45 cleanup confirm the raised bar is operational. This batch keeps it that way — the queue moved from 7 followups (pre-v1.0.45) to 4 (#156 #159 #160 #164) to 2 (#159 #160) post-batch. Both remaining are deferred-by-design (share infra), not noise.
+
+---
+
 ## [1.0.48] - 2026-05-25
 
 ### Fixed

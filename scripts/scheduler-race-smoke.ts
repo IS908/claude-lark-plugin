@@ -536,6 +536,86 @@ try {
     inFlight.delete('foo'); // cleanup
     passed++;
   }
+
+  // 13. #156 cleanup-batch-2: recoverMissedJobs re-reads + isRecycledJob
+  //     check before executeJob. Pre-fix, if a delete_job+create_job
+  //     landed in the few-ms tier-1/tier-2 notification window, the
+  //     OLD snapshot's executeMessageJob fired OLD content to OLD
+  //     target (executeJob's own isRecycledJob caught the runtime
+  //     writeback but couldn't undo the side effect). Post-fix the
+  //     re-read catches the recycle BEFORE the send fires.
+  //
+  //     Scenario: seed OLD job with stale next_run_at, then write NEW
+  //     job (same id, different created_at) before recoverMissedJobs
+  //     iterates. The OLD snapshot reaches the executeJob call, but
+  //     our new re-read sees the recycle and skips — no send.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent));
+
+    // OLD job in the past, NOT stale (so it would normally be recovered)
+    const pastButNotStale = new Date(Date.now() - 60_000).toISOString();
+    const oldJob = makeJob({
+      id: 'recover-recycle',
+      createdAt: '2026-01-01T00:00:00Z',
+      content: 'OLD content',
+    });
+    oldJob.runtime.next_run_at = pastButNotStale;
+
+    // Write NEW job to disk BEFORE recoverMissedJobs runs — simulates
+    // a delete+create that landed between listAllJobs and the per-job
+    // executeJob.
+    const newJob = makeJob({
+      id: 'recover-recycle',
+      createdAt: '2026-06-15T00:00:00Z',
+      content: 'NEW content',
+    });
+    newJob.runtime.next_run_at = new Date(Date.now() + 60_000).toISOString(); // future, won't trigger
+    await writeJob(newJob);
+
+    // Call recoverMissedJobs with the OLD snapshot in the inbound list.
+    // executeJob is reached but the re-read should catch the recycle
+    // and skip — NO send to either OLD or NEW target.
+    await (scheduler as any).recoverMissedJobs([oldJob]);
+
+    if (sent.length !== 0) {
+      fail(`13: recoverMissedJobs should skip OLD execute after recycle, got ${sent.length} sends: ${JSON.stringify(sent)}`);
+    }
+    // NEW job on disk untouched
+    const onDisk = await readJob('recover-recycle');
+    if (!onDisk) fail('13: NEW job file disappeared');
+    if (onDisk.meta.content !== 'NEW content') {
+      fail(`13: NEW job's meta corrupted, got ${onDisk.meta.content}`);
+    }
+
+    await deleteJob('recover-recycle');
+    passed++;
+  }
+
+  // 14. #156: recoverMissedJobs skips when file was DELETED during
+  //     the recovery loop (no recycle, just removed). Existing
+  //     "deleted during execution" log inside executeJob already
+  //     handles this if executeJob is reached, but our pre-execute
+  //     re-read short-circuits earlier — symmetric.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent));
+
+    const pastButNotStale = new Date(Date.now() - 60_000).toISOString();
+    const ghostJob = makeJob({
+      id: 'recover-deleted',
+      createdAt: '2026-01-01T00:00:00Z',
+    });
+    ghostJob.runtime.next_run_at = pastButNotStale;
+    // Do NOT write to disk — simulates the file already being deleted.
+
+    await (scheduler as any).recoverMissedJobs([ghostJob]);
+
+    if (sent.length !== 0) {
+      fail(`14: recoverMissedJobs should skip deleted-file path, got ${sent.length} sends`);
+    }
+    passed++;
+  }
 } finally {
   (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
   rmSync(tmpJobsDir, { recursive: true, force: true });
