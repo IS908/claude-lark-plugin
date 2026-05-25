@@ -220,6 +220,35 @@ function freshHooks(overrides: Partial<MockHooks> = {}): MockHooks {
   passed++;
 }
 
+// 6b. R2-followup (HIGH defect): prompt body INSTRUCTS Claude to pass
+//     thread_id=distillKey in the save_memory call. Without this,
+//     Claude's call omits thread_id → resolveCaller falls back to
+//     chat-level → in a group chat, distilled facts get written to
+//     the WRONG user's profile (the last real user in the chat).
+//     Mirror of the #87 Stage 1 flush fix.
+{
+  const hooks = freshHooks({ episodeCounts: { 'oc_thread': 10 } });
+  await triggerProfileDistillation(
+    'oc_thread',
+    [{ role: 'user', senderId: 'ou_grace' }],
+    makeDeps(hooks, () => 1_700_000_000_000),
+    { cooldownMs: 24 * HOUR_MS, minEpisodes: 5, cooldownState: new Map() },
+  );
+  const inj = hooks.injections[0];
+  // The threadId is `distill-${userId}-${now}` — verify it appears in the
+  // save_memory template AND the explanatory note.
+  if (!inj.text.includes('thread_id="distill-ou_grace-1700000000000"')) {
+    fail(`6b: prompt MUST instruct Claude to pass thread_id in save_memory (wrong-user pollution risk)`);
+  }
+  if (!inj.text.includes('REQUIRED')) {
+    fail(`6b: prompt MUST emphasize thread_id is REQUIRED (avoid silent omission)`);
+  }
+  if (!/WRONG user/i.test(inj.text)) {
+    fail(`6b: prompt SHOULD explain the wrong-user pollution risk for trust calibration`);
+  }
+  passed++;
+}
+
 // 7. Cooldown is marked on DISPATCH (not on success). Even if injection
 //    rejects, the cooldown state holds — failed turns don't retry-storm.
 {

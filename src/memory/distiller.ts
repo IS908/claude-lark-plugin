@@ -53,6 +53,7 @@ export function buildProfileDistillationPrompt(args: {
   episodeSummaries: string[];
   chatType: 'p2p' | 'group';
   l2Rules: string;
+  threadId?: string;
 }): string {
   return profileDistillationPrompt(args);
 }
@@ -228,12 +229,20 @@ export async function triggerProfileDistillation(
       // 4. Identity binding + prompt build
       const distillKey = `distill-${userId}-${now}`;
       deps.setCaller(chatId, distillKey, userId);
+      // R2-followup: pass distillKey as `threadId` into the prompt so
+      // Claude is instructed to echo it back as `thread_id=` in the
+      // save_memory call. Without this, Claude's save_memory call
+      // omits thread_id → caller resolution falls back to chat-level
+      // → in a group chat, distilled facts get written to the WRONG
+      // user's profile (the LAST real user in the chat). Mirror of
+      // the #87 Stage 1 flush fix.
       const prompt = buildProfileDistillationPrompt({
         userId,
         currentProfile,
         episodeSummaries: recentEpisodes,
         chatType,
         l2Rules,
+        threadId: distillKey,
       });
 
       console.error(`[distill-stage2] dispatching profile distillation for user ${userId} in chat ${chatId} (${recentEpisodes.length} episodes)`);
