@@ -171,4 +171,8 @@ echo "=== Ack-reaction batch (pending-revoke / react / download) unit checks ===
 npx tsx scripts/ack-reaction-batch-smoke.ts
 
 echo ""
+echo "=== Envelope cluster (flush + cronjob prompt wrapping) unit checks ==="
+npx tsx scripts/envelope-cluster-smoke.ts
+
+echo ""
 echo "All tests passed."
