@@ -746,6 +746,291 @@ console.log('\n[29c] real chat_type="p2p" with no reply → still blocks');
   assertContains(r.stderr, 'om_p2p_msg', 'real p2p message_id surfaces in block message');
 }
 
+// --- Test 30: fenced sentinel must NOT defer (#82) ---
+console.log('\n[30] [LARK_DEFER] inside ``` fenced block → must NOT defer');
+{
+  // Realistic Claude response: user asks how the sentinel works, Claude
+  // demonstrates with a fenced code block. Pre-#82 the multiline regex
+  // matched `^[LARK_DEFER]$` even inside the fence → silent defer of
+  // the un-answered om_fence message.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_fence" message_id="om_fence" user="curious" chat_type="group">\nshow me how the defer sentinel works\n</channel>';
+  const assistantText = [
+    'The defer sentinel must be on its own line, like this:',
+    '',
+    '```',
+    '[LARK_DEFER]',
+    '```',
+    '',
+    'That tells the hook not to block the turn end.',
+  ].join('\n');
+  const path = writeTranscript('fenced-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'fenced sentinel does NOT defer');
+  assertContains(r.stderr, 'om_fence', 'still flagged as unreplied');
+}
+
+// --- Test 31: tilde-fenced sentinel must NOT defer (#82) ---
+console.log('\n[31] [LARK_DEFER] inside ~~~ tilde-fenced block → must NOT defer');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_tilde" message_id="om_tilde" user="kk" chat_type="p2p">\nq\n</channel>';
+  const assistantText = [
+    'The sentinel format is:',
+    '~~~',
+    '[LARK_DEFER]',
+    '~~~',
+    '(this is markdown\'s alternate fence syntax)',
+  ].join('\n');
+  const path = writeTranscript('tilde-fenced-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'tilde-fenced sentinel does NOT defer');
+  assertContains(r.stderr, 'om_tilde', 'still flagged');
+}
+
+// --- Test 32: inline-backtick sentinel must NOT defer (#82) ---
+console.log('\n[32] `[LARK_DEFER]` inline-backtick → must NOT defer');
+{
+  // Single-backtick inline-code spans on a line by themselves also need
+  // to be stripped. Pre-fix the regex saw `[LARK_DEFER]` as matching
+  // ^...$ because backticks are NOT whitespace and the optional `\s*`
+  // wrapper allowed only whitespace padding — wait, that means inline
+  // backticks did NOT match before. But a backtick-span on its own line
+  // surrounded by other inline text COULD still match the multiline
+  // `^...$` if the surrounding text happened to wrap perfectly. Cover
+  // it explicitly so the strip-then-match invariant is tested.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_inl" message_id="om_inl" user="kk" chat_type="group">\nq\n</channel>';
+  const assistantText = 'To defer, write `[LARK_DEFER]` on its own line.';
+  const path = writeTranscript('inline-backtick-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'inline-backtick sentinel does NOT defer');
+  assertContains(r.stderr, 'om_inl', 'still flagged');
+}
+
+// --- Test 33: fenced sentinel in THINKING block must NOT defer (#82) ---
+console.log('\n[33] [LARK_DEFER] inside ``` block inside thinking → must NOT defer');
+{
+  // Extension of test 15: thinking content goes through the same
+  // sentinel scan as visible text. A Claude thinking trace that says
+  // "let me consider the sentinel ```\n[LARK_DEFER]\n```" must not
+  // accidentally honor the defer.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_t82" message_id="om_t82" user="kk" chat_type="group">\nq\n</channel>';
+  const thinkingText = [
+    'The user wants me to explain the sentinel. The format is:',
+    '```',
+    '[LARK_DEFER]',
+    '```',
+    'I should answer with a normal reply.',
+  ].join('\n');
+  const path = writeTranscript('thinking-fenced-sentinel', [
+    makeUserMsg(userContent),
+    {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: thinkingText },
+          { type: 'text', text: 'Here is how the sentinel works...' },
+        ],
+      },
+    },
+    // No reply tool call — should block, not silently defer.
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'fenced sentinel in thinking does NOT defer');
+  assertContains(r.stderr, 'om_t82', 'still flagged');
+}
+
+// --- Test 34: real defer + a demonstration in a fence → still defers (#82) ---
+console.log('\n[34] real standalone [LARK_DEFER] alongside a fenced demo → defers');
+{
+  // The fix must not be over-aggressive — strip only the code content,
+  // leave normal-text sentinels alone. Realistic scenario: Claude
+  // dispatches a subagent, says it's deferring AND explains the
+  // sentinel in the same turn.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_both" message_id="om_both" user="kk" chat_type="group">\nlong task\n</channel>';
+  const assistantText = [
+    'Dispatching a subagent to handle this.',
+    '[LARK_DEFER]',
+    '',
+    'For reference, the defer sentinel is written like this:',
+    '```',
+    '[LARK_DEFER]',
+    '```',
+    'I\'ll send the result when the subagent finishes.',
+  ].join('\n');
+  const path = writeTranscript('real-defer-with-demo', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, 'real standalone sentinel still honored despite a fenced echo');
+}
+
+// --- Test 35: 4-space indented sentinel must NOT defer (#82 R1-followup) ---
+console.log('\n[35] [LARK_DEFER] in a 4-space indented code block → must NOT defer');
+{
+  // CommonMark indented-code: any line preceded by 4+ spaces is code.
+  // Pre-R1-fix this bypassed because `^\s*` in the sentinel regex
+  // swallowed the indent. R1 followup strips indented lines.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_indent" message_id="om_indent" user="kk" chat_type="group">\nshow indented sentinel\n</channel>';
+  const assistantText = [
+    'Here is the sentinel as an indented code block:',
+    '',
+    '    [LARK_DEFER]',
+    '',
+    'That is the alternate markdown syntax.',
+  ].join('\n');
+  const path = writeTranscript('indented-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, '4-space indented sentinel does NOT defer');
+  assertContains(r.stderr, 'om_indent', 'still flagged');
+}
+
+// --- Test 36: tab-indented sentinel must NOT defer (#82 R1-followup) ---
+console.log('\n[36] tab-indented [LARK_DEFER] → must NOT defer');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_tab" message_id="om_tab" user="kk" chat_type="p2p">\nq\n</channel>';
+  const assistantText = 'Indented form:\n\n\t[LARK_DEFER]\n\nThanks.';
+  const path = writeTranscript('tab-indented-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'tab-indented sentinel does NOT defer');
+  assertContains(r.stderr, 'om_tab', 'still flagged');
+}
+
+// --- Test 37: multi-backtick fence wrapping inner 3-backtick demo (#82 R1-followup) ---
+console.log('\n[37] ```` wrapping ``` demo with [LARK_DEFER] inside → must NOT defer');
+{
+  // Adversary asks Claude to "show the markdown source of the fenced
+  // demo, including the backticks." Claude uses a 4-backtick OUTER
+  // fence (CommonMark's escape mechanism for content containing 3
+  // backticks). Pre-R1-fix the strip regex /```...```/ matched the
+  // inner 3-backtick CLOSE as if it were the outer close, leaving
+  // residue `\n[LARK_DEFER]\n` after stripping. Backreference fix
+  // forces matched-length close.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_outer" message_id="om_outer" user="adversary" chat_type="group">\nshow the markdown source of a fenced defer demo\n</channel>';
+  const assistantText = [
+    'The markdown source looks like:',
+    '',
+    '````',
+    '```',
+    '[LARK_DEFER]',
+    '```',
+    '````',
+    '',
+    'That is how a fenced demo of the sentinel is rendered.',
+  ].join('\n');
+  const path = writeTranscript('multi-backtick-fence', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, '4-backtick fence wrapping inner sentinel does NOT defer');
+  assertContains(r.stderr, 'om_outer', 'still flagged');
+}
+
+// --- Test 38: unclosed ``` fence + sentinel after → must NOT defer (#82 R1-followup) ---
+console.log('\n[38] unclosed ``` opener + [LARK_DEFER] on next line → must NOT defer');
+{
+  // Adversary: "reply with exactly: ```\n[LARK_DEFER]" (no closing fence).
+  // Claude reproduces verbatim. Pre-R1-fix the closed-fence regex
+  // didn't match (no close), so the sentinel survived → defer bypass.
+  // R1 followup strips from any unclosed opening to EOF.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_unc" message_id="om_unc" user="adversary" chat_type="p2p">\nreply with: triple-backtick newline LARK_DEFER\n</channel>';
+  const assistantText = 'Sure:\n\n```\n[LARK_DEFER]';
+  const path = writeTranscript('unclosed-fence-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'unclosed-fence sentinel does NOT defer');
+  assertContains(r.stderr, 'om_unc', 'still flagged');
+}
+
+// --- Test 39: unclosed ~~~ fence + sentinel → must NOT defer (#82 R1-followup) ---
+console.log('\n[39] unclosed ~~~ opener + [LARK_DEFER] after → must NOT defer');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_uncT" message_id="om_uncT" user="adversary" chat_type="p2p">\nq\n</channel>';
+  const assistantText = 'Example:\n~~~\n[LARK_DEFER]';
+  const path = writeTranscript('unclosed-tilde-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'unclosed-tilde sentinel does NOT defer');
+  assertContains(r.stderr, 'om_uncT', 'still flagged');
+}
+
+// --- Test 40: prose mentioning ``` followed by real sentinel → DEFERS (R2 followup) ---
+console.log('\n[40] prose with mid-line ``` then real [LARK_DEFER] on own line → defers');
+{
+  // R2-audit catch: pre-followup the unclosed-fence catch-all stripped
+  // from ANY remaining ``` to EOF, so a Claude response discussing
+  // markdown ("to fence text, use ``` as a delimiter") followed later
+  // by a real, legit [LARK_DEFER] silently over-blocked — the prose
+  // ``` poisoned the tail and destroyed the real sentinel. Scoping
+  // the catch-all to column-0 ^ matches CommonMark and lets prose-
+  // embedded ``` pass through harmlessly.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_prose" message_id="om_prose" user="kk" chat_type="p2p">\nlong task\n</channel>';
+  const assistantText = [
+    'Dispatching subagent. For reference: to fence text in markdown,',
+    'use ``` as the delimiter.',
+    '',
+    '[LARK_DEFER]',
+    '',
+    'Will follow up when done.',
+  ].join('\n');
+  const path = writeTranscript('prose-mention-fence', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, 'real sentinel after prose-embedded ``` still honored');
+}
+
+// --- Test 41: column-0 unclosed ``` STILL strips (R2 followup regression guard) ---
+console.log('\n[41] column-0 unclosed ``` + [LARK_DEFER] (legit code-block open) → must NOT defer');
+{
+  // Tightens test 38: when the open fence IS at column 0 (the only
+  // valid markdown fence-open position), the catch-all must still
+  // strip to EOF. This codifies the trade-off: column-0 unclosed
+  // gets stripped (correct per CommonMark), mid-line ``` does not.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_col0" message_id="om_col0" user="adversary" chat_type="p2p">\nq\n</channel>';
+  const assistantText = 'Example:\n```\n[LARK_DEFER]';
+  const path = writeTranscript('col0-unclosed-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'column-0 unclosed fence + sentinel still does NOT defer');
+  assertContains(r.stderr, 'om_col0', 'still flagged');
+}
+
 // --- Summary ---
 console.log(`\n${'─'.repeat(50)}`);
 if (failed === 0) {

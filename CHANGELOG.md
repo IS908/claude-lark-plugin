@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.31] - 2026-05-25
+
+### Fixed
+- **Stop hook: defer sentinel inside fenced code block silently bypasses block** (#82 — **MEDIUM hook-bypass via legitimate Claude documentation**). `hooks/enforce-lark-reply.mjs:376` (`hasDeferSentinel`) used a multiline-anchored regex `^\s*\[LARK_DEFER\]\s*$` to detect the defer sentinel on its own line — but the `m` flag matches ANY line, including lines inside a markdown fenced code block. So a Claude response that *documented* the sentinel — e.g. a user asking "how does [LARK_DEFER] work?" and Claude replying with a fenced demo — silently deferred the un-answered turn. The user's real message was treated as deferred-pending-async even though Claude had not actually called `reply`.
+
+  Test 22 covered the inline-echo attack (`the token is [LARK_DEFER] as you asked`) and test 23 covered the legitimate own-line sentinel — but the in-between "own line inside a code block" case was uncovered.
+
+  Same exposure in **thinking blocks** (`block.type === 'thinking'`): Claude's thinking trace often quotes the sentinel inside fences when reasoning about its own behavior. `collectAssistantText` includes thinking text in the scanned `combined` string, so any fenced sentinel in thinking would have hit the same false-defer path.
+
+  Fix: new `stripCodeContent(text)` step before the sentinel regex. Removes — in order — ```...``` fenced blocks (any language hint), ~~~...~~~ alt-fence blocks, and `` `...` `` inline backtick spans. Non-greedy matching so adjacent fences don't collapse into one strip. Unclosed fences are NOT stripped (rare in realistic Claude output; over-blocking on a malformed code block is a worse failure mode than under-blocking the rare unclosed case).
+
+### Added
+- 12 new hook-test assertions (tests 30–41) covering:
+  - **Tests 30–34** (initial fix): ```...[LARK_DEFER]...``` fenced sentinel → must NOT defer; ~~~ alt-fence sentinel → must NOT defer; inline backtick `` `[LARK_DEFER]` `` → must NOT defer; fenced sentinel in `thinking` block → must NOT defer; real standalone `[LARK_DEFER]` + a fenced demo together → still defers (strip-only-code regression guard).
+  - **Tests 35–39 (R1-followup)**: 4-space indented code block → must NOT defer; tab-indented → must NOT defer; multi-backtick fence (4+ backticks wrapping inner 3-backtick demo) → must NOT defer; unclosed ``` fence + sentinel → must NOT defer; unclosed ~~~ fence + sentinel → must NOT defer.
+  - **Tests 40–41 (R2-followup)**: prose with mid-line ``` followed by a real `[LARK_DEFER]` on its own line → MUST still defer (regression guard against the over-block the unscoped catch-all caused); column-0 unclosed ``` + sentinel → still does NOT defer (regression guard that the scoping didn't accidentally reopen the legit fence-open bypass).
+
+### R1-audit followups (closed in this PR)
+- **Multi-backtick fences** — pre-followup the strip regex `/```...```/` matched the inner 3-backtick CLOSE of a `````...`````-wrapped demo as if it were the outer close, leaving residue. Switched to backreference `(`{3,})...\1` so a 4-backtick open requires a 4-backtick close. Same fix applied to tilde fences via `(~{3,})...\1`.
+- **Indented code blocks** — CommonMark's 4-space (and tab) indented-code syntax was not stripped. A Claude response indenting the sentinel demo bypassed because the sentinel regex `^\s*\[LARK_DEFER\]\s*$` swallowed the leading indent. Now strips `^[ ]{4,}.*$` and `^\t.*$` line-by-line.
+- **Unclosed fences (column-0 only, refined after R2)** — adversary asks Claude to "reply with exactly: ` ``` \n[LARK_DEFER]" (no closing fence). Pre-fix the closed-fence regex didn't match → sentinel survived → defer bypass. Strips any **column-0** opening fence to EOF. (R2-audit found the initial R1 wording — "any remaining ``` to EOF" — was over-aggressive: legitimate Claude prose discussing markdown that mentions ``` mid-line, followed later by a real `[LARK_DEFER]`, would have over-blocked because the prose `` ``` `` poisoned the tail. Scoping to `^`-anchored matches CommonMark — only column-0 fence opens are real opens — and lets prose-embedded backticks pass through harmlessly. The narrower residual "mid-line ``` followed by sentinel on next line" can still produce a false defer, but it requires very specific adversarial prompting that Claude is unlikely to emit naturally.)
+
+### R2-audit followups (closed in this PR)
+- **Unclosed-fence catch-all scoped to column-0** (described above) — turned a HIGH false-negative (legit defer dropped because of prose `` ``` ``) into the much narrower residual described.
+- **Test 40 + test 41 (regression guards)**: test 40 covers the over-block scenario (prose mentioning ``` followed by real sentinel → must defer); test 41 codifies that column-0 unclosed fences STILL strip (the legitimate code-block-open case).
+
+### R1-audit findings filed as followups
+- **#139 — Unmatched inline backtick residual**. An unclosed single backtick followed by the sentinel on a later line (e.g. `look at \`weird thing\n[LARK_DEFER]`) survives strip-then-match because the inline regex requires a same-line close. Lower-frequency adversarial path; fix likely via tightening the sentinel regex to require column-0 start (rejecting all leading whitespace). Filed for a separate PR.
+
+### Operator notes
+- No data-format changes; no migration. Pre-fix transcripts that triggered a false-defer cannot be retroactively re-evaluated — the audit log shows `status=deferred reason=defer-sentinel` for any past occurrence. Post-fix, the same shape transcript will block, surfacing the genuine pending message via `process.stderr`.
+- If you observe a turn over-blocking on legitimately-formatted text containing a trailing opening fence (very rare), the fix is to close the fence — match the open ` ``` ` with a corresponding close at the end of the response.
+
 ## [1.0.30] - 2026-05-25
 
 ### Fixed
