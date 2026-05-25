@@ -413,9 +413,32 @@ export class JobScheduler {
           return;
         }
         fresh.runtime.last_run_at = new Date(startTime).toISOString();
-        fresh.runtime.next_run_at = computeNextRun(fresh.meta.schedule);
         fresh.runtime.run_count = (fresh.runtime.run_count ?? 0) + 1;
-        fresh.runtime.last_error = null;
+        // Compute next_run_at defensively (R1-audit followup on this PR):
+        // the on-disk schedule can be poisoned by an out-of-band edit
+        // (manual JSON edit / restore-from-backup / future code path
+        // that bypasses update_job's Zod validation). Pre-fix, a thrown
+        // computeNextRun would short-circuit the writeJob — leaving
+        // `next_run_at` unchanged on disk → next tick re-fires with the
+        // same `<= now` value → the chat message is RE-SENT every 60s
+        // until an operator notices the stderr spam. The dead-letter
+        // (next_run_at='') makes both tick and recoverMissedJobs skip
+        // the job via their existing `if (!next_run_at) continue;`
+        // guards. last_error explains the resume path.
+        try {
+          fresh.runtime.next_run_at = computeNextRun(fresh.meta.schedule);
+          fresh.runtime.last_error = null;
+        } catch (cronErr: any) {
+          fresh.runtime.next_run_at = '';
+          fresh.runtime.last_error =
+            `invalid schedule '${fresh.meta.schedule}': ${cronErr?.message ?? cronErr} ` +
+            `— job dead-lettered; fix via update_job to resume.`;
+          console.error(
+            `[scheduler] Job ${fresh.meta.id}: invalid schedule '${fresh.meta.schedule}' ` +
+            `(${cronErr?.message ?? cronErr}) — DEAD-LETTERED (cleared next_run_at to ` +
+            `prevent re-fire loop). Fix with update_job.`,
+          );
+        }
 
         if (attempt > 0) {
           console.error(`[scheduler] Job ${fresh.meta.id} succeeded on retry #${attempt} (run #${fresh.runtime.run_count})`);
@@ -459,7 +482,22 @@ export class JobScheduler {
       return;
     }
     freshFail.runtime.last_run_at = new Date(startTime).toISOString();
-    freshFail.runtime.next_run_at = computeNextRun(freshFail.meta.schedule);
+    // Same dead-letter defense as the success path (R1-audit followup).
+    // A poisoned on-disk schedule throws here and would otherwise leave
+    // next_run_at unchanged → tick re-fires every 60s, hitting the same
+    // execution failure each time. On the failure path, the execution
+    // error itself goes into last_error (more actionable for the
+    // operator than the cron error); the dead-letter is only logged.
+    try {
+      freshFail.runtime.next_run_at = computeNextRun(freshFail.meta.schedule);
+    } catch (cronErr: any) {
+      freshFail.runtime.next_run_at = '';
+      console.error(
+        `[scheduler] Job ${freshFail.meta.id}: invalid schedule '${freshFail.meta.schedule}' ` +
+        `(${cronErr?.message ?? cronErr}) — DEAD-LETTERED on failure-path advance ` +
+        `(cleared next_run_at). Fix with update_job.`,
+      );
+    }
     freshFail.runtime.last_error = lastErr?.message ?? String(lastErr);
 
     // #106 fix: detect permanent target-chat errors (bot kicked / chat

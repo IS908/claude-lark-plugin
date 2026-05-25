@@ -867,9 +867,130 @@ try {
     }
     passed++;
   }
+
+  // 28. R1-audit followup on this PR: a poisoned on-disk schedule
+  //     (anything that bypasses update_job's Zod gate — manual edit,
+  //     restore-from-backup, future bypass path) must NOT cause an
+  //     infinite re-fire loop. Pre-fix, executeMessageJob would send
+  //     the chat message, then computeNextRun would throw, writeJob
+  //     would be skipped, and the next tick (60s later) would see
+  //     the same next_run_at <= now → re-send forever until the
+  //     operator noticed the stderr spam.
+  //
+  //     Post-fix: computeNextRun is wrapped in try/catch on both
+  //     paths. On throw, next_run_at is set to '' (empty string —
+  //     tick and recoverMissedJobs both gate on `if (!next_run_at)`)
+  //     and last_error explains the resume path.
+  {
+    let raceFired = false;
+    const racyClient = {
+      im: { v1: { message: { create: async (args: any) => {
+        if (!raceFired) {
+          const disk = await readJob('race-bad-schedule');
+          if (!disk) fail(`28: precondition: job should exist on disk pre-race`);
+          // Poison the schedule mid-flight — simulates an out-of-band
+          // edit that landed between tick's listAllJobs read and
+          // executeJob's post-execute fresh-read.
+          disk!.meta.schedule = 'not a cron expression at all';
+          await writeJob(disk!);
+          raceFired = true;
+        }
+        return { data: { message_id: 'mock' } };
+      } } } },
+    };
+    const scheduler = makeScheduler(racyClient);
+    const job = makeJob('race-bad-schedule', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    let threw = false;
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await (scheduler as any).executeJob(job);
+    } catch {
+      threw = true;
+    } finally {
+      console.error = origError;
+    }
+
+    if (threw) fail(`28: executeJob must NOT throw on bad on-disk schedule (would re-fire on next tick)`);
+
+    const onDisk = await readJob('race-bad-schedule');
+    if (!onDisk) fail(`28: file should still exist (dead-letter, not delete)`);
+    if (onDisk!.runtime.next_run_at !== '') {
+      fail(`28: poisoned schedule must dead-letter via next_run_at=''; got ${JSON.stringify(onDisk!.runtime.next_run_at)}`);
+    }
+    if (!onDisk!.runtime.last_error || !/invalid schedule/.test(onDisk!.runtime.last_error)) {
+      fail(`28: last_error must explain the dead-letter; got ${onDisk!.runtime.last_error}`);
+    }
+    if (!errors.some((e) => /DEAD-LETTERED/.test(e) && /race-bad-schedule/.test(e))) {
+      fail(`28: dead-letter must log to stderr; got: ${errors.join(' | ')}`);
+    }
+    // Run count was still incremented (the run DID happen — message sent).
+    if (onDisk!.runtime.run_count !== 1) {
+      fail(`28: run_count should be 1 (the run completed before schedule poison); got ${onDisk!.runtime.run_count}`);
+    }
+    passed++;
+  }
+
+  // 29. Same dead-letter defense on the FAILURE path: if executeJob's
+  //     send fails AND the schedule is also bad, computeNextRun's throw
+  //     must not propagate (same re-fire loop concern as test 28).
+  {
+    let raceFired = false;
+    const racyClient = {
+      im: { v1: { message: { create: async () => {
+        if (!raceFired) {
+          const disk = await readJob('race-bad-schedule-fail');
+          if (!disk) fail(`29: precondition`);
+          disk!.meta.schedule = 'still not a cron';
+          await writeJob(disk!);
+          raceFired = true;
+        }
+        // Now throw a non-retryable execution error.
+        const err: any = new Error('Feishu API [230001]: param error');
+        err.response = { data: { code: 230001, msg: 'param error' } };
+        throw err;
+      } } } },
+    };
+    const scheduler = makeScheduler(racyClient);
+    const job = makeJob('race-bad-schedule-fail', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    let threw = false;
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await (scheduler as any).executeJob(job);
+    } catch {
+      threw = true;
+    } finally {
+      console.error = origError;
+    }
+
+    if (threw) fail(`29: failure-path executeJob must NOT throw on bad on-disk schedule`);
+
+    const onDisk = await readJob('race-bad-schedule-fail');
+    if (!onDisk) fail(`29: file should still exist`);
+    if (onDisk!.runtime.next_run_at !== '') {
+      fail(`29: failure-path bad-schedule must also dead-letter; got ${JSON.stringify(onDisk!.runtime.next_run_at)}`);
+    }
+    // On the failure path, last_error reflects the EXECUTION error
+    // (more actionable than the cron error); the dead-letter is
+    // logged via stderr only.
+    if (!onDisk!.runtime.last_error || !/230001|param error/.test(onDisk!.runtime.last_error)) {
+      fail(`29: failure-path last_error should carry the execution error; got ${onDisk!.runtime.last_error}`);
+    }
+    if (!errors.some((e) => /DEAD-LETTERED/.test(e) && /race-bad-schedule-fail/.test(e))) {
+      fail(`29: failure-path dead-letter must log to stderr; got: ${errors.join(' | ')}`);
+    }
+    passed++;
+  }
 } finally {
   (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }
 
-console.log(`scheduler smoke: ${passed}/31 PASS`);
+console.log(`scheduler smoke: ${passed}/33 PASS`);

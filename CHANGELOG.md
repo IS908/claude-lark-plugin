@@ -16,16 +16,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **#78**: both success and failure paths of `executeJob` re-read the job via `readJob(id)` before writing. If the file is gone, the run is logged-and-dropped (no resurrection). Otherwise the fresh disk meta wins — user updates to schedule / prompt / status survive — and only the runtime fields (last_run_at, next_run_at from the FRESH schedule, run_count, last_error) plus the `#106` auto-pause status are applied to the fresh object. The fresh meta+runtime is then copied back onto the input `job` reference so existing callers (tests, recoverMissedJobs) see the post-write state.
 
 ### Added
-- 8 new scheduler-smoke assertions (tests 20–27) covering:
+- 10 new scheduler-smoke assertions (tests 20–29) covering:
   - re-entrancy: pre-populated `inFlight` → tick skips; cross-job parallelism preserved (different ids don't gate each other); `.finally` cleanup on success and failure paths both work.
   - read-modify-write: success-path mid-flight delete → no resurrection; failure-path mid-flight delete → no resurrection; mid-flight `update_job(status='paused')` → disk status wins on the post-write merge while runtime fields still apply; mid-flight `update_job(schedule=...)` → next_run_at computed from the NEW schedule, not the stale one captured at tick time.
+  - dead-letter on poisoned schedule (R1-followup, see below): success-path and failure-path bad-schedule cases each verify no throw escapes executeJob, `next_run_at` is cleared to `''`, and the dead-letter is logged.
 
 ### Changed
 - Existing scheduler-smoke tests 16–19 + 19c updated to `await writeJob(job)` before `executeJob` / `recoverMissedJobs`. Pre-fix the in-memory `job` was mutated directly; post-fix `executeJob` requires the file to be on disk for its fresh-read merge — which mirrors production exactly, where `executeJob` is only ever called on jobs returned by `listAllJobs`. Test 18 also temporarily clears `appConfig.ownerOpenId` to exercise the truly-orphan path, because `backfillJob` (now invoked via `readJob`) resurrects `created_by` from `LARK_OWNER_OPEN_ID`.
 
+### R1-audit followups (closed in this PR)
+- **Dead-letter on poisoned on-disk schedule** — the fresh-read merge made a pre-existing latent bug more reachable: any out-of-band edit to `meta.schedule` (manual JSON edit / restore-from-backup / a future code path that bypasses `update_job`'s Zod validation) would make `computeNextRun(fresh.meta.schedule)` throw AFTER the chat send / prompt injection had already succeeded. The throw short-circuited `writeJob`, leaving the on-disk `next_run_at` unchanged — so the next tick (60s later) would see the same `next_run_at <= now`, re-fire the message, re-throw on the schedule, and so on. Result: silent infinite re-send loop at 60s cadence until an operator noticed the stderr spam.
+
+  Fix: both success-path and failure-path `computeNextRun` calls are now wrapped in try/catch. On throw, `next_run_at` is cleared to `''` (which both `tick` and `recoverMissedJobs` skip via their existing `if (!next_run_at) continue;` guard) and `last_error` explains the resume path (`update_job` with a valid schedule). The dead-letter is logged with severity-grade prefix `DEAD-LETTERED` so it's grep-able in operator log triage.
+
 ### Operator notes
 - No data-format changes — existing job files on disk are read and written in the same shape as v1.0.28. The fix is purely in scheduler memory semantics; there is nothing to migrate.
-- The `inFlight` Set is in-process. A daemon restart clears it, but `start()` runs `recoverMissedJobs` once before installing the tick timer, so there is no window for cross-restart re-entrancy.
+- The `inFlight` Set is in-process. A daemon restart clears it, and `start()` runs `recoverMissedJobs` before installing the tick timer — so there is no window for cross-restart re-entrancy **within a single process**. If the daemon is SIGKILL'd mid-`executeJob`, on restart `recoverMissedJobs` will replay the run — same as v1.0.28 and prior, this is the intended crash-recovery semantics, not a regression.
+- If you discover a job stuck in the dead-letter state (`next_run_at: ""` + `last_error: "invalid schedule ..."`), fix it via `update_job` with a valid schedule. `update_job` validates the schedule at the Zod boundary AND via `expandSchedule`, so a successful `update_job` will recompute `next_run_at` and resume normal ticking.
 
 ## [1.0.28] - 2026-05-25
 
