@@ -114,4 +114,8 @@ echo "=== Profile TOCTOU mutex unit checks ==="
 npx tsx scripts/profile-toctou-smoke.ts
 
 echo ""
+echo "=== Inbox GC unit checks ==="
+npx tsx scripts/inbox-gc-smoke.ts
+
+echo ""
 echo "All tests passed."

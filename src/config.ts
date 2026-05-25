@@ -122,6 +122,26 @@ export const appConfig = {
   memoriesDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'memories'),
   inboxDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'inbox'),
   jobsDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'jobs'),
+
+  // Inbox garbage collection (#89). The inbox directory was write-only
+  // pre-v1.0.35 — every downloaded image and every download_attachment
+  // file accumulated forever. In a heavy-image deployment (group with
+  // screenshots / PDF reports / memes) an SSD would fill in months.
+  //
+  // GC runs at startup and periodically. Files are removed when:
+  //   1. mtime is older than maxAgeDays (age expiry), OR
+  //   2. total directory size exceeds maxSizeMB → oldest-first LRU
+  //      eviction until under cap.
+  //
+  // The 7-day default age comfortably exceeds any reasonable Claude
+  // turn duration (largest turn we've observed is single-digit minutes),
+  // so a mid-turn `Read` of an `image_path` notification meta will
+  // always find its file. Operators can disable entirely via
+  // LARK_INBOX_GC_DISABLED=true for forensic / archival deployments.
+  inboxMaxAgeDays: optionalNumber('LARK_INBOX_MAX_AGE_DAYS', 7),
+  inboxMaxSizeMB: optionalNumber('LARK_INBOX_MAX_SIZE_MB', 500),
+  inboxGcIntervalMin: optionalNumber('LARK_INBOX_GC_INTERVAL_MIN', 60),
+  inboxGcDisabled: (process.env.LARK_INBOX_GC_DISABLED ?? '').toLowerCase() === 'true',
 } as const;
 
 export type AppConfig = typeof appConfig;
