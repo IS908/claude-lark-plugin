@@ -167,12 +167,19 @@ export class JobScheduler {
    * design had no way to distinguish them either; this matches the
    * pre-fix legacy behavior.
    *
-   * Cleanup keys on `id` alone — the finally-block delete after
-   * `executeJob` always clears the slot regardless of the
-   * created_at it captured (executeJob removed exactly the entry
-   * tick() added; tick() never adds twice for the same id with
-   * different created_at because the second-add-attempt sees
-   * `inFlight.has(id)` short-circuit).
+   * Cleanup uses CAS-on-delete (R2-followup correction): the
+   * finally-block compares the slot's current value to the
+   * `created_at` captured in tick()'s closure and only deletes on
+   * match. Without this, a recycle could play out as:
+   *   1. tick: inFlight.set(foo, A); launch executeJob(A)
+   *   2. recycle: file replaced with B
+   *   3. tick: inFlight.get(foo)=A, jobA.created_at=B → release;
+   *      inFlight.set(foo, B); launch executeJob(B)
+   *   4. A finishes; A's finally — if id-only — runs
+   *      inFlight.delete(foo), erasing B's entry; B is now
+   *      unprotected and a third tick could re-launch it
+   * The CAS makes step 4 a no-op for A (slot holds B, not A), so
+   * B's re-entrancy stays gated until B's own finally fires.
    *
    * NOT used by recoverMissedJobs — start() awaits recoverMissedJobs
    * before installing the tick timer, so the two paths are temporally
@@ -396,20 +403,36 @@ export class JobScheduler {
       // distinct logical job and let it run. The OLD execution's
       // writeback will skip via isRecycledJob, so the two don't
       // collide on disk either.
+      const jobCreatedAt = job.meta.created_at ?? '';
       const inFlightCreatedAt = this.inFlight.get(job.meta.id);
-      if (inFlightCreatedAt !== undefined && inFlightCreatedAt === (job.meta.created_at ?? '')) {
+      if (inFlightCreatedAt !== undefined && inFlightCreatedAt === jobCreatedAt) {
         continue;
       }
 
       const nextRun = new Date(job.runtime.next_run_at).getTime();
       if (nextRun <= now) {
-        this.inFlight.set(job.meta.id, job.meta.created_at ?? '');
+        // R2-followup: capture `jobCreatedAt` in the closure so the
+        // finally-block can perform a CAS-on-delete. Pre-followup the
+        // delete was id-only, which broke the re-entrancy invariant
+        // under recycle: if OLD execution was in flight and a recycle
+        // landed a NEW job, this tick overwrote OLD's slot with NEW's
+        // — then OLD's finally fired `inFlight.delete(id)`, erasing
+        // NEW's entry. NEW was still in flight but unprotected, and
+        // the next tick would re-launch NEW (the exact #77 duplicate-
+        // execution bug, on the recycled job). Post-followup: each
+        // execution's finally only clears its OWN slot.
+        this.inFlight.set(job.meta.id, jobCreatedAt);
         this.executeJob(job)
           .catch((err) => {
             console.error(`[scheduler] Failed to execute job ${job.meta.id}:`, err);
           })
           .finally(() => {
-            this.inFlight.delete(job.meta.id);
+            // CAS: only clear if the slot still holds OUR generation.
+            // A concurrent recycle that overwrote our entry must keep
+            // its own slot intact until its own executeJob finishes.
+            if (this.inFlight.get(job.meta.id) === jobCreatedAt) {
+              this.inFlight.delete(job.meta.id);
+            }
           });
       }
     }

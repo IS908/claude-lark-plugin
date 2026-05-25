@@ -378,6 +378,133 @@ try {
     passed++;
   }
 
+  // 12. R2-followup integration: CAS-on-delete prevents OLD's
+  //     finally from clearing NEW's recycled slot. Pre-followup,
+  //     `inFlight.delete(id)` was id-only — so the moment OLD
+  //     finished, NEW's slot vanished even though NEW was still in
+  //     flight. A subsequent tick would then see no slot for `id`
+  //     and re-launch NEW (the exact #77 duplicate-execution bug,
+  //     on the recycled job).
+  //
+  //     Deterministic setup using mock blocking: both OLD and NEW's
+  //     mock sends block on a promise we control. We fire ticks
+  //     1/2/3 with full control over which executions are still in
+  //     flight when each tick decides. The acid test is tick 3:
+  //       - WITH CAS:    OLD's earlier finally was a no-op (slot
+  //                      holds B, captured A) → NEW's slot intact
+  //                      → tick 3 sees `B === B` → BLOCKED → no
+  //                      duplicate execution.
+  //       - WITHOUT CAS: OLD's finally deleted the slot → tick 3
+  //                      sees no slot → launches NEW AGAIN.
+  //     We verify post-release that NEW ran exactly once (sends
+  //     filtered for 'new-content' === 1, and on-disk run_count === 1).
+  {
+    let releaseOld!: () => void;
+    let releaseNew!: () => void;
+    const oldBlock = new Promise<void>(r => { releaseOld = r; });
+    const newBlock = new Promise<void>(r => { releaseNew = r; });
+    const sends: { text: string }[] = [];
+
+    const blockingClient = {
+      im: { v1: { message: { create: async (args: any) => {
+        const text = JSON.parse(args?.data?.content ?? '{}').text ?? '';
+        sends.push({ text });
+        if (text === 'old-content') await oldBlock;
+        if (text === 'new-content') await newBlock;
+        return { data: { message_id: 'mock' } };
+      } } } },
+    };
+    const scheduler = makeScheduler(blockingClient as any);
+    const inFlight = (scheduler as any).inFlight as Map<string, string>;
+
+    // OLD on disk, fires immediately
+    const oldJob = makeJob({
+      id: 'cas-cleanup',
+      createdAt: '2026-01-01T00:00:00Z',
+      content: 'old-content',
+    });
+    oldJob.runtime.next_run_at = new Date(Date.now() - 60_000).toISOString();
+    await writeJob(oldJob);
+
+    // Tick 1: launches OLD (will block in mock.create)
+    await (scheduler as any).tick();
+    await new Promise(r => setTimeout(r, 30)); // let mock send begin + block
+
+    if (inFlight.get('cas-cleanup') !== '2026-01-01T00:00:00Z') {
+      fail(`12a: tick 1 should set slot to A, got '${inFlight.get('cas-cleanup')}'`);
+    }
+    if (sends.length !== 1 || sends[0].text !== 'old-content') {
+      fail(`12a: tick 1 should have started OLD's send, sends=${JSON.stringify(sends)}`);
+    }
+
+    // Recycle: replace file with NEW
+    const newJob = makeJob({
+      id: 'cas-cleanup',
+      createdAt: '2026-06-15T00:00:00Z',
+      content: 'new-content',
+    });
+    newJob.runtime.next_run_at = new Date(Date.now() - 60_000).toISOString();
+    await writeJob(newJob);
+
+    // Tick 2: should release (A vs B), set slot to B, launch NEW
+    await (scheduler as any).tick();
+    await new Promise(r => setTimeout(r, 30));
+
+    if (inFlight.get('cas-cleanup') !== '2026-06-15T00:00:00Z') {
+      fail(`12b: tick 2 should overwrite slot with B, got '${inFlight.get('cas-cleanup')}'`);
+    }
+    if (sends.length !== 2 || sends[1].text !== 'new-content') {
+      fail(`12b: tick 2 should have started NEW's send, sends=${JSON.stringify(sends)}`);
+    }
+
+    // Release OLD. Its post-send runs: readJob → NEW; isRecycledJob
+    // → true → return. Finally CAS: slot holds B, captured A →
+    // mismatch → no delete. POST-FIX behavior.
+    releaseOld();
+    await new Promise(r => setTimeout(r, 30));
+
+    // Slot MUST still hold B (NEW still in flight via newBlock)
+    if (inFlight.get('cas-cleanup') !== '2026-06-15T00:00:00Z') {
+      fail(`12c: OLD's finally cleared NEW's slot — CAS regression. Slot='${inFlight.get('cas-cleanup')}'`);
+    }
+
+    // Tick 3: the acid test. WITHOUT CAS, slot would be empty here
+    // and tick 3 would re-launch NEW. WITH CAS, slot holds B and
+    // tick 3's gate sees B === B → blocked.
+    // But first we need next_run_at to be in the past again (NEW's
+    // initial value was past, hasn't been written back yet because
+    // NEW is still blocked).
+    await (scheduler as any).tick();
+    await new Promise(r => setTimeout(r, 30));
+
+    // CRITICAL ASSERTION: no third send. WITHOUT CAS this would be
+    // 3 (old + 2x new — duplicate execution).
+    if (sends.length !== 2) {
+      fail(`12d: tick 3 launched a duplicate execution — CAS regression. ` +
+           `sends.length=${sends.length} (expected 2: 1 OLD + 1 NEW), ` +
+           `texts=[${sends.map(s => s.text).join(', ')}]`);
+    }
+
+    // Release NEW. Post-send: writeback. run_count=1. Finally CAS
+    // (slot B, captured B → delete).
+    releaseNew();
+    await new Promise(r => setTimeout(r, 30));
+
+    if (inFlight.has('cas-cleanup')) {
+      fail(`12e: NEW's finally CAS should have cleared its own slot`);
+    }
+
+    const onDisk = await readJob('cas-cleanup');
+    if (!onDisk) fail('12: file disappeared');
+    if (onDisk.runtime.run_count !== 1) {
+      fail(`12: NEW run_count expected 1, got ${onDisk.runtime.run_count} ` +
+           `(0 = NEW never wrote back; 2+ = duplicate execution)`);
+    }
+
+    await deleteJob('cas-cleanup');
+    passed++;
+  }
+
   // 11. R1-followup integration: inFlight is now (id, created_at) so
   //     a recycle DURING execution can run on the NEXT tick. Direct
   //     unit test of the Map keying — the bare Set behavior would have
