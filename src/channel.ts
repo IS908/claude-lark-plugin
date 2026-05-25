@@ -9,7 +9,7 @@ import { LARK_ID_REGEX } from './tools.js';
 import { TTLCache } from './ttl-cache.js';
 import { appendWithRotationSync } from './log-rotation.js';
 import { withFeishuRetry } from './feishu-retry.js';
-import type { MemoryStore } from './memory/file.js';
+import { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
 import { TERMINAL_CHAT_ID } from './identity-session.js';
@@ -878,6 +878,14 @@ export class LarkChannel {
     const scoreTag = (score: number | undefined): string =>
       typeof score === 'number' && Number.isFinite(score) ? `score:${score.toFixed(2)} · ` : '';
 
+    // #100 fix (Fix B inject side): cap per-episode content before
+    // wrapping into the system prompt. `saveEpisode` also caps on
+    // write, but a pre-fix episode already on disk would otherwise
+    // inject whole. Belt-and-suspenders. `MemoryStore.capByBytes`
+    // preserves UTF-8 boundaries and appends `\n... [truncated]`.
+    const injectCap = appConfig.episodeInjectCapBytes;
+    const capEp = (s: string): string => injectCap > 0 ? MemoryStore.capByBytes(s, injectCap) : s;
+
     // 3. Thread episodes (cold injection — semantic search with score filtering)
     if (msg.threadId) {
       const threadEps = await this.memoryStore
@@ -886,7 +894,7 @@ export class LarkChannel {
       const filtered = threadEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
       for (const ep of filtered) {
         const dateTag = ep.timestamp.slice(0, 10);
-        parts.push(wrapEnrichmentSection('thread_episode', `${scoreTag(ep.score)}${dateTag}`, ep.content));
+        parts.push(wrapEnrichmentSection('thread_episode', `${scoreTag(ep.score)}${dateTag}`, capEp(ep.content)));
       }
     }
 
@@ -897,7 +905,7 @@ export class LarkChannel {
     const filteredChat = chatEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
     for (const ep of filteredChat) {
       const dateTag = ep.timestamp.slice(0, 10);
-      parts.push(wrapEnrichmentSection('chat_episode', `${scoreTag(ep.score)}${dateTag}`, ep.content));
+      parts.push(wrapEnrichmentSection('chat_episode', `${scoreTag(ep.score)}${dateTag}`, capEp(ep.content)));
     }
 
     // 5. Skills (cold injection — inject name + sanitized description + path)

@@ -667,6 +667,18 @@ export class MemoryStore {
 
       // Read all episodes and score by keyword overlap + recency
       const keywords = this.extractKeywords(query);
+
+      // #100 fix (Fix A): empty-keyword short-circuit. searchSkills
+      // gates on `if (score > 0)` but searchEpisodes pre-fix pushed
+      // every file with `keywordScore + recencyScore`, where recency
+      // alone is 0-1. Combined with the consumer-side floor of
+      // `minSearchScore=0.3`, any episode <21 days old still passed —
+      // so emoji-only / single-token / Chinese-stopword inputs (which
+      // `extractKeywords` filters to []) injected the most recent
+      // unrelated episode on every reply. Match searchSkills:
+      // no keywords ⇒ no relevance ⇒ no episodes.
+      if (keywords.length === 0) return [];
+
       const scored: Array<{ episode: Episode; score: number }> = [];
 
       for (const file of mdFiles) {
@@ -690,6 +702,12 @@ export class MemoryStore {
             keywordScore++;
           }
         }
+
+        // #100 fix (Fix A continued): per-file gate — if this
+        // episode matched zero keywords, don't push it. Recency is
+        // a tie-breaker among RELEVANT episodes, not a relevance
+        // signal of its own.
+        if (keywordScore === 0) continue;
 
         // Recency boost: newer files score higher (0-1 scale, decays over 30 days)
         const ageMs = Date.now() - stat.mtimeMs;
@@ -739,7 +757,17 @@ export class MemoryStore {
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const fileName = `${timestamp}.md`;
-    await fs.writeFile(path.join(dir, fileName), content, 'utf-8');
+    // #100 fix (Fix B write side): cap episode write size. Pre-fix
+    // `enrichWithMemory` injected `${ep.content}` whole, so a single
+    // pathological flush (50KB+ buffered text) would inflate every
+    // future enrichment that matched. Cap defends both this and
+    // disk-quota erosion. Default 8KB ≈ one to several screens of
+    // distilled text per episode — comfortably more than a normal
+    // flush produces. Configurable via LARK_EPISODE_WRITE_CAP_BYTES;
+    // 0 disables. See also enrichWithMemory's inject-cap (channel.ts).
+    const writeCap = appConfig.episodeWriteCapBytes;
+    const capped = writeCap > 0 ? MemoryStore.capByBytes(content, writeCap) : content;
+    await fs.writeFile(path.join(dir, fileName), capped, 'utf-8');
   }
 
   /**
@@ -1296,6 +1324,34 @@ export class MemoryStore {
     // behavior. `\b` boundaries are ASCII-defined and would produce
     // surprising results on these scripts.
     return haystack.includes(kw);
+  }
+
+  /**
+   * Truncate a UTF-8 string to at most `maxBytes` bytes, preserving
+   * multi-byte character boundaries. Appends `\n... [truncated]` (in
+   * ASCII, so the appended suffix never re-violates the cap by much).
+   *
+   * Pure helper used by #100 fix (saveEpisode write cap + channel
+   * inject cap). Exported `static` so the smoke test can pin the
+   * truncation contract without going through fs.
+   *
+   * Implementation note: UTF-8 continuation bytes are `10xxxxxx`
+   * (`0x80–0xBF`). After a candidate cutoff, walk backward past any
+   * continuation bytes so we land on a lead byte boundary — otherwise
+   * `Buffer.toString('utf-8')` would render the partial sequence as
+   * `U+FFFD` (replacement character) which is uglier than truncating
+   * a few bytes earlier.
+   */
+  static capByBytes(s: string, maxBytes: number): string {
+    if (maxBytes <= 0) return '';
+    const buf = Buffer.from(s, 'utf-8');
+    if (buf.length <= maxBytes) return s;
+    let end = maxBytes;
+    // Walk back past UTF-8 continuation bytes (10xxxxxx) so we don't
+    // bisect a multi-byte codepoint. Bounded by 4 iterations max
+    // (UTF-8 chars are at most 4 bytes).
+    while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+    return buf.subarray(0, end).toString('utf-8') + '\n... [truncated]';
   }
 
   private extractKeywords(query: string): string[] {

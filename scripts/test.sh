@@ -159,4 +159,8 @@ echo "=== Search precision (word-boundary) unit checks ==="
 npx tsx scripts/search-precision-smoke.ts
 
 echo ""
+echo "=== Episode cap + empty-keyword unit checks ==="
+npx tsx scripts/episode-cap-smoke.ts
+
+echo ""
 echo "All tests passed."

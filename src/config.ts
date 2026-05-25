@@ -124,6 +124,17 @@ export const appConfig = {
   minSearchScore: optionalNumber('LARK_MIN_SEARCH_SCORE', 0.3),
   maxSearchResults: optionalNumber('LARK_MAX_SEARCH_RESULTS', 2),
   inactivityHours: optionalNumber('LARK_INACTIVITY_HOURS', 3),
+  // #100 fix: episode size caps. `episodeWriteCapBytes` is the
+  // write-side cap inside `saveEpisode` — keeps a pathologically
+  // large flush from inflating disk + every subsequent injection.
+  // `episodeInjectCapBytes` is the read-side cap inside
+  // `enrichWithMemory` — defends against a pre-cap episode that's
+  // already on disk OR an off-by-one window between the two caps.
+  // Both default conservative; set to 0 to disable a side. 8KB write
+  // ≈ a few screens of distilled text; 2KB inject keeps the per-
+  // episode budget in line with the system-prompt envelope.
+  episodeWriteCapBytes: optionalNumber('LARK_EPISODE_WRITE_CAP_BYTES', 8 * 1024),
+  episodeInjectCapBytes: optionalNumber('LARK_EPISODE_INJECT_CAP_BYTES', 2 * 1024),
   // #110 fix: hard cap on per-chat buffer entries. The inactivity
   // timer was the only pre-fix bound; a chat that produced events
   // faster than the timer could fire (or a cronjob that kept

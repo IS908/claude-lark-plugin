@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.42] - 2026-05-25
+
+### Fixed
+- **`searchEpisodes` injected unrelated episodes by recency alone, and pre-cap episodes inflated context** (#100 — **HIGH context pollution, silent token waste**). Two amplifying bugs:
+
+  1. **Empty-keyword + recency-only injection.** `extractKeywords` filters stopwords and tokens of length ≤ 1, so common Feishu replies like `好的`, `嗯嗯`, `thanks 👍`, emoji-only messages collapsed to `[]`. With `keywords = []`, `keywordScore = 0` for every file, but `recencyScore = max(0, 1 - ageDays/30)` still hit 0.7+ for anything from the last week. `totalScore = 0 + recencyScore` cleared the consumer-side floor `LARK_MIN_SEARCH_SCORE=0.3` — so every "好的" reply injected the most recent unrelated episode into Claude's system prompt. `searchSkills` had the right guard (`if (score > 0)`); `searchEpisodes` didn't.
+
+  2. **No per-episode size cap.** `saveEpisode` called `fs.writeFile(content)` with no length check. `enrichWithMemory` injected `${ep.content}` whole. A single pathological buffer-flush (50KB+ from a noisy chat) would re-inflate every future enrichment that matched, silently exhausting Claude's context budget.
+
+  Fix:
+  - **Fix A (search side)**: `searchEpisodes` now matches `searchSkills` — early-return `[]` when `extractKeywords` yields nothing, AND skips per-file when `keywordScore === 0`. Recency stays as a tie-breaker among RELEVANT episodes, not as a relevance signal on its own.
+  - **Fix B (write side)**: `saveEpisode` truncates content to `LARK_EPISODE_WRITE_CAP_BYTES` (default 8KB) before writing. Disk + future-injection cost are bounded at write time.
+  - **Fix B (inject side)**: `enrichWithMemory` truncates each `ep.content` to `LARK_EPISODE_INJECT_CAP_BYTES` (default 2KB) before wrapping. Belt-and-suspenders against pre-cap episodes already on disk OR a future operator who raises the write cap without rebuilding.
+
+  UTF-8 safety: both caps use a new `MemoryStore.capByBytes(s, maxBytes)` static helper that walks back from a candidate cutoff to the nearest UTF-8 lead-byte boundary, so CJK chars are never bisected into U+FFFD replacement chars. Appends `\n... [truncated]` so Claude (and operators reading episode files) can tell.
+
+### Added
+- New `MemoryStore.capByBytes(s, maxBytes): string` static helper — UTF-8-safe byte truncation. Exported for direct unit testing.
+- Two new config keys (both default to a reasonable value; set to `0` to disable that side):
+  - `LARK_EPISODE_WRITE_CAP_BYTES` (default `8192`) — cap inside `saveEpisode`.
+  - `LARK_EPISODE_INJECT_CAP_BYTES` (default `2048`) — cap inside `enrichWithMemory` per episode.
+- New `scripts/episode-cap-smoke.ts` (10 tests, wired into `scripts/test.sh`):
+  - Part A (6): `capByBytes` contract — under-cap pass-through, at-cap pass-through, over-cap ASCII truncation, UTF-8 boundary preservation on CJK, zero-cap returns `''`, negative-cap returns `''`.
+  - Part B (1): `saveEpisode` round-trip — 10KB write read back is bounded and bears the truncation tag.
+  - Part C (3): `searchEpisodes` empty-keyword short-circuit (emoji-only / Chinese-stopword queries), zero-match short-circuit (keywords exist but no episode contains them), and a positive control (genuine keyword match returns the episode).
+
+### Operator notes
+- **Existing on-disk episodes are NOT retroactively rescanned or truncated.** Episodes written before v1.0.42 keep their full content on disk. The inject-side cap defends Claude's prompt budget regardless; if you want to reclaim disk, re-run `pruneEpisodes` (existing path, no change) or manually delete old episode files. The retention prune from v1.0.20 (`LARK_EPISODE_RETENTION_DAYS`) already bounds disk growth at the directory level.
+- **Behavior change for short replies**: post-fix, an "嗯" / "好的" / "👍" reply no longer injects the most-recent episode by recency. If you were relying on this (e.g., expecting Claude to recall "the thing we were just talking about" from emoji-only acknowledgements), you'll need to either type a more substantive reply or let the in-buffer context (which carries recent turns regardless of episode search) do the work.
+- **Cap defaults are intentionally generous on the write side and conservative on the inject side.** Write cap (8KB) is bigger than any single normal flush; inject cap (2KB) is sized to fit comfortably alongside profile + skills in the enrichment envelope. Tune via env if your distillation prompt produces longer episodes or you want tighter injection.
+- No data-format changes. The cache/storage shape and enrichment envelope shape are identical. Only sizes change.
+
+---
+
 ## [1.0.41] - 2026-05-25
 
 ### Fixed
