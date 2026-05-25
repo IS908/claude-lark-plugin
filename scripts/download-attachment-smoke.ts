@@ -144,7 +144,12 @@ const noopMemory = {
   saveSkill: async () => {},
 } as unknown as MemoryStore;
 
-const fakeChannel = { isPrivateChat: () => true } as unknown as LarkChannel;
+// v1.0.44 #136: stub new ack-pending methods (no-op for these tests)
+const fakeChannel = {
+  isPrivateChat: () => true,
+  markPendingAckRevoke: (_: string) => {},
+  consumePendingAckRevoke: (_: string) => false,
+} as unknown as LarkChannel;
 const handlers = new Map<string, (args: any) => Promise<any>>();
 const fakeServer = {
   registerTool(name: string, _config: any, handler: any) {

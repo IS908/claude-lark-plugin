@@ -62,7 +62,12 @@ const fakeServer = {
 };
 
 const identitySession = new IdentitySession(() => null);
-const fakeChannel = { isPrivateChat: () => false } as unknown as LarkChannel;
+// v1.0.44 #136: stub new ack-pending methods (no-op for these tests)
+const fakeChannel = {
+  isPrivateChat: () => false,
+  markPendingAckRevoke: (_: string) => {},
+  consumePendingAckRevoke: (_: string) => false,
+} as unknown as LarkChannel;
 
 // Minimal mock Lark client — save_memory doesn't actually use it but
 // registerTools signature requires one.

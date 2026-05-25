@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.44] - 2026-05-25
+
+### Fixed
+- **Two ack-reaction lifecycle gaps** (#136 #137 — batch-fix, both touching `src/channel.ts` ack lifecycle + `src/tools.ts` revoke helper). The #85 ack-reaction redesign (v1.0.30) closed the bulk-wipe bug but left two residual sharp edges around the MeMeMe ack lifecycle:
+
+  1. **#136 — set-vs-revoke race**: when a fast bot's reply turn completes BEFORE the Feishu `messageReaction.create` round-trip returns (cached identity + small prompt + fast model = sub-100ms reply), `revokeAckFor` saw an empty Map and silently no-op'd. The ack-create's `.then()` then stored an orphan entry that sat on the user's message for up to ~6 min until the TTL backstop swept it. User-visible: MeMeMe lingers visibly after the bot has already replied.
+
+  2. **#137 — `react` and `download_attachment` didn't revoke**: per the Stop hook (`hooks/enforce-lark-reply.mjs`), both `react` and `download_attachment` are valid "I responded to the user" tools — a react-only reply or a file-receipt acknowledged by download both satisfy a pending Lark message. But neither tool called `revokeAckFor`, so the MeMeMe lingered until the TTL backstop. (`edit_message` is correctly excluded — it targets the bot's previous card, not the user's inbound id.)
+
+  Shared fix shape:
+  - **`LarkChannel.markPendingAckRevoke(messageId)` + `consumePendingAckRevoke(messageId)`** — a new `Set<string>` on `LarkChannel` (cap 500, FIFO eviction, insertion-order preserved). `revokeAckFor` marks when the Map has no entry; the deferred ack-create `.then()` checks the Set first and, on hit, immediately deletes the just-created reaction instead of storing it. The Set entry is consumed on use (single-shot).
+  - **`revokeAckFor` lifted from `reply`'s inner scope to a shared `registerTools`-level helper** with a `callerLabel` parameter for stderr breadcrumbs. Both `react` and `download_attachment` now wrap their main op in a try/finally that calls `revokeAckFor(message_id, '<tool>')` — symmetric with `reply`'s lifecycle.
+
+### Added
+- New `LarkChannel.markPendingAckRevoke` / `consumePendingAckRevoke` / `getPendingAckRevokeSize` methods (the last for test introspection only).
+- New `scripts/ack-reaction-batch-smoke.ts` (9 tests, wired into `scripts/test.sh`):
+  - Part A (3): pending-revoke mark/consume cycle, empty-messageId rejection, re-mark bumps insertion order.
+  - Part B (1): FIFO cap eviction at `PENDING_REVOKE_CAP=500` — fill 505 entries, verify oldest 5 evicted and latest preserved.
+  - Part C (1): `reply` with no pre-existing ack triggers pending-revoke mark (race scenario).
+  - Part D (2): `react` with matching ack → revoke fires; `react` with no ack → marks pending.
+  - Part E (2): `download_attachment` with matching ack → revoke fires (even on download failure via finally); `download_attachment` with no ack → marks pending.
+
+### Operator notes
+- **Behavior change for fast bots**: pre-#136, the MeMeMe on a sub-100ms reply could linger up to 6 min. Post-fix, the race window is closed — the late-landing ack is immediately revoked when `revokeAckFor` had already requested it. Operators with slow bots (multi-second LLM turns) won't notice any difference; the typical flow is unaffected.
+- **Behavior change for `react`-only and `download_attachment`-only responses**: pre-#137, these left the MeMeMe stuck until the TTL backstop. Post-fix, they revoke synchronously like `reply` does. If you were specifically relying on the MeMeMe staying visible after a reaction-only response (no good reason to), set `LARK_ACK_EMOJI=''` to disable acks entirely.
+- **`PENDING_REVOKE_CAP=500` is intentionally generous.** Each entry is ~25 bytes; the cap defends against pathological mismatched-id floods (a user spamming a malformed Claude-side reply loop with random `reply_to` values) but is far above any realistic legitimate workload. Entries are consumed when the ack lands, so steady-state size is near-zero. If you observe high steady-state size in production, that's a signal that something is calling `revokeAckFor` with `message_id`s that have no corresponding inbound — worth investigating.
+- **No data-format or storage changes.** Only in-memory state on `LarkChannel`; restart clears everything.
+
+---
+
 ## [1.0.43] - 2026-05-25
 
 ### Fixed

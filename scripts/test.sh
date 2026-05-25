@@ -167,4 +167,8 @@ echo "=== Scheduler race (recycle / divergence / retarget) unit checks ==="
 npx tsx scripts/scheduler-race-smoke.ts
 
 echo ""
+echo "=== Ack-reaction batch (pending-revoke / react / download) unit checks ==="
+npx tsx scripts/ack-reaction-batch-smoke.ts
+
+echo ""
 echo "All tests passed."
