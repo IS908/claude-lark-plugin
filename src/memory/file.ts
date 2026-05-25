@@ -353,7 +353,23 @@ export class MemoryStore {
    * intentionally different, and their consumers are disjoint.
    */
   async getProfile(ownerId: string, caller: string): Promise<string | null> {
-    await this.migrateIfNeeded(ownerId);
+    // #143 fix: serialize the migration step under the per-user mutex
+    // so a concurrent `saveProfile`'s migration cannot race against
+    // our migration. Pre-fix the read paths called `migrateIfNeeded`
+    // unmutexed; on a legacy user's first touch, getProfile + a racing
+    // saveProfile could both pass the legacy-exists check before
+    // either had mkdir'd the new layout, then both write their L1-
+    // split content to public.md — the read's L1-split would clobber
+    // the save's NEW content. Post-fix, getProfile's migrate chains
+    // behind any in-flight saveProfile on the same userId via
+    // `withProfileMutex`; when our migrate fires, the new layout is
+    // already authoritative and the existing `if (existsSync(dir))`
+    // short-circuit at the top of `migrateIfNeeded` takes the safe
+    // unlink-only branch. Reads themselves (below) stay outside the
+    // mutex — eventual-consistency on tier reads is fine for
+    // enrichment, and locking every read would serialize the hot
+    // path for no benefit post-migration.
+    await this.withProfileMutex(ownerId, () => this.migrateIfNeeded(ownerId));
 
     const readOpt = async (p: string): Promise<string> => {
       if (!existsSync(p)) return '';
@@ -582,7 +598,26 @@ export class MemoryStore {
    * in `what_do_you_know`.
    */
   async listProfileLines(ownerId: string, tier: Tier): Promise<ProfileLine[]> {
-    await this.migrateIfNeeded(ownerId);
+    // #143 fix: same as getProfile — wrap migrate in per-user mutex
+    // so legacy-first-touch concurrency can't have an unmutexed read
+    // path's L1-split clobber an in-flight save's NEW content.
+    await this.withProfileMutex(ownerId, () => this.migrateIfNeeded(ownerId));
+    return this._listProfileLinesLocked(ownerId, tier);
+  }
+
+  /**
+   * Internal: read + parse a profile tier file, NO migration step,
+   * NO mutex. Callers that are ALREADY inside `withProfileMutex` on
+   * the same userId (e.g. `removeProfileLine`'s closure) must use
+   * this variant — calling the public `listProfileLines` from inside
+   * a held mutex would deadlock (the inner `withProfileMutex` chains
+   * behind the outer's still-unresolved tail).
+   *
+   * Public callers from OUTSIDE any mutex should use `listProfileLines`
+   * instead; this method skips the migration step which is required
+   * for legacy users' first read.
+   */
+  private async _listProfileLinesLocked(ownerId: string, tier: Tier): Promise<ProfileLine[]> {
     const p = this.profileTierPath(ownerId, tier);
     if (!existsSync(p)) return [];
     const content = await fs.readFile(p, 'utf-8');
@@ -626,7 +661,12 @@ export class MemoryStore {
     // saveProfile / saveProfileTiered / removeProfileLine for the same
     // ownerId — would deadlock the per-user mutex.
     return this.withProfileMutex(ownerId, async () => {
-      const lines = await this.listProfileLines(ownerId, tier);
+      // #143 fix: must call the _Locked variants from inside the
+      // mutex. Calling the public listProfileLines (which now also
+      // takes the mutex internally) would deadlock — its chain would
+      // queue behind our still-unresolved tail.
+      await this.migrateIfNeeded(ownerId);
+      const lines = await this._listProfileLinesLocked(ownerId, tier);
       const targets = lines.filter((l) => l.hash === hash);
       if (targets.length === 0) return { removed: 0, sample: null, allTexts: [] };
       const kept = lines.filter((l) => l.hash !== hash);
