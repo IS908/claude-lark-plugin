@@ -44,8 +44,18 @@ import { writeSdkResource, WriteSdkResourceTooLargeError } from './sdk-resource.
  * This is the canonical sanitizer applied to ALL outbound bot text on
  * Feishu's `msg_type=text` path: tool `reply`, tool `edit_message` (text
  * variant), scheduler stale-skip notice, scheduler message-job execution.
- * Card paths are NOT sanitized — Feishu's Schema 2.0 card renderer does
- * NOT interpret `<at>` as a mention, so the vector doesn't exist there.
+ *
+ * Card paths: pre-#105, this docstring claimed cards were safe because
+ * Schema 2.0 plain-element cards (`div` / `text` / `plain_text`) don't
+ * render `<at>`. That claim was HALF-TRUE — Schema 2.0 `markdown` /
+ * `lark_md` element blocks DO interpret `<at>` as a Feishu mention.
+ * `buildCards` produces such elements (every chunked rendering uses
+ * `tag: 'markdown'`), and the raw-card path lets Claude submit
+ * arbitrary card JSON which might include them. Post-#105:
+ *   - `buildCards` callers sanitize `text` before passing in.
+ *   - The raw-card path runs `sanitizeCardJson` (below) which walks
+ *     the parsed tree and sanitizes any `markdown` / `lark_md`
+ *     element's `content`.
  *
  * Exported for unit testing.
  */
@@ -84,6 +94,53 @@ export function sanitizeOutboundText(text: string): string {
   // self-closing+paired input, or a malformed half-tag) is purely
   // cosmetic noise — keep the output clean.
   return out.replace(/<\/at>/gi, '');
+}
+
+/**
+ * #105 fix: walk a parsed Feishu Schema 2.0 card object and sanitize
+ * `<at>` tags out of every `markdown` / `lark_md` element's `content`
+ * field. Other element types (`plain_text`, `div`, `column_set`, etc.)
+ * render `<at>` as literal text per Feishu's docs and don't need the
+ * scrub — but `markdown` / `lark_md` go through the card-markdown
+ * renderer which DOES interpret `<at>` as a mention.
+ *
+ * The walker is deeply recursive and resilient: it tolerates unknown
+ * structure (operator-built / future-format cards), only mutating
+ * fields it recognizes. Mutates in place AND returns the same object
+ * (caller convenience).
+ *
+ * Recognized element shapes (Feishu Schema 2.0):
+ *   - `{ tag: 'markdown', content: '...' }`  — main content block
+ *   - `{ tag: 'lark_md', content: '...' }`   — legacy alias
+ *   - `{ tag: 'note', elements: [...] }`     — wraps inner elements
+ *   - `{ tag: 'column_set', columns: [...] }` → recurses into each column's elements
+ *   - any object with `body: { elements: [...] }` (top-level card)
+ *   - any object with `elements: [...]` (column, note, etc.)
+ *
+ * Exported for unit testing.
+ */
+export function sanitizeCardJson(obj: unknown): unknown {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) {
+    for (const item of obj) sanitizeCardJson(item);
+    return obj;
+  }
+  const o = obj as Record<string, unknown>;
+  // Markdown-rendering tags: sanitize their content string.
+  if ((o.tag === 'markdown' || o.tag === 'lark_md') && typeof o.content === 'string') {
+    o.content = sanitizeOutboundText(o.content);
+  }
+  // Recurse into common container fields. Walking by key name is
+  // resilient to unknown structures — Feishu can add new container
+  // shapes and we'll still drill into anything that looks like a
+  // child collection.
+  for (const key of Object.keys(o)) {
+    const v = o[key];
+    if (v !== null && typeof v === 'object') {
+      sanitizeCardJson(v);
+    }
+  }
+  return obj;
 }
 
 /**
@@ -660,6 +717,13 @@ export function registerTools(
             isError: true,
           };
         }
+        // #105 fix: sanitize <at> inside any markdown/lark_md content
+        // elements. Schema 2.0 plain elements (div / text / plain_text)
+        // don't render <at>, but markdown/lark_md elements DO — and an
+        // adversarial Claude can construct valid Schema 2.0 JSON with
+        // a markdown element containing <at user_id="all">. Walks the
+        // parsed tree in place and applies the existing sanitizer.
+        sanitizeCardJson(cardObj);
         const content = JSON.stringify(cardObj);
         try {
           // #112: retry-wrapped — rate-limit / 5xx auto-retry, permanent
@@ -710,7 +774,20 @@ export function registerTools(
       let sentCount = 0;
 
       if (useCard) {
-        const cards = buildCards(text, { footer });
+        // #105 fix: sanitize text BEFORE buildCards. buildCards wraps
+        // content in `tag: 'markdown'` Schema 2.0 elements, which DO
+        // render <at> as a Feishu mention. Pre-fix the heuristic card
+        // path (text auto-detected as markdown-rich or long) had the
+        // same exposure as the raw-card path.
+        //
+        // R1-followup: also sanitize `footer`. buildCards embeds the
+        // footer in its own `{tag:'markdown'}` element (see
+        // feishu-card.ts L52-58) — same identical-shape vector as
+        // the body text. Pre-followup an adversarial Claude could
+        // smuggle `<at user_id="all">` via `footer` and bypass the
+        // body-text sanitizer entirely.
+        const safeFooter = footer ? sanitizeOutboundText(footer) : footer;
+        const cards = buildCards(sanitizeOutboundText(text), { footer: safeFooter });
         sentCount = cards.length;
         for (let i = 0; i < cards.length; i++) {
           const content = JSON.stringify(cards[i]);

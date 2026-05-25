@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.55] - 2026-05-26
+
+### Fixed
+- **`<at>` tag injection survived through the reply tool's card paths** (#105, R2 residual from #96 / v1.0.16). The pre-fix docstring on `sanitizeOutboundText` claimed cards were safe because Schema 2.0's plain elements (`div` / `text` / `plain_text`) don't render `<at>`. That was HALF-TRUE — Schema 2.0 `markdown` and `lark_md` element blocks go through Feishu's card-markdown renderer which DOES interpret `<at>`. Two exposed paths:
+
+  1. **Raw-card path** (`reply` tool with `card` param): Claude submits arbitrary Schema 2.0 JSON. An adversarial Claude (prompt-injected) could craft a payload with `{tag:'markdown', content:'<at user_id="all">all</at>'}` → Feishu renders an @-all in the card. Untrivial-but-real injection target.
+
+  2. **Heuristic card path** (`reply` tool with text auto-detected as card via length or markdown features): `buildCards(text, ...)` wraps `text` in `tag: 'markdown'` Schema 2.0 elements. Pre-fix, `text` was passed in UN-sanitized — any `<at>` in the user-supplied text ended up inside the markdown element and rendered as a real mention. Same vector, lower bar (no JSON construction needed).
+
+  Fix:
+  - **New `sanitizeCardJson(obj)`** walks a parsed Feishu card tree in place, applying `sanitizeOutboundText` to `content` of any `{tag: 'markdown' | 'lark_md', content}` element. Other element types (`plain_text`, `div`, `column_set`, `hr`, etc.) are recursed into but their content fields are left alone — Feishu doesn't render `<at>` in those tags. Deeply recursive, tolerates unknown shapes (operator-built / future-format cards).
+  - **Raw-card path** in `reply`: `JSON.parse → sanitizeCardJson → JSON.stringify` before send.
+  - **Heuristic card path**: `buildCards(sanitizeOutboundText(text), { footer })` — sanitize at the boundary into `buildCards` so all generated markdown elements are clean.
+  - **`sanitizeOutboundText` docstring corrected**: the pre-fix "card paths are NOT sanitized — Feishu's Schema 2.0 card renderer does NOT interpret `<at>`" claim was wrong. Updated to reflect both paths are now sanitized via the appropriate boundary.
+
+### R1-audit followup (closed in this PR)
+- **`footer` parameter was an identical-shape vector that bypassed the initial fix.** R1 caught that `buildCards(text, { footer })` embeds `footer` in its OWN `tag: 'markdown'` Schema 2.0 element (`src/feishu-card.ts:52-58`) — same renderer that processes the body text. Pre-followup the initial fix only sanitized `text`; an adversarial Claude could smuggle `<at user_id="all">` via `footer` and bypass it entirely. Patched in-PR per discipline rule #4 (R1 trivial defect → in-PR fix): added `const safeFooter = footer ? sanitizeOutboundText(footer) : footer;` before `buildCards`. New test 18 in `reply-card-smoke.ts` exercises the footer-injection vector end-to-end.
+
+### Added
+- New `sanitizeCardJson(obj): unknown` exported helper in `src/tools.ts`. Pure, in-place walker. Exported for direct unit testing.
+- `scripts/at-tag-sanitization-smoke.ts` grows from 18 → 26 cases:
+  - **19**: markdown element content sanitized
+  - **20**: lark_md (legacy alias) sanitized identically
+  - **21**: plain_text element NOT touched (Feishu doesn't render `<at>` there)
+  - **22**: nested `column_set` recurses correctly — only markdown columns sanitized
+  - **23**: defensive on unknown structure (no throw)
+  - **24**: null / undefined / non-object inputs degrade gracefully + array-top-level
+  - **25**: self-closing `<at/>` inside markdown
+  - **26**: multi-element body — only markdown sanitized, plain_text and other tags untouched
+- `scripts/reply-card-smoke.ts` grows from 15 → 17 cases:
+  - **16**: end-to-end raw-card path with adversarial `<at user_id="all">` inside markdown → sanitized; plain_text content untouched
+  - **17**: heuristic card path (forced via `format='card'`) with `<at>` in text → no `<at user_id` survives anywhere in the sent JSON
+
+### Operator notes
+- **No behavior change for legitimate text content.** Cards with markdown bodies that don't contain `<at>` tags pass through unchanged. The sanitizer only strips Feishu @-mention syntax.
+- **`plain_text` element content is intentionally NOT sanitized.** Feishu renders `<at>` as literal angle brackets in plain_text. Some legitimate use cases display angle-bracketed text in plain_text headers; preserving that is correct.
+- **Operator-built cards (e.g. from `scripts/lark-cli`) also get sanitized.** If you have an operator-trusted card that legitimately needs `<at>` rendering as a mention, you'll need to construct the mention via Feishu's structured mention API instead of inline `<at>` tags — same as the existing text-path constraint.
+
+---
+
 ## [1.0.54] - 2026-05-26
 
 ### Fixed

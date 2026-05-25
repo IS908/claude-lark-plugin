@@ -15,7 +15,7 @@
  * `<atom>` etc. mistakenly matched).
  */
 
-import { sanitizeOutboundText } from '../src/tools.js';
+import { sanitizeOutboundText, sanitizeCardJson } from '../src/tools.js';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -250,6 +250,142 @@ let testNum = 0;
   if (elapsed > 500) fail(`sanitizeOutboundText took ${elapsed}ms on 1000 unclosed tags (DoS risk)`);
   // With no closers nothing matches paired/self-closing; output unchanged.
   if (out !== torture) fail(`unexpected modification of 1000-unclosed input`);
+}
+
+// ── #105 — sanitizeCardJson: walk Schema 2.0 card tree + strip <at> ──
+
+// 19. Markdown element with <at> → content stripped
+{
+  testNum++;
+  const card: any = {
+    schema: '2.0',
+    body: {
+      elements: [
+        { tag: 'markdown', content: 'hello <at user_id="all">all</at> please' },
+      ],
+    },
+  };
+  sanitizeCardJson(card);
+  if (card.body.elements[0].content !== 'hello all please') {
+    fail(`19: markdown content not sanitized, got: ${JSON.stringify(card.body.elements[0].content)}`);
+  }
+}
+
+// 20. lark_md (legacy alias) treated identically
+{
+  testNum++;
+  const card: any = {
+    body: { elements: [{ tag: 'lark_md', content: '<at user_id="ou_x">K</at>' }] },
+  };
+  sanitizeCardJson(card);
+  if (card.body.elements[0].content !== 'K') {
+    fail(`20: lark_md content not sanitized, got: ${JSON.stringify(card.body.elements[0].content)}`);
+  }
+}
+
+// 21. plain_text element NOT touched (Feishu doesn't render <at> there)
+{
+  testNum++;
+  const card: any = {
+    body: { elements: [{ tag: 'plain_text', content: 'header with <at user_id="all">literal</at>' }] },
+  };
+  sanitizeCardJson(card);
+  // plain_text content stays untouched — Feishu renders the literal angle brackets
+  if (card.body.elements[0].content !== 'header with <at user_id="all">literal</at>') {
+    fail(`21: plain_text content must NOT be sanitized, got: ${JSON.stringify(card.body.elements[0].content)}`);
+  }
+}
+
+// 22. Nested column_set with markdown inside columns
+{
+  testNum++;
+  const card: any = {
+    body: {
+      elements: [
+        {
+          tag: 'column_set',
+          columns: [
+            { elements: [{ tag: 'markdown', content: 'left <at user_id="all">L</at>' }] },
+            { elements: [{ tag: 'plain_text', content: 'right <at>X</at>' }] },
+          ],
+        },
+      ],
+    },
+  };
+  sanitizeCardJson(card);
+  const leftMd = card.body.elements[0].columns[0].elements[0];
+  const rightPt = card.body.elements[0].columns[1].elements[0];
+  if (leftMd.content !== 'left L') {
+    fail(`22: nested markdown not sanitized, got: ${JSON.stringify(leftMd.content)}`);
+  }
+  if (rightPt.content !== 'right <at>X</at>') {
+    fail(`22: nested plain_text incorrectly modified, got: ${JSON.stringify(rightPt.content)}`);
+  }
+}
+
+// 23. Defensive: tolerates unknown structure without throwing
+{
+  testNum++;
+  const weird: any = {
+    schema: 'future-shape',
+    unknown_field: { tag: 'unknown', content: '<at user_id="all">X</at>' },
+    body: { elements: 'not-an-array-but-string' },
+    other: null,
+  };
+  sanitizeCardJson(weird);
+  // unknown_field has tag='unknown', not markdown/lark_md → content unchanged
+  if (weird.unknown_field.content !== '<at user_id="all">X</at>') {
+    fail(`23: unknown tag should not be sanitized`);
+  }
+  // No throw, weird shape tolerated
+}
+
+// 24. Empty / null / non-object inputs degrade gracefully
+{
+  testNum++;
+  if (sanitizeCardJson(null) !== null) fail(`24: null input`);
+  if (sanitizeCardJson(undefined) !== undefined) fail(`24: undefined input`);
+  if (sanitizeCardJson('string') !== 'string') fail(`24: string input`);
+  if (sanitizeCardJson(42) !== 42) fail(`24: number input`);
+  // Array of elements at top level
+  const arr: any[] = [{ tag: 'markdown', content: '<at user_id="all">x</at>' }];
+  sanitizeCardJson(arr);
+  if (arr[0].content !== 'x') fail(`24: array top-level not handled`);
+}
+
+// 25. Self-closing <at/> inside markdown content
+{
+  testNum++;
+  const card: any = {
+    body: { elements: [{ tag: 'markdown', content: 'ping <at user_id="ou_x"/> later' }] },
+  };
+  sanitizeCardJson(card);
+  if (card.body.elements[0].content !== 'ping  later') {
+    fail(`25: self-closing inside markdown not sanitized, got: ${JSON.stringify(card.body.elements[0].content)}`);
+  }
+}
+
+// 26. Multi-element body: only markdown elements sanitized
+{
+  testNum++;
+  const card: any = {
+    body: {
+      elements: [
+        { tag: 'div', text: { tag: 'plain_text', content: 'header text with <at>X</at>' } },
+        { tag: 'markdown', content: 'body with <at user_id="all">all</at>' },
+        { tag: 'hr' },
+      ],
+    },
+  };
+  sanitizeCardJson(card);
+  // plain_text under div.text: stays
+  if (card.body.elements[0].text.content !== 'header text with <at>X</at>') {
+    fail(`26: div.text.plain_text incorrectly sanitized`);
+  }
+  // markdown: sanitized
+  if (card.body.elements[1].content !== 'body with all') {
+    fail(`26: markdown not sanitized, got: ${JSON.stringify(card.body.elements[1].content)}`);
+  }
 }
 
 console.log(`at-tag sanitization smoke: ${testNum}/${testNum} PASS`);

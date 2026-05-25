@@ -684,6 +684,94 @@ async function run() {
     if (seenIds.size !== 5) fail(`Test 15: duplicate or missing delete targets: ${[...seenIds].join(',')}`);
   }
 
+  // ── Test 16: #105 — raw-card path sanitizes <at> inside markdown elements ──
+  // The card param is a raw Schema 2.0 JSON string. Pre-fix, an adversarial
+  // Claude could embed `<at user_id="all">all</at>` inside a `markdown`
+  // element and it would render as a real @-all on Feishu.
+  {
+    apiCalls.length = 0;
+    const attackCard = JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'markdown', content: 'hello <at user_id="all">all</at> please' },
+          { tag: 'plain_text', content: 'footer <at>X</at>' },  // untouched
+        ],
+      },
+    });
+    await replyHandler({
+      chat_id: 'chat_card_at',
+      text: '',
+      card: attackCard,
+    });
+    const sent = apiCalls.find((c) => c.method === 'message.create');
+    if (!sent) fail('Test 16: message.create not called');
+    const parsedSent = JSON.parse(sent!.args.data.content);
+    const mdEl = parsedSent.body.elements[0];
+    const ptEl = parsedSent.body.elements[1];
+    // markdown content sanitized
+    if (mdEl.content !== 'hello all please') {
+      fail(`Test 16: markdown content not sanitized, got: ${JSON.stringify(mdEl.content)}`);
+    }
+    // plain_text content NOT touched
+    if (ptEl.content !== 'footer <at>X</at>') {
+      fail(`Test 16: plain_text content incorrectly modified, got: ${JSON.stringify(ptEl.content)}`);
+    }
+  }
+
+  // ── Test 17: #105 — heuristic card path (text → buildCards) sanitizes ──
+  // buildCards wraps content in `tag: 'markdown'` elements which DO render
+  // <at>. Pre-fix the text path also auto-detected card mode for long /
+  // markdown-rich content, exposing the same vector.
+  {
+    apiCalls.length = 0;
+    // Use long text to trigger card heuristic (>500 chars or markdown-rich)
+    const attackText = '# Heading\n\nhello <at user_id="all">all</at> please review the report.\n\n' +
+      'Long body to trigger card auto-detection. '.repeat(20);
+    await replyHandler({
+      chat_id: 'chat_heuristic_card',
+      text: attackText,
+      format: 'card',  // force card path to avoid auto-detect dependency
+    });
+    const sent = apiCalls.find((c) => c.method === 'message.create');
+    if (!sent) fail('Test 17: message.create not called');
+    const parsedSent = JSON.parse(sent!.args.data.content);
+    // Walk all elements for any markdown content; verify NO <at user_id> survives
+    const allContent = JSON.stringify(parsedSent);
+    if (allContent.includes('<at user_id')) {
+      fail(`Test 17: heuristic card path did not sanitize <at>; full JSON: ${allContent.slice(0, 200)}`);
+    }
+    // The legit text "hello all please" should still be present (sanitizer preserves the label)
+    if (!allContent.includes('hello all please')) {
+      fail(`Test 17: legitimate label content lost during sanitization`);
+    }
+  }
+
+  // ── Test 18: #105 R1-followup — footer path also sanitized ──
+  // buildCards embeds `footer` in its OWN tag:'markdown' element. Pre-
+  // followup, only the body `text` was sanitized — `footer` was an
+  // identical-shape vector that bypassed the fix entirely. R1 caught
+  // this; in-PR fix sanitizes `footer` before passing into buildCards.
+  {
+    apiCalls.length = 0;
+    await replyHandler({
+      chat_id: 'chat_footer_at',
+      text: 'safe body text',
+      footer: 'note: <at user_id="all">all</at> please review',
+      format: 'card',  // force card path
+    });
+    const sent = apiCalls.find((c) => c.method === 'message.create');
+    if (!sent) fail('Test 18: message.create not called');
+    const allContent = JSON.stringify(JSON.parse(sent!.args.data.content));
+    if (allContent.includes('<at user_id')) {
+      fail(`Test 18: footer <at> not sanitized; full JSON: ${allContent.slice(0, 200)}`);
+    }
+    // Legit footer label "all" preserved
+    if (!allContent.includes('note: all please review')) {
+      fail(`Test 18: footer legit content lost during sanitization`);
+    }
+  }
+
   console.log('PASS');
 }
 
