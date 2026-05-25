@@ -33,6 +33,12 @@ function mockLarkClient() {
             apiCalls.push({ method: 'message.reply', args });
             return { data: { message_id: 'mock_msg_002' } };
           },
+          patch: async (args: any) => {
+            // #111: edit_message uses message.patch. Mock returns empty
+            // data (Feishu's actual response shape per SDK types).
+            apiCalls.push({ method: 'message.patch', args });
+            return { data: {} };
+          },
         },
         messageReaction: {
           create: async (args: any) => {
@@ -79,6 +85,21 @@ function makeBuffer() {
     flush: async () => {},
     startAutoFlush: () => {},
     stopAutoFlush: () => {},
+    // #111: mock replaceLastAssistant — mutates the most recent assistant
+    // entry in `recorded` for the given chatId. Production ConversationBuffer
+    // walks its own internal buffer; we mirror the semantics on `recorded`
+    // so the smoke test can observe the buffer-mirror behavior.
+    replaceLastAssistant(chatId: string, newText: string): boolean {
+      for (let i = recorded.length - 1; i >= 0; i--) {
+        const r = recorded[i];
+        if (r.chatId === chatId && r.entry.role === 'assistant') {
+          r.entry.text = newText;
+          r.entry.timestamp = new Date().toISOString();
+          return true;
+        }
+      }
+      return false;
+    },
   };
 }
 
@@ -345,6 +366,116 @@ async function run() {
     }
     if (apiCalls.length === 0) {
       fail(`8b-sanity: non-cron-thread reply must SEND (got 0 API calls)`);
+    }
+  }
+
+  // ── Test 8c: #111 — edit_message mirrors edit into ConversationBuffer ──
+  //   Pre-fix, edit_message only patched Feishu and left the buffer
+  //   holding pre-edit text → distillation flushed stale content into
+  //   episodes. Fix: pass chat_id (and thread_id) to edit_message, and
+  //   the handler calls conversationBuffer.replaceLastAssistant.
+  {
+    const editHandler = handlers.get('edit_message');
+    if (!editHandler) fail('8c: edit_message handler not registered');
+    identitySession.setCaller('chat_edit', undefined, 'ou_edit_user');
+
+    // Seed: simulate a prior reply having recorded an assistant entry.
+    buffer.recorded.length = 0;
+    apiCalls.length = 0;
+    await replyHandler({
+      chat_id: 'chat_edit',
+      text: '会议在 3 点',
+    });
+    if (buffer.recorded.length !== 1) {
+      fail(`8c-seed: prior reply should have recorded an assistant entry (got ${buffer.recorded.length})`);
+    }
+    if (buffer.recorded[0].entry.text !== '会议在 3 点') {
+      fail(`8c-seed: seeded text mismatch (got ${buffer.recorded[0].entry.text})`);
+    }
+
+    // Now edit — pass chat_id so the fix takes effect
+    apiCalls.length = 0;
+    const r = await editHandler({
+      message_id: 'om_bot_card_001',
+      text: '会议在 4 点',
+      chat_id: 'chat_edit',
+    });
+    // Patch call landed
+    const patchCall = apiCalls.find((c) => c.method === 'message.patch');
+    if (!patchCall) fail(`8c: edit_message must call message.patch`);
+    // Buffer's stored assistant entry should now reflect the edited text.
+    // The mock's `record` pushes objects into `buffer.recorded`; the
+    // backing entries are the same references (no defensive copy in
+    // makeBuffer). So mutation via replaceLastAssistant should be visible.
+    const latest = buffer.recorded[buffer.recorded.length - 1].entry;
+    if (latest.text !== '会议在 4 点') {
+      fail(`8c: buffer entry must reflect edited text (got ${latest.text})`);
+    }
+  }
+
+  // ── Test 8d: #111 — edit_message WITHOUT chat_id silently no-ops on buffer ──
+  //   Backward compat: existing callers that don't pass chat_id should
+  //   still see the patch land on Feishu, just without buffer-mirroring
+  //   (falls back to pre-fix behavior; no worse than before).
+  {
+    const editHandler = handlers.get('edit_message');
+    identitySession.setCaller('chat_edit_nocid', undefined, 'ou_edit_user');
+
+    buffer.recorded.length = 0;
+    await replyHandler({
+      chat_id: 'chat_edit_nocid',
+      text: 'original text',
+    });
+    const beforeText = buffer.recorded[0].entry.text;
+    if (beforeText !== 'original text') fail(`8d-seed: text mismatch`);
+
+    apiCalls.length = 0;
+    await editHandler({
+      message_id: 'om_card_002',
+      text: 'attempted edit',
+      // chat_id intentionally omitted
+    });
+    const patchCall = apiCalls.find((c) => c.method === 'message.patch');
+    if (!patchCall) fail(`8d: edit_message must still patch even without chat_id`);
+    // Buffer unchanged
+    if (buffer.recorded[0].entry.text !== 'original text') {
+      fail(`8d: no chat_id → buffer must not be mirrored (got ${buffer.recorded[0].entry.text})`);
+    }
+  }
+
+  // ── Test 8e: #111 — edit_message with cron-thread skips buffer mirror ──
+  //   Same shape as 8b for the reply tool: cron-originated edits are
+  //   not user dialogue and must not pollute the buffer.
+  {
+    const editHandler = handlers.get('edit_message');
+    const cronThread = `${JOB_THREAD_PREFIX}edit-job-1`;
+    identitySession.setCaller('chat_edit_cron', cronThread, 'ou_cron_owner');
+
+    buffer.recorded.length = 0;
+    // Seed a prior NON-cron assistant entry in this chat so we can
+    // detect if the cron-edit incorrectly mutates it.
+    identitySession.setCaller('chat_edit_cron', 'thr_real', 'ou_real');
+    await replyHandler({
+      chat_id: 'chat_edit_cron',
+      thread_id: 'thr_real',
+      text: 'real user reply',
+    });
+    if (buffer.recorded[0].entry.text !== 'real user reply') fail(`8e-seed: setup failed`);
+
+    apiCalls.length = 0;
+    await editHandler({
+      message_id: 'om_card_003',
+      text: 'cron-edit attempt',
+      chat_id: 'chat_edit_cron',
+      thread_id: cronThread,
+    });
+    // Patch landed
+    if (!apiCalls.find((c) => c.method === 'message.patch')) {
+      fail(`8e: cron edit must still patch Feishu`);
+    }
+    // Buffer's real-user entry MUST be untouched
+    if (buffer.recorded[0].entry.text !== 'real user reply') {
+      fail(`8e: cron-thread edit must NOT mutate real-user buffer entry (got ${buffer.recorded[0].entry.text})`);
     }
   }
 

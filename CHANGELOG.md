@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.39] - 2026-05-25
+
+### Fixed
+- **`edit_message` left ConversationBuffer holding pre-edit text → distillation flushed stale content into episodes** (#111 — **MEDIUM memory-correctness, hard to trace**). The `reply` tool recorded its assistant text into the per-chat buffer (so distillation has user-visible context). `edit_message`, however, only patched Feishu's stored card/text — the buffer still held the pre-edit version. Effect: when the auto-flush eventually fired, the distiller saw "bot said 3pm" instead of the edited "bot said 4pm", and wrote the wrong fact into the chat's episode `.md`. Users later querying `what_do_you_know` saw the stale fact with no obvious trace back to the original wrong reply.
+
+  Concrete scenario: user asks "what time is the meeting"; Claude replies "3pm"; user corrects "it's 4pm"; Claude `edit_message`s its prior reply to "4pm"; 3h later the buffer flushes, episode says "meeting is at 3pm" — permanently wrong.
+
+  Fix (per the issue's suggested order: C → A, B deferred):
+
+  **Fix C — `chat_id` (+ `thread_id`) added to `edit_message` schema**. Optional fields so existing callers without them continue to work (the patch lands on Feishu; only the buffer-alignment is skipped). Descriptions tell Claude to pass them verbatim from the current notification's metadata.
+
+  **Fix A — new `ConversationBuffer.replaceLastAssistant(chatId, newText)`**. Walks backwards from the end of the chat's buffer; replaces the text + timestamp of the most-recent assistant entry. Returns `true` on success, `false` for: no buffer for chat / no assistant entries / mid-flush (skipped to avoid the edit landing in a buffer about to be wiped by `triggerFlush`'s post-await cleanup).
+
+  `edit_message` handler now (after a successful patch) calls `replaceLastAssistant` with the sanitized + 500-char-prefix text — same shape as the `reply`-path `recordReply` for consistency. Cron-originated edits (thread_id starts with `JOB_THREAD_PREFIX`) skip the mirror, same as #110's cron-skip in `recordReply`.
+
+  **NOTE on simplicity**: this only covers the "edit the bot's most recent message" case. Editing an earlier message (e.g. patching a card from 50 turns ago) won't find the right entry. Per-message-id tracking would require widening `BufferedMessage` with a `messageId` field — deferred unless real user-reported cases surface.
+
+### Added
+- New `ConversationBuffer.replaceLastAssistant(chatId, newText): boolean` method.
+- New `edit_message` schema fields: `chat_id?` + `thread_id?` (both optional; documented for Claude to pass verbatim from notification meta).
+- 4 new tests in `scripts/buffer-cap-smoke.ts` (tests 6–9):
+  - 6: latest assistant replaced; user entries above untouched
+  - 7: multi-turn — only the LATEST assistant gets replaced, earlier ones preserved
+  - 8: no-op cases (missing chat, user-only buffer) return false without mutation
+  - 9: mid-flush short-circuit (returns false; edit doesn't land in soon-to-be-wiped buffer)
+- 3 new tests in `scripts/reply-card-smoke.ts` (8c–8e):
+  - 8c: end-to-end edit_message → buffer entry reflects new text
+  - 8d: backward compat — edit_message WITHOUT `chat_id` still patches Feishu, buffer untouched (pre-fix behavior preserved)
+  - 8e: cron-thread edit skips buffer mirror (same shape as #110 cron-skip in reply)
+
+### Operator notes
+- No data-format changes; no env vars added.
+- Pre-#111 episodes may contain stale facts from edits that never reached the buffer. There's no automated way to find these — operator can spot-check by comparing the Feishu chat history against the distilled episode `.md`.
+- Existing `edit_message` callers (Claude code that doesn't pass `chat_id`) keep working — only the buffer-mirror is skipped. To get the fix's benefit, Claude needs to start passing `chat_id`; the schema description nudges this.
+
 ## [1.0.38] - 2026-05-25
 
 ### Fixed

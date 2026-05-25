@@ -187,4 +187,90 @@ let testNum = 0;
   testNum++;
 }
 
+// ── Part B: replaceLastAssistant (#111 fix) ──────────────────────
+
+// 6. Replace latest assistant entry; user entries above untouched
+{
+  const buf = new ConversationBuffer({ maxMessages: 100 });
+  buf.record('chat_r', { role: 'user', senderId: 'u', text: 'q', timestamp: 't1' });
+  buf.record('chat_r', { role: 'assistant', senderId: 'bot', text: 'old answer', timestamp: 't2' });
+
+  const ok = buf.replaceLastAssistant('chat_r', 'new answer');
+  if (!ok) fail(`6: replaceLastAssistant should return true on success`);
+
+  const msgs = buf.getMessages('chat_r');
+  if (msgs.length !== 2) fail(`6: count unchanged, got ${msgs.length}`);
+  if (msgs[0].text !== 'q') fail(`6: user entry must be untouched`);
+  if (msgs[1].text !== 'new answer') fail(`6: assistant entry should be updated, got ${msgs[1].text}`);
+  if (msgs[1].role !== 'assistant') fail(`6: role preserved`);
+  if (msgs[1].timestamp === 't2') fail(`6: timestamp should be refreshed`);
+  testNum++;
+}
+
+// 7. Multi-turn — replace only the LATEST assistant, earlier assistants untouched
+{
+  const buf = new ConversationBuffer({ maxMessages: 100 });
+  buf.record('chat_m', { role: 'user', senderId: 'u', text: 'q1', timestamp: 't1' });
+  buf.record('chat_m', { role: 'assistant', senderId: 'bot', text: 'a1', timestamp: 't2' });
+  buf.record('chat_m', { role: 'user', senderId: 'u', text: 'q2', timestamp: 't3' });
+  buf.record('chat_m', { role: 'assistant', senderId: 'bot', text: 'a2', timestamp: 't4' });
+
+  buf.replaceLastAssistant('chat_m', 'a2-edited');
+  const msgs = buf.getMessages('chat_m');
+  if (msgs[1].text !== 'a1') fail(`7: earlier assistant 'a1' must be untouched, got ${msgs[1].text}`);
+  if (msgs[3].text !== 'a2-edited') fail(`7: latest assistant should be edited`);
+  testNum++;
+}
+
+// 8. No-op cases return false
+{
+  const buf = new ConversationBuffer({ maxMessages: 100 });
+  // 8a: chat with no buffer
+  if (buf.replaceLastAssistant('chat_none', 'whatever')) {
+    fail(`8a: missing chat → false`);
+  }
+  // 8b: buffer with only user entries
+  buf.record('chat_user_only', { role: 'user', senderId: 'u', text: 'q', timestamp: 't' });
+  if (buf.replaceLastAssistant('chat_user_only', 'whatever')) {
+    fail(`8b: user-only buffer → false`);
+  }
+  // Verify user entry was NOT mutated
+  const msgs = buf.getMessages('chat_user_only');
+  if (msgs[0].text !== 'q') fail(`8b: user entry must stay`);
+  testNum++;
+}
+
+// 9. Mid-flush short-circuit — edit must not land in a buffer that's
+//    about to be wiped by triggerFlush's post-await cleanup. This is
+//    the explicit safety the implementation documents.
+{
+  const buf = new ConversationBuffer({ maxMessages: 100 });
+  let flushStarted = false;
+  let flushResume!: () => void;
+  const flushBlock = new Promise<void>((r) => { flushResume = r; });
+  buf.setFlushHandler(async () => {
+    flushStarted = true;
+    await flushBlock; // hold the flush so we can edit mid-flight
+  });
+
+  buf.record('chat_flush', { role: 'user', senderId: 'u', text: 'q', timestamp: 't1' });
+  buf.record('chat_flush', { role: 'assistant', senderId: 'bot', text: 'old', timestamp: 't2' });
+
+  // Trigger flush via the private method (force a deterministic test).
+  // We can't use cap here without filling 100 entries; use direct call.
+  const flushP = (buf as any).triggerFlush('chat_flush');
+  // Let the flush handler enter (sets flushStarted = true)
+  await new Promise((r) => setImmediate(r));
+  if (!flushStarted) fail(`9: flush should have started`);
+
+  // While mid-flush, try replaceLastAssistant — must return false
+  const ok = buf.replaceLastAssistant('chat_flush', 'edited');
+  if (ok) fail(`9: replaceLastAssistant during flush must return false`);
+
+  // Release the flush
+  flushResume();
+  await flushP;
+  testNum++;
+}
+
 console.log(`buffer-cap smoke: ${testNum}/${testNum} PASS`);

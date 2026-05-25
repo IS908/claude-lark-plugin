@@ -781,9 +781,23 @@ export function registerTools(
           .enum(['text', 'card_markdown'])
           .default('text')
           .describe('Format of the content'),
+        // #111 fix: optional chat_id + thread_id so the edit can be
+        // mirrored into the in-memory conversation buffer. Pre-fix,
+        // edit_message left the buffer holding pre-edit text; the next
+        // distillation flushed wrong content into the chat's episode
+        // history. Pass these verbatim from the current notification's
+        // metadata. If omitted, the edit still works (Feishu side is
+        // patched); only the buffer-alignment is skipped, falling back
+        // to pre-fix behavior.
+        chat_id: larkIdSchema('chat_id').optional().describe(
+          'Chat ID where the edited message lives. Pass this verbatim from the current notification\'s metadata so the in-memory conversation buffer stays aligned with the user-visible text — otherwise distillation may produce stale episodes from the pre-edit content.',
+        ),
+        thread_id: larkIdSchema('thread_id').optional().describe(
+          'Thread ID — pass when present in the notification metadata. Used to detect cron-originated edits (which are skipped from buffer alignment for the same reason cron-originated replies are skipped: cron output is not user dialogue).',
+        ),
       }),
     },
-    async ({ message_id, text, format }) => {
+    async ({ message_id, text, format, chat_id, thread_id }) => {
       // Strip <at> tags before send (#96). Apply to BOTH variants because
       // Lark.messageCard.defaultCard wraps the text in a markdown block,
       // and Feishu's card markdown renderer ALSO interprets <at> as
@@ -836,6 +850,32 @@ export function registerTools(
         }
         console.error(`[tools] edit_message failed:`, err?.message ?? String(err));
         throw err;
+      }
+
+      // #111 fix: mirror the edit into the in-memory ConversationBuffer
+      // so distillation sees the user-visible text, not the pre-edit
+      // version. Skips on:
+      //  - missing chat_id (caller didn't pass — falls back to pre-fix
+      //    behavior, buffer stays stale, just no worse than before)
+      //  - cron-originated edits (same shape as recordReply skip in
+      //    #110 — cron output is not user dialogue)
+      //  - no buffer wired (unlikely in production; defensive)
+      //  - no recent assistant entry in the buffer (e.g. edit_message
+      //    called before any reply landed for this chat — buffer is
+      //    empty for the assistant role; the edit's content has no
+      //    pre-edit version to replace, so the skip is harmless)
+      if (chat_id && conversationBuffer) {
+        const isCronOriginated =
+          !!thread_id && thread_id.startsWith(JOB_THREAD_PREFIX);
+        if (!isCronOriginated) {
+          // Use the same 500-char prefix + sanitize-on-record rule as
+          // reply's recordReply for consistency (the buffer stores
+          // what the user actually saw — sanitized, length-capped).
+          conversationBuffer.replaceLastAssistant(
+            chat_id,
+            safeText.slice(0, 500),
+          );
+        }
       }
 
       return {
