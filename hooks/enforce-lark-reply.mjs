@@ -382,6 +382,71 @@ function collectAssistantText(entries, fromIndex) {
   return combined;
 }
 
+// #122 fix: collect IDs of lark-plugin tool_use blocks in this turn,
+// so the matching tool_result blocks can be scoped-scanned for the
+// defer sentinel. Pre-#122 the sentinel was only honored if Claude
+// VOLUNTARILY echoed it in assistant text — best-effort, prompt-
+// fragile across LLM versions. Post-fix, when `handlePermanentTargetError`
+// returns `[LARK_DEFER]` in a `reply` / `react` / `edit_message`
+// tool_result, the hook scans that block directly and bypasses
+// mechanically.
+//
+// Scoped to lark-plugin tools so an unrelated MCP plugin returning
+// the literal "[LARK_DEFER]" string in its output can't spuriously
+// bypass the unanswered-message block. Includes `edit_message`
+// (which is NOT in REPLY_TOOLS — those are "tools that fulfill a
+// reply obligation"; here we're collecting "tools that can emit a
+// defer signal," a different concept).
+const LARK_TOOLS_WITH_DEFER = new Set([
+  'mcp__plugin_lark_lark__reply',
+  'mcp__plugin_lark_lark__react',
+  'mcp__plugin_lark_lark__edit_message',
+]);
+
+function collectLarkToolUseIds(entries, fromIndex) {
+  const ids = new Set();
+  for (let i = fromIndex; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry?.type !== 'assistant') continue;
+    const tools = extractToolUses(entry.message?.content);
+    for (const t of tools) {
+      if (LARK_TOOLS_WITH_DEFER.has(t.name) && t.id) ids.add(t.id);
+    }
+  }
+  return ids;
+}
+
+// #122: extract text from tool_result blocks whose tool_use_id was a
+// lark-plugin tool (per `collectLarkToolUseIds`). Anthropic API
+// shape: tool_result.content is either a string OR an array of
+// {type:'text',text} / string entries. Walk both shapes defensively.
+function collectLarkToolResultText(entries, fromIndex, larkIds) {
+  let combined = '';
+  for (let i = fromIndex; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry?.type !== 'user') continue;
+    const content = entry.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type !== 'tool_result') continue;
+      if (!larkIds.has(block.tool_use_id)) continue;
+      const blockContent = block.content;
+      if (typeof blockContent === 'string') {
+        combined += blockContent + '\n';
+      } else if (Array.isArray(blockContent)) {
+        for (const sub of blockContent) {
+          if (typeof sub === 'string') {
+            combined += sub + '\n';
+          } else if (sub?.type === 'text' && typeof sub.text === 'string') {
+            combined += sub.text + '\n';
+          }
+        }
+      }
+    }
+  }
+  return combined;
+}
+
 // Defer sentinel must appear on its own line (allowing leading/trailing
 // whitespace) — guards against echo attacks where a Lark user asks the
 // bot to print the literal token inline (Round 2 hardening of #11).
@@ -606,11 +671,16 @@ function main() {
     process.exit(0);
   }
 
-  let pending, replies, assistantText;
+  let pending, replies, assistantText, larkToolUseIds, toolResultText;
   try {
     pending = collectPendingLarkMessages(entries, turn.realUserIndices);
     replies = collectReplies(entries, turn.scanFromIndex);
     assistantText = collectAssistantText(entries, turn.scanFromIndex);
+    // #122 fix: also gather tool_result text from lark-plugin tools.
+    // Lets the defer signal be mechanical (the tool itself emits the
+    // sentinel) rather than depending on Claude voluntarily echoing it.
+    larkToolUseIds = collectLarkToolUseIds(entries, turn.scanFromIndex);
+    toolResultText = collectLarkToolResultText(entries, turn.scanFromIndex, larkToolUseIds);
   } catch (e) {
     audit(`Stop  status=fail-safe  reason=parse-error  err=${String(e).slice(0, 100)}`);
     process.exit(0);
@@ -631,6 +701,13 @@ function main() {
   if (hasDeferSentinel(assistantText)) {
     audit(
       `Stop  status=deferred  pending=${pending.length}  unanswered=${unanswered.length}  reason=defer-sentinel`
+    );
+    process.exit(0);
+  }
+  // #122: tool_result defer — mechanical fallback when Claude didn't echo.
+  if (hasDeferSentinel(toolResultText)) {
+    audit(
+      `Stop  status=deferred  pending=${pending.length}  unanswered=${unanswered.length}  reason=defer-tool-result`
     );
     process.exit(0);
   }
