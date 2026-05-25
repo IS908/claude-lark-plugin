@@ -55,8 +55,24 @@ export function profileDistillationPrompt(args: {
   episodeSummaries: string[];
   chatType: 'p2p' | 'group';
   l2Rules: string;
+  /**
+   * #113 R2-followup: synthetic thread_id bound to the target user.
+   * The prompt instructs Claude to pass it back as `thread_id=` in
+   * the save_memory call so caller resolution hits the EXACT
+   * (chatId, threadId) binding instead of falling back to the
+   * chat-level slot (which holds the last real user — would cause
+   * wrong-user profile pollution in group chats). Mirror of #87's
+   * Stage 1 fix.
+   *
+   * Optional for back-compat: when omitted, the prompt falls back
+   * to the pre-R2-followup template (no thread_id instruction). The
+   * production caller (`triggerProfileDistillation` in distiller.ts)
+   * always passes it. Unit tests pre-R2 omitted it; the default
+   * keeps them passing without modification.
+   */
+  threadId?: string;
 }): string {
-  const { userId, currentProfile, episodeSummaries, chatType, l2Rules } = args;
+  const { userId, currentProfile, episodeSummaries, chatType, l2Rules, threadId } = args;
   // #164 fix: episode summaries are LLM-distilled from buffered user
   // messages (#116-chain). Two LLM hops removed from attacker text,
   // but consistent with the envelope hygiene pattern from PR #163.
@@ -105,7 +121,11 @@ Classification rules (apply in order; higher priority wins):
 
 Return the JSON object inline (no code fence). Then call save_memory once with type="profile_tiered" and pass the JSON object as the content string:
 
-  save_memory(type="profile_tiered", content=<the JSON string>, reason=<why>, chat_id=<current>)
+  save_memory(type="profile_tiered", content=<the JSON string>, reason=<why>, chat_id=<current>${threadId ? `, thread_id="${threadId}"` : ''})
+
+${threadId ? `The thread_id="${threadId}" is REQUIRED — this is a system-initiated profile distillation turn bound to user "${userId}" via that synthetic thread. Without thread_id, save_memory's caller resolution falls back to the chat-level slot (which holds the LAST real user message's sender in this chat) → in a group chat, your distilled facts for "${userId}" would be written to the WRONG user's profile (silent cross-user pollution). Always pass thread_id="${threadId}" verbatim. (Mirror of the #87 Stage 1 flush fix.)
+
+` : ''}
 
 The server parses the JSON, applies the L1 privacy safety net (anything classified public that matches a regex/keyword rule like phone numbers, IDs, credentials, salary keywords is forced into private), and writes BOTH tier files atomically under a per-user lock (v1.0.34, #54). No other save_memory call for the same user can interleave between the two tier writes. (A concurrent getProfile read mid-pair can still see public-new + private-old for a sub-ms window — acceptable for an enrichment read.)
 

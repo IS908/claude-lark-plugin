@@ -380,6 +380,39 @@ async function run() {
     if (apiCalls.length === 0) {
       fail(`8b-sanity: non-cron-thread reply must SEND (got 0 API calls)`);
     }
+
+    // Sub-case c (#113 R2-followup): flush- and distill- synthetic
+    // threads also skip buffer.record. Pre-followup only `job-` was
+    // recognized; a misbehaving Claude reply during a flush or distill
+    // turn would pollute the buffer and recurse into the next
+    // distillation. The fix broadened `isSyntheticThread` to all three
+    // prefixes.
+    const flushThread = `flush-${Date.now()}`;
+    const distillThread = `distill-ou_someone-${Date.now()}`;
+    identitySession.setCaller('chat_cron', flushThread, '__system_flush__');
+    identitySession.setCaller('chat_cron', distillThread, 'ou_someone');
+
+    apiCalls.length = 0;
+    buffer.recorded.length = 0;
+    await replyHandler({
+      chat_id: 'chat_cron',
+      thread_id: flushThread,
+      text: 'rogue reply during flush turn',
+    });
+    if (buffer.recorded.length !== 0) {
+      fail(`8b-flush: flush-thread reply must NOT record (got ${buffer.recorded.length}) — closes Stage 1 buffer-pollution gap`);
+    }
+
+    apiCalls.length = 0;
+    buffer.recorded.length = 0;
+    await replyHandler({
+      chat_id: 'chat_cron',
+      thread_id: distillThread,
+      text: 'rogue reply during distill turn',
+    });
+    if (buffer.recorded.length !== 0) {
+      fail(`8b-distill: distill-thread reply must NOT record (got ${buffer.recorded.length}) — closes Stage 2 buffer-pollution gap`);
+    }
   }
 
   // ── Test 8c: #111 — edit_message mirrors edit into ConversationBuffer ──

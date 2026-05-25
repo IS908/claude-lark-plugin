@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.57] - 2026-05-26
+
+### Added
+- **Autonomous Stage 2 profile distillation, opt-in** (#113). Pre-#113, `profileDistillationPrompt` and `buildProfileDistillationPrompt` existed and were tested but had **no caller anywhere in src/** — profiles only got populated via explicit user-initiated `save_memory(type='profile_tiered')`. The product narrative ("bot remembers users") was unwired.
+
+  Post-fix: when `LARK_PROFILE_DISTILL_ENABLED=true`, after every Stage 1 (Buffer → Episode) auto-flush completes its dispatch, the system fires a follow-up Stage 2 (Episodes → Profile) turn for each active user in the just-flushed buffer. Gated by:
+  - **Cooldown** (`LARK_PROFILE_DISTILL_COOLDOWN_HOURS`, default 24h) — per-userId TTL. The same user across any chat won't be re-distilled until the cooldown expires.
+  - **Min-episodes** (`LARK_PROFILE_DISTILL_MIN_EPISODES`, default 5) — skip users whose `listEpisodes(chat)` length is below this floor. Avoids distilling sparse data into spurious facts.
+
+  Identity binding: each Stage 2 turn binds the **target user** as caller under a synthetic `thread_id=distill-<userId>-<ts>`. Claude's `save_memory(type='profile_tiered')` resolves caller server-side and writes to `profiles/<userId>/`. The L1 safety net (#54) + per-user mutex protect the writes.
+
+  Failure isolation: fire-and-forget — the orchestrator does NOT await Claude's turn. Each user iteration has its own try/catch so one user's failure doesn't stop others. Cooldown is marked on DISPATCH (not on success), so failed turns don't retry-storm into the next flush.
+
+### Implementation
+
+- New exported `triggerProfileDistillation(chatId, messages, deps, opts)` in `src/memory/distiller.ts` — dependency-injected orchestrator. Production deps (memoryStore + identitySession + channel + L2 loader) wired in `src/index.ts` setFlushHandler.
+- New config keys (off by default):
+  - `LARK_PROFILE_DISTILL_ENABLED` (default `false`)
+  - `LARK_PROFILE_DISTILL_COOLDOWN_HOURS` (default `24`)
+  - `LARK_PROFILE_DISTILL_MIN_EPISODES` (default `5`)
+- New `scripts/profile-distill-stage2-smoke.ts` (9 tests, wired into `scripts/test.sh`):
+  - Part A — gating (4): cooldown skip + expire-and-redispatch, min-episodes skip, no-eligible-users empty outcome, `system`/`bot` sentinel filter
+  - Part B — dispatch shape (3): identity binding (`setCaller` with `userId` as `callerId`), prompt body contains `userId` + `currentProfile` + recent episodes + `l2Rules`, cooldown marked on DISPATCH even when injection rejects
+  - Part C — failure isolation (2): per-user `getProfile` failure doesn't stop others, `loadL2Rules` failure tolerated (continues with empty rules)
+
+### R2-audit followups (closed in this PR)
+- **HIGH — wrong-user profile pollution in group chats.** R2 caught that `profileDistillationPrompt` (in `src/prompts.ts`) didn't instruct Claude to pass `thread_id` in the `save_memory(type='profile_tiered')` call. Stage 2 binds the target user as caller under a synthetic `distill-<userId>-<ts>` thread, but if Claude's `save_memory` call omits `thread_id`, `resolveCaller` falls back to the chat-level slot — which in a group chat holds the LAST real user's senderId. Result: distilled facts for User A would be silently written to User B's profile. Mirror of the exact same hazard Stage 1 had pre-#87. Fix: added optional `threadId` to the prompt template; production caller (`triggerProfileDistillation`) always passes `distillKey`; prompt now contains `thread_id="<distillKey>"` in the save_memory template AND an explanatory note ("REQUIRED — wrong-user pollution risk" mirroring #87). New test 6b pins the prompt-body assertion.
+- **MEDIUM — synthetic-thread guard didn't cover `flush-` / `distill-`.** Pre-followup the `isSyntheticThread` check in `src/tools.ts` (used by both reply's `reply_in_thread` routing AND the buffer-record skip) only recognized the `job-` prefix. Stage 1 flush turns + Stage 2 distill turns weren't supposed to call reply, but a misbehaving Claude COULD — and the buffer-record path would then pollute the buffer with synthetic-turn replies that re-distill into the next episode (recursive self-reinforcement). Fix: broadened the predicate to recognize all three synthetic-thread prefixes (`job-` / `flush-` / `distill-`). Two call sites updated (L614 reply path, L1083 edit_message path). Two new sub-cases in test 8b pin the broadened scope.
+
+### Known limitations / forward links
+- **#176** — Stage 2 dispatch has no audit-log entry; operator cost-visibility gap. Per-dispatch stderr log exists, but no `audit.log` entry. Tracked for follow-up; not a regression of pre-PR behavior.
+
+### Operator notes
+- **Default is OFF.** Existing deployments see no behavior change unless they set `LARK_PROFILE_DISTILL_ENABLED=true`. Opt-in is intentional — Stage 2 adds ~1 extra Claude turn per active user per cooldown window, multiplicative for busy group chats. Operator should size cost vs. value for their deployment.
+- **Cooldown is per-user-globally** (not per-user-per-chat). The same user being active in two different chats won't get distilled twice — the second flush sees them in cooldown. Acceptable trade-off — profile is per-user, not per-chat.
+- **First post-restart flush may double-distill** one user at most (cooldown state is in-memory, restart resets). Worst case is one wasted turn per user across restarts.
+- **No persistence required.** The cooldown Map lives in process memory; lost on restart by design.
+- **Recommended tuning** for a busy multi-chat deployment: raise `LARK_PROFILE_DISTILL_COOLDOWN_HOURS` to 48 or 72 to halve/third the cost; raise `LARK_PROFILE_DISTILL_MIN_EPISODES` to 10 to limit Stage 2 to "well-known" users only.
+
+---
+
 ## [1.0.56] - 2026-05-26
 
 ### Fixed

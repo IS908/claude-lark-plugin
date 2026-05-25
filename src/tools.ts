@@ -604,14 +604,28 @@ export function registerTools(
       // new thread — unwanted. Fall through to plain `message.create` in
       // those cases, preserving pre-fix behavior.
       //
-      // Also excluded: synthetic thread_ids from the cronjob dispatcher
-      // (prefix JOB_THREAD_PREFIX, see src/scheduler.ts). These values
-      // exist solely to isolate IdentitySession entries per cronjob run
-      // and do NOT correspond to a real Feishu thread. Using
-      // reply_in_thread:true against the effectiveReplyTo (which, if
-      // auto-filled or user-passed, points at a real earlier message)
+      // Also excluded: synthetic thread_ids from one of three internal
+      // dispatchers:
+      //   - `job-<id>-<ts>` — cronjob dispatcher (src/scheduler.ts)
+      //   - `flush-<ts>` — auto-flush handler (src/index.ts)
+      //   - `distill-<userId>-<ts>` — profile distillation (#113, v1.0.57)
+      // All three exist solely to isolate IdentitySession entries per
+      // synthetic turn and do NOT correspond to real Feishu threads.
+      // Using reply_in_thread:true against the effectiveReplyTo (which,
+      // if auto-filled or user-passed, points at a real earlier message)
       // would incorrectly pull that message into a newly-created thread.
-      const isSyntheticThread = !!thread_id && thread_id.startsWith(JOB_THREAD_PREFIX);
+      //
+      // R2-followup on #113: pre-followup only the `job-` prefix was
+      // recognized. flush and distill turns weren't supposed to call
+      // reply (they're system-initiated, no reply obligation), but a
+      // misbehaving Claude COULD — and the buffer-record path below
+      // also keyed on this flag, so a synthetic-turn reply would
+      // pollute the buffer and recurse into the next distillation.
+      const isSyntheticThread = !!thread_id && (
+        thread_id.startsWith(JOB_THREAD_PREFIX) ||
+        thread_id.startsWith('flush-') ||
+        thread_id.startsWith('distill-')
+      );
       const shouldStayInThread = !!thread_id && !isSyntheticThread && !!effectiveReplyTo;
       async function sendFollowup(data: { content: string; msg_type: string }): Promise<any> {
         // #112 fix: wrap every send in withFeishuRetry so a Feishu
@@ -1066,8 +1080,16 @@ export function registerTools(
       //    empty for the assistant role; the edit's content has no
       //    pre-edit version to replace, so the skip is harmless)
       if (chat_id && conversationBuffer) {
+        // R2-followup on #113: broaden to all synthetic-thread prefixes
+        // (cron + flush + distill). Synthetic-turn edit_message should
+        // not pollute the buffer; same rationale as reply's isSyntheticThread
+        // broadening at L614.
         const isCronOriginated =
-          !!thread_id && thread_id.startsWith(JOB_THREAD_PREFIX);
+          !!thread_id && (
+            thread_id.startsWith(JOB_THREAD_PREFIX) ||
+            thread_id.startsWith('flush-') ||
+            thread_id.startsWith('distill-')
+          );
         if (!isCronOriginated) {
           // Use the same 500-char prefix + sanitize-on-record rule as
           // reply's recordReply for consistency (the buffer stores
