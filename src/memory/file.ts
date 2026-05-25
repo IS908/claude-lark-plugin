@@ -1342,12 +1342,15 @@ export class MemoryStore {
    * fits"). Returns the original string for any input whose UTF-8
    * byte length is already within the cap (including empty string).
    *
-   * Edge note: with `maxBytes` smaller than the first character's
-   * UTF-8 length (e.g. `maxBytes=1` and a 3-byte CJK lead), the body
-   * truncates to empty and the result is just the truncation tag.
-   * Production caps (defaults 2KB / 8KB) never hit this corner; if a
-   * future caller sets a sub-codepoint cap they get the tag only —
-   * accept that as the intended "cap was unreasonably small" signal.
+   * Edge note (#153 followup): with `maxBytes` smaller than the
+   * first character's UTF-8 length (e.g. `maxBytes=1` and a 3-byte
+   * CJK lead), the body would truncate to empty. Pre-followup we
+   * returned just the truncation tag (16 bytes of "this got cut"
+   * with 0 bytes of payload — conveys nothing useful). Post-
+   * followup we return `''` so the caller can detect "nothing fit"
+   * cleanly. Production caps (defaults 2KB / 8KB) never hit this
+   * corner; the change matters only for pathological / hand-tuned
+   * tiny caps.
    *
    * Implementation note: UTF-8 continuation bytes are `10xxxxxx`
    * (`0x80–0xBF`). After a candidate cutoff, walk backward past any
@@ -1365,6 +1368,15 @@ export class MemoryStore {
     // bisect a multi-byte codepoint. Bounded by 4 iterations max
     // (UTF-8 chars are at most 4 bytes).
     while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+    // #153 followup: skip the truncation tag when the body would be
+    // empty (sub-codepoint cap on a multi-byte-leading string).
+    // Pre-followup `capByBytes('人abc', 1)` returned
+    // `'\n... [truncated]'` — 16 bytes of tag for 0 bytes of body,
+    // which conveys nothing useful to Claude or to a human reading
+    // a truncated episode. Now: empty body → return `''` so the
+    // caller can detect "nothing fit" cleanly. Production caps
+    // (defaults 2KB / 8KB) never hit this branch.
+    if (end === 0) return '';
     return buf.subarray(0, end).toString('utf-8') + '\n... [truncated]';
   }
 

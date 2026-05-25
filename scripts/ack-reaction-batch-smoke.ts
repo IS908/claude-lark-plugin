@@ -309,4 +309,94 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
   passed++;
 }
 
+// 11. #161 followup: channel-side .then() consume integration. The
+//     pure-helper contract (tests 1-4) and the reply-call-site mark
+//     (tests 5, 10) cover the input side. This test exercises the
+//     OUTPUT side — `onAckCreated` (the extracted .then() body)
+//     consumes the mark and triggers a late-revoke delete instead
+//     of storing in the Map. Without this test, a refactor that
+//     flipped the consume/store order, dropped the early return, or
+//     removed the consume branch would pass tests 1-10.
+{
+  const ch = new LarkChannel();
+  const deleteCalls: any[] = [];
+  // Swap the client with a deletion-recording mock. messageReaction.delete
+  // is the only call onAckCreated makes on the late-revoke path.
+  (ch as any).client = {
+    im: { v1: { messageReaction: {
+      delete: async (args: any) => {
+        deleteCalls.push(args);
+        return { data: {} };
+      },
+    } } },
+  };
+
+  // Pre-mark pending — simulates `reply.revokeAckFor` having run
+  // before the ack-create's .then() landed.
+  ch.markPendingAckRevoke('om_late_revoke');
+  if (!(ch as any).pendingAckRevokes.has('om_late_revoke')) {
+    fail(`11a: setup — pending mark should be set`);
+  }
+
+  // Fire onAckCreated as the .then() would. Synchronous body, but
+  // the inner withFeishuRetry().catch() is async — give it a tick.
+  ch.onAckCreated('om_late_revoke', 'rxn_late');
+  await new Promise(r => setTimeout(r, 30));
+
+  // Verify:
+  //  - delete fired with the right reaction_id
+  //  - ack entry NOT stored (the race-protection point)
+  //  - pending mark consumed
+  if (deleteCalls.length !== 1) {
+    fail(`11b: late-revoke delete should fire exactly once, got ${deleteCalls.length}`);
+  }
+  if (deleteCalls[0].path.message_id !== 'om_late_revoke') {
+    fail(`11b: wrong message_id in delete, got ${deleteCalls[0].path.message_id}`);
+  }
+  if (deleteCalls[0].path.reaction_id !== 'rxn_late') {
+    fail(`11b: wrong reaction_id in delete, got ${deleteCalls[0].path.reaction_id}`);
+  }
+  if (ch.getAckReactions().has('om_late_revoke')) {
+    fail(`11c: ack entry should NOT be stored on the race path — got entry, race protection failed`);
+  }
+  if (ch.consumePendingAckRevoke('om_late_revoke')) {
+    fail(`11d: pending mark should have been consumed by onAckCreated`);
+  }
+  passed++;
+}
+
+// 11b. #161 followup: control case — onAckCreated WITHOUT a pending
+//      mark stores normally (no late-revoke, ack entry persists).
+//      This pins the "non-race" path so a regression that always
+//      took the late-revoke branch would be caught.
+{
+  const ch = new LarkChannel();
+  const deleteCalls: any[] = [];
+  (ch as any).client = {
+    im: { v1: { messageReaction: {
+      delete: async (args: any) => {
+        deleteCalls.push(args);
+        return { data: {} };
+      },
+    } } },
+  };
+
+  // No pending mark — normal storage path
+  ch.onAckCreated('om_normal_ack', 'rxn_normal');
+  await new Promise(r => setTimeout(r, 30));
+
+  if (deleteCalls.length !== 0) {
+    fail(`11b-control: delete must NOT fire without a pending mark, got ${deleteCalls.length} calls`);
+  }
+  const entry = ch.getAckReactions().get('om_normal_ack');
+  if (!entry) fail(`11b-control: ack entry MUST be stored on the normal path`);
+  if (entry!.reactionId !== 'rxn_normal') {
+    fail(`11b-control: wrong reactionId stored, got ${entry!.reactionId}`);
+  }
+  if (typeof entry!.addedAt !== 'number') {
+    fail(`11b-control: addedAt must be set (powers TTL backstop)`);
+  }
+  passed++;
+}
+
 console.log(`ack-reaction batch smoke: ${passed}/${passed} PASS`);

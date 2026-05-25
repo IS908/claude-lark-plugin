@@ -501,6 +501,47 @@ export class LarkChannel {
     return this.pendingAckRevokes.size;
   }
 
+  /**
+   * #161 followup: race-resolution body lifted out of the inline
+   * `.then()` in `handleMessageEvent` so the channel-side wiring
+   * is directly testable. Called when an ack-create resolves.
+   *
+   * If `consumePendingAckRevoke(messageId)` returns true (revoke
+   * was requested while the ack-create was still in flight),
+   * immediately delete the just-created reaction instead of
+   * storing it — closes #136 race. Otherwise store with timestamp
+   * so the TTL backstop (`pruneStaleAcks`, #85) can sweep orphans.
+   *
+   * Returns void; errors from the late-revoke delete are swallowed
+   * after a `debugLog` (best-effort; the TTL backstop would catch
+   * a leaked entry anyway).
+   *
+   * Marked `internal` in spirit — production caller is the inline
+   * `.then()` only. Tests call it directly.
+   */
+  onAckCreated(messageId: string, reactionId: string): void {
+    // Check pending-revoke FIRST. Order is critical (#161): if we
+    // set the Map before checking the Set, a race-protected
+    // revoke would silently lose. The test pins this ordering.
+    if (this.consumePendingAckRevoke(messageId)) {
+      debugLog(`[channel] ack for ${messageId} landed after revoke was requested; deleting immediately`);
+      withFeishuRetry(
+        () => this.client.im.v1.messageReaction.delete({
+          path: { message_id: messageId, reaction_id: reactionId },
+        }),
+        { label: 'ack.late-revoke' },
+      ).catch((err: any) => {
+        debugLog(`[channel] late-revoke gave up for ${messageId}: ${err?.message ?? err}`);
+      });
+      return;
+    }
+    // addedAt timestamp powers the TTL backstop (#85): pruneStaleAcks
+    // sweeps entries older than ACK_TTL_MS so anything that escaped
+    // the normal revoke path doesn't sit on the user's message
+    // forever or leak Map memory.
+    this.ackReactions.set(messageId, { reactionId, addedAt: Date.now() });
+  }
+
   getBotMessageTracker(): BotMessageTracker {
     return this.botMessageTracker;
   }
@@ -710,30 +751,11 @@ export class LarkChannel {
       ).then((resp: any) => {
         const reactionId = resp?.data?.reaction_id;
         if (reactionId) {
-          // #136 fix: check the pending-revoke Set FIRST. If
-          // `revokeAckFor` already ran (fast bot reply outraced the
-          // ack-create round-trip), the messageId is marked here —
-          // immediately delete the reaction we just created instead
-          // of storing in the Map (where it would sit until the TTL
-          // backstop swept it up to 6 min later, leaving the MeMeMe
-          // emoji visibly stuck on the user's message).
-          if (this.consumePendingAckRevoke(messageId)) {
-            debugLog(`[channel] ack for ${messageId} landed after revoke was requested; deleting immediately`);
-            withFeishuRetry(
-              () => this.client.im.v1.messageReaction.delete({
-                path: { message_id: messageId, reaction_id: reactionId },
-              }),
-              { label: 'ack.late-revoke' },
-            ).catch((err: any) => {
-              debugLog(`[channel] late-revoke gave up for ${messageId}: ${err?.message ?? err}`);
-            });
-            return;
-          }
-          // addedAt timestamp powers the TTL backstop (#85): pruneStaleAcks
-          // sweeps entries older than ACK_TTL_MS so anything that escaped
-          // the normal revoke path doesn't sit on the user's message
-          // forever or leak Map memory.
-          this.ackReactions.set(messageId, { reactionId, addedAt: Date.now() });
+          // #161 followup: race-resolution body lifted into a
+          // private `onAckCreated` method so the smoke test can
+          // exercise the consume-vs-store branch directly without
+          // SDK / WebSocket plumbing.
+          this.onAckCreated(messageId, reactionId);
         }
       }).catch((err) => {
         // #112: at least log on final exhaustion so an operator can see

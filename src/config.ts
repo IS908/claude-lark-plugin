@@ -2,6 +2,29 @@ import { config } from 'dotenv';
 import path from 'node:path';
 import os from 'node:os';
 
+/**
+ * Config lifecycle (#154):
+ *
+ * `appConfig` (exported below) is built ONCE at module load time —
+ * `dotenv` reads `~/.claude/channels/lark/.env`, every `optional*`
+ * helper captures `process.env[KEY]` into the literal, and the
+ * resulting object is frozen-ish (no setter discipline beyond
+ * "don't write to it"). **There is no hot-reload.** Mutating
+ * `process.env.LARK_*` at runtime has NO effect on `appConfig.*`
+ * reads from anywhere in the codebase.
+ *
+ * If a test or future use site needs to verify env-override
+ * behavior, it must either (a) set `process.env.LARK_*` BEFORE the
+ * first `import './config.js'` in the entry point, or (b) spawn a
+ * subprocess with the env preset. Setting env after `appConfig` is
+ * imported and expecting the change to land is a known footgun.
+ *
+ * Hot-path use sites that read `appConfig.someKey` per-call (e.g.
+ * `src/memory/file.ts` cap reads, `src/scheduler.ts` retry knobs)
+ * do so for code-organization reasons — NOT to allow runtime
+ * retuning. The reads are constant after module load.
+ */
+
 const envPath = path.join(os.homedir(), '.claude', 'channels', 'lark', '.env');
 config({ path: envPath });
 
