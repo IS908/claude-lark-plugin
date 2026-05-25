@@ -29,10 +29,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - Part C (1): #133 divergence log fires + `run_count` still increments on legitimate mid-flight `type` update.
   - Part D (2): #132 retarget skips auto-pause (control: unchanged target + permanent error STILL auto-pauses — the fix is conditional, not an unconditional disable).
 
+### R1-audit followups (closed in this PR)
+- **`inFlight` re-entrancy guard switched from `Set<string>` (id-only) to `Map<string, string>` (id → created_at).** Pre-followup, the `(id, created_at)` identity fix at the writeback layer was inconsistent with the tick-level re-entrancy gate: a recycled NEW job's first scheduled tick would have been blocked by the still-pending OLD execution's `inFlight` entry, missing its first fire (silent for up to 210s). Post-followup, `tick()` compares both id AND `created_at` — a recycled job is treated as a distinct logical job and gets its own re-entrancy slot.
+- **Test 6 contract tightened** — added assertions on `last_error === null`, `next_run_at` unchanged, and `created_at` preserved so a future regression that selectively writes back fields can't pass with only `run_count` / `last_run_at` / `content` checked.
+- **Test 10 mock cleaned up** — mock no longer throws on the owner DM (`ou_owner`) call. The pre-followup stack-trace in the smoke output was benign but looked like a failure; now the smoke verifies the owner DM actually fires with the AUTO-PAUSED text.
+- **New test 11** — pinning the `inFlight` Map keying contract directly: same id with different `created_at` does NOT block; same `created_at` does block.
+- **`isRecycledJob` docstring** clarifies the asymmetric legacy gap (`created_at: ''` OLD snapshot + real-timestamp NEW will NOT be flagged — accepted trade-off documented).
+
+### Known limitations / forward links
+- **`recoverMissedJobs` boot-time window** (#156): the same recycle race exists during boot recovery, between `listAllJobs()` and the per-job `executeJob` call. Window is much smaller (no 210s retry budget; just the few ms of tier-1/tier-2 notification sends) and only the OLD side effect lands — `executeJob`'s isRecycledJob guard already protects the NEW runtime. Tracked separately.
+- **TOCTOU between `isRecycledJob` and `writeJob`** (#157): two delete_job+create_job calls inside ~milliseconds of an executeJob writeback can still stomp the second recycle's runtime. Vanishingly rare (requires sub-ms tool-call spacing); documented and tracked.
+
 ### Operator notes
 - **Behavior changes are conservative and only fire on documented race scenarios.** Normal `executeJob` execution (no concurrent `update_job` / `delete_job` + `create_job`) is unaffected.
 - **#106 auto-pause is now retarget-aware.** If you're firefighting a kicked-bot scenario and want immediate re-targeting to "stick," the post-fix behavior is what you'd expect: change the target → next tick uses it. The race window between "Feishu API call started" and "auto-pause decision" is the only place the old behavior could surprise; it's now closed.
 - **Legacy jobs without `created_at`** retain the pre-fix recycle behavior (recycle detection requires both sides to have a non-empty `created_at`). If you have very old jobs in flight, recycle stomping is still theoretically possible on them — but those are typically long-running daily / weekly cronjobs, not delete+create churn targets. New jobs (post-v0.9 — every job since `create_job` started setting `created_at`) are protected.
+- **If you're scripting rapid delete_job + create_job cycles** for testing or migration, sleep ≥100ms between calls to give the executeJob writeback path time to commit. The #157 TOCTOU window is small but real.
 - **No data-format changes.** Existing job files on disk are unaffected. Only `executeJob`'s decision logic changes.
 
 ---

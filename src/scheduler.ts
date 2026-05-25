@@ -110,6 +110,18 @@ function sleep(ms: number): Promise<void> {
  * recycle detected" so we preserve pre-fix behavior rather than
  * spuriously skipping writebacks on legacy data.
  *
+ * R1-followup asymmetry note: a legacy OLD snapshot (`created_at: ''`)
+ * delete+create-replaced by a NEW job with a real timestamp returns
+ * `false` here — the OLD execution WILL stomp the NEW job's runtime.
+ * This is the documented trade-off: detecting "OLD lacks created_at,
+ * NEW has one" as a recycle would also flag the common case of an
+ * operator running create_job to re-attribute a legacy job, where
+ * the OLD snapshot is genuinely the same logical job. Legacy jobs
+ * are typically long-running daily/weekly cronjobs (not delete+create
+ * churn targets); the asymmetric gap is acceptable and shrinks every
+ * time an operator touches a legacy job via update_job (which now
+ * always sets created_at).
+ *
  * Pure helper, exported `static`-style at module scope so the smoke
  * test can pin the contract without instantiating a full scheduler.
  */
@@ -128,7 +140,7 @@ export class JobScheduler {
   private botMessageTracker: BotMessageTracker | undefined;
   private running = false;
   /**
-   * Per-job re-entrancy guard (#77, v1.0.29).
+   * Per-job re-entrancy guard (#77, v1.0.29; recycle-aware in v1.0.43).
    *
    * `tick()` runs on a 60s setInterval, but `executeJob()` can sit inside
    * the retry loop for up to 210s (30 + 60 + 120). Without this guard,
@@ -137,16 +149,36 @@ export class JobScheduler {
    * fire executeJob a second time — duplicate execution, the exact
    * symptom #62 already tried to eliminate via filename-as-id.
    *
-   * Membership is keyed by `job.meta.id` (the filename stem). The
-   * Set is in-process: a daemon restart clears it, but on restart
-   * recoverMissedJobs runs once before tick begins, so there is no
-   * window for cross-restart re-entrancy.
+   * v1.0.43 #134 fix: switched from `Set<string>` (keyed on bare id) to
+   * `Map<string, string>` (id → created_at) so the guard respects the
+   * `(id, created_at)` identity tuple introduced by `isRecycledJob`.
+   * Pre-fix, a `delete_job('foo')` + `create_job('foo')` during the
+   * 210s in-flight window would have the NEW job's tick blocked by
+   * the OLD execution's still-pending `inFlight` entry — the new job
+   * would miss its first fire even though the OLD execution's
+   * writeback now correctly skips. Post-fix, `tick()` skips only
+   * when `inFlight.get(id) === job.meta.created_at`; a different
+   * `created_at` (recycled job) is treated as a distinct logical
+   * job and gets its own re-entrancy slot.
+   *
+   * Legacy jobs without `created_at` (very old jobs that pre-date
+   * the field) use the empty string as their key value. Two legacy
+   * jobs with the same id would still collide — but the PRE-#134
+   * design had no way to distinguish them either; this matches the
+   * pre-fix legacy behavior.
+   *
+   * Cleanup keys on `id` alone — the finally-block delete after
+   * `executeJob` always clears the slot regardless of the
+   * created_at it captured (executeJob removed exactly the entry
+   * tick() added; tick() never adds twice for the same id with
+   * different created_at because the second-add-attempt sees
+   * `inFlight.has(id)` short-circuit).
    *
    * NOT used by recoverMissedJobs — start() awaits recoverMissedJobs
    * before installing the tick timer, so the two paths are temporally
    * disjoint.
    */
-  private inFlight = new Set<string>();
+  private inFlight = new Map<string, string>();
 
   constructor(opts: SchedulerOptions) {
     this.server = opts.server;
@@ -357,11 +389,21 @@ export class JobScheduler {
       // #77 re-entrancy guard: skip jobs whose previous execution is
       // still in flight. Without this, a job in the 30+60+120s retry
       // sleep window would be re-launched on each subsequent tick.
-      if (this.inFlight.has(job.meta.id)) continue;
+      //
+      // v1.0.43 #134 fix: compare BOTH id AND created_at. If the
+      // user delete+create'd inside the window, the new job's
+      // created_at differs from the in-flight entry's — treat as a
+      // distinct logical job and let it run. The OLD execution's
+      // writeback will skip via isRecycledJob, so the two don't
+      // collide on disk either.
+      const inFlightCreatedAt = this.inFlight.get(job.meta.id);
+      if (inFlightCreatedAt !== undefined && inFlightCreatedAt === (job.meta.created_at ?? '')) {
+        continue;
+      }
 
       const nextRun = new Date(job.runtime.next_run_at).getTime();
       if (nextRun <= now) {
-        this.inFlight.add(job.meta.id);
+        this.inFlight.set(job.meta.id, job.meta.created_at ?? '');
         this.executeJob(job)
           .catch((err) => {
             console.error(`[scheduler] Failed to execute job ${job.meta.id}:`, err);

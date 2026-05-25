@@ -203,6 +203,22 @@ try {
     if (onDisk.runtime.last_run_at !== '2026-06-15T01:00:00Z') {
       fail(`6: new job's last_run_at stomped, got ${onDisk.runtime.last_run_at}`);
     }
+    // R1-followup tighter contract: lock the FULL runtime snapshot to
+    // catch a future regression that selectively writes back individual
+    // fields (e.g. refactor below `computeNextRun` that skips only
+    // run_count). Without these, a partial writeback could pass while
+    // still corrupting the new job's `next_run_at` (would lose its
+    // scheduled fire) or `last_error` (would surface OLD failure to
+    // operator who thinks the NEW job is broken).
+    if (onDisk.runtime.last_error !== null) {
+      fail(`6: new job's last_error polluted, got "${onDisk.runtime.last_error}"`);
+    }
+    if (onDisk.runtime.next_run_at !== newJob.runtime.next_run_at) {
+      fail(`6: new job's next_run_at stomped, got '${onDisk.runtime.next_run_at}'`);
+    }
+    if (onDisk.meta.created_at !== '2026-06-15T00:00:00Z') {
+      fail(`6: new job's created_at clobbered, got '${onDisk.meta.created_at}'`);
+    }
     // The OLD send DID happen (intended behavior — in-flight execution
     // owns its side effect).
     if (sent.length !== 1) fail(`6: expected 1 send, got ${sent.length}`);
@@ -328,10 +344,16 @@ try {
 
   // 10. Target UNCHANGED + permanent error → auto-pause STILL fires
   //     (the #132 fix is conditional, not an unconditional disable).
+  //
+  //     R1-followup: mock now succeeds for owner DM (`ou_owner`) so
+  //     the test's stderr stays clean. Pre-followup the mock threw on
+  //     EVERY receive_id including the owner DM that fires after
+  //     auto-pause, producing a stack-trace in the smoke output that
+  //     looked like a failure but was actually expected behavior.
   {
     const sent: SentMessage[] = [];
     const scheduler = makeScheduler(
-      mockClient(sent, () => permanentTargetError(230002)),
+      mockClient(sent, (rid) => (rid === 'ou_owner' ? null : permanentTargetError(230002))),
     );
 
     const job = makeJob({ id: 'real-pause-test', createdAt: '2026-01-01T00:00:00Z', target: 'oc_dead' });
@@ -345,8 +367,46 @@ try {
     if (onDisk.meta.status !== 'paused') {
       fail(`10: unchanged target + permanent error should AUTO-PAUSE, got status='${onDisk.meta.status}'`);
     }
+    // Confirm owner DM fired (auto-pause path notifies)
+    const ownerDm = sent.find(s => s.receive_id === 'ou_owner');
+    if (!ownerDm) fail(`10: owner DM should fire after auto-pause`);
+    if (!ownerDm.text.includes('AUTO-PAUSED')) {
+      fail(`10: owner DM should mention AUTO-PAUSED, got "${ownerDm.text.slice(0, 80)}"`);
+    }
 
     await deleteJob('real-pause-test');
+    passed++;
+  }
+
+  // 11. R1-followup integration: inFlight is now (id, created_at) so
+  //     a recycle DURING execution can run on the NEXT tick. Direct
+  //     unit test of the Map keying — the bare Set behavior would have
+  //     blocked the NEW job's tick on the still-pending OLD entry.
+  {
+    const scheduler = makeScheduler(mockClient([]));
+    const inFlight = (scheduler as any).inFlight as Map<string, string>;
+
+    // OLD execution begins — tick adds entry
+    inFlight.set('foo', '2026-01-01T00:00:00Z');
+
+    // Recycled NEW job's tick checks: SAME id but DIFFERENT created_at
+    // — must NOT be treated as "still in flight".
+    if (inFlight.get('foo') === '2026-06-15T00:00:00Z') {
+      fail(`11: identity check should differ — same id, different created_at`);
+    }
+    // The actual tick gate is `inFlight.get(id) === job.meta.created_at`
+    // — a recycle has different created_at → gate releases.
+    const newCreatedAt = '2026-06-15T00:00:00Z';
+    const blockedByGate = inFlight.get('foo') !== undefined && inFlight.get('foo') === newCreatedAt;
+    if (blockedByGate) fail(`11: recycled job blocked by stale in-flight entry`);
+
+    // The OLD job is still blocked though (correct — its execution
+    // is mid-flight, can't re-launch).
+    const oldCreatedAt = '2026-01-01T00:00:00Z';
+    const oldBlocked = inFlight.get('foo') !== undefined && inFlight.get('foo') === oldCreatedAt;
+    if (!oldBlocked) fail(`11: same-identity tick should still be blocked`);
+
+    inFlight.delete('foo'); // cleanup
     passed++;
   }
 } finally {

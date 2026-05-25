@@ -607,8 +607,12 @@ try {
     const scheduler = makeScheduler(mockClient(sent));
     const job = makeJob('reentrancy-prepop', new Date(Date.now() - 60_000).toISOString());
     await writeJob(job);
-    // Simulate "a prior tick is still executing this job"
-    (scheduler as any).inFlight.add(job.meta.id);
+    // Simulate "a prior tick is still executing this job".
+    // v1.0.43 #134: inFlight is now Map<id, created_at>; pre-populate
+    // with the SAME created_at as the on-disk job so the gate fires
+    // (a different created_at would correctly let the tick through
+    // as a recycle, which is the opposite of what this test wants).
+    (scheduler as any).inFlight.set(job.meta.id, job.meta.created_at);
 
     await (scheduler as any).tick();
     // tick uses fire-and-forget; nothing to await for the skipped job,
