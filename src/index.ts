@@ -417,7 +417,9 @@ async function main() {
     void runInboxGcOnce();
     const intervalMs = appConfig.inboxGcIntervalMin * 60 * 1000;
     const timer = setInterval(() => { void runInboxGcOnce(); }, intervalMs);
-    timer.unref?.();
+    // R2-followup: setInterval always returns a NodeJS.Timeout with
+    // unref defined; no optional-chain needed.
+    timer.unref();
     console.error(
       `[index] Inbox GC enabled (maxAge=${appConfig.inboxMaxAgeDays}d, ` +
       `maxSize=${appConfig.inboxMaxSizeMB}MB, interval=${appConfig.inboxGcIntervalMin}min)`,

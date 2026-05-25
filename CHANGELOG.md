@@ -20,8 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Best-effort throughout: `unlink` failures (file vanished concurrently, EACCES) are swallowed so one bad file doesn't abort cleanup of the rest. `readdir` failure (dir missing during a race) is a no-op.
 
 ### Added
-- New module `src/inbox-gc.ts` — `gcInbox(opts)` returns `{ removed, bytesFreed, finalSize, remaining }` for tests + operator logging. `runInboxGcOnce()` is the timer wrapper that logs at info-level only when something was actually removed (silent on most idle ticks).
-- New `scripts/inbox-gc-smoke.ts` (10 tests, wired into `scripts/test.sh`):
+- New module `src/inbox-gc.ts` — `gcInbox(opts)` returns `{ removed, bytesFreed, finalSize, remaining }` for tests + operator logging. `runInboxGcOnce()` is the timer wrapper that logs at info-level only when something was actually removed (silent on most idle ticks). The `unlinkFn` option is a test-only hook for cross-platform EACCES simulation.
+- New `scripts/inbox-gc-smoke.ts` (12 tests, wired into `scripts/test.sh`):
   - 1: missing directory → all-zeros result, no throw
   - 2: empty directory → all-zeros
   - 3: age expiry — older-than-cutoff deleted, fresher kept
@@ -32,6 +32,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - 8: nothing-to-do happy path (all fresh, under cap)
   - 9: size cap boundary (total === cap, no eviction — strict `>`)
   - 10: mixed file types — PNG, PDF, BIN, no-extension all eligible
+  - **11 (R2-followup)**: pass 1 (age) — `unlink` failure pushes the entry back into survivors so `finalSize`/`remaining` reflect actual on-disk state (this path was already correct pre-followup; locking in as regression guard)
+  - **12 (R2-followup, THE BUG)**: pass 2 (LRU) — `unlink` failure must NOT silently subtract from `totalSize`. Pre-followup the undeletable's bytes were subtracted as if freed, and the entry was dropped from survivors → `finalSize=0, remaining=0` lied about disk state. Post-followup: undeletables are stashed and re-pushed into survivors at loop exit; `finalSize`/`remaining` are accurate.
+
+### R2-audit followups (closed in this PR)
+- **Pass-2 LRU accounting asymmetry** (the bug above). Pre-followup, pass 1 (age) correctly handled `unlink` failure by re-pushing the entry into `survivors`; pass 2 (LRU) was asymmetric — unconditional `shift()` + unconditional `totalSize -= oldest.size` even in the catch branch. An undeletable file (EACCES) was silently counted as freed in the stats. The stderr log line `[inbox-gc] removed X file(s), freed YMB (N remain, ZMB total)` lied about actual disk state. Operator-cosmetic (the loop still terminated correctly), but the dishonest stats are exactly the kind of regression that erodes operator trust in the GC. Fixed by stashing undeletables in a separate list and pushing them back into `survivors` after the loop, so the returned stats reflect what's actually on disk.
+- **`timer.unref?.()` → `timer.unref()`** in `src/index.ts` — R2 noted the optional-chain was cosmetic since `setInterval` always returns a `NodeJS.Timeout` with `unref` defined.
+- **`unlinkFn` test hook** added to `GcInboxOptions` — test-only dependency injection for cross-platform EACCES simulation (cleaner than chmod gymnastics). Production callers don't pass it.
 - New env vars (in `src/config.ts`):
   - `LARK_INBOX_MAX_AGE_DAYS` (default 7) — age threshold in days
   - `LARK_INBOX_MAX_SIZE_MB` (default 500) — directory size cap in MB

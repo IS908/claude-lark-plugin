@@ -59,6 +59,12 @@ export interface GcInboxOptions {
   maxSizeBytes?: number;
   /** Reference "now" timestamp in ms (for deterministic tests). Defaults to Date.now(). */
   now?: number;
+  /**
+   * Test hook: override `fs.unlink`. Lets the smoke test simulate EACCES
+   * cross-platform without chmod gymnastics. Production callers don't
+   * pass this — defaults to real `fs.unlink`.
+   */
+  unlinkFn?: (filePath: string) => Promise<void>;
 }
 
 export interface GcInboxResult {
@@ -77,6 +83,7 @@ export async function gcInbox(opts: GcInboxOptions = {}): Promise<GcInboxResult>
   const maxAgeMs = opts.maxAgeMs ?? appConfig.inboxMaxAgeDays * 86_400_000;
   const maxSizeBytes = opts.maxSizeBytes ?? appConfig.inboxMaxSizeMB * 1024 * 1024;
   const now = opts.now ?? Date.now();
+  const unlinkFn = opts.unlinkFn ?? fs.unlink;
 
   if (!existsSync(dir)) {
     return { removed: 0, bytesFreed: 0, finalSize: 0, remaining: 0 };
@@ -123,7 +130,7 @@ export async function gcInbox(opts: GcInboxOptions = {}): Promise<GcInboxResult>
   for (const f of files) {
     if (f.mtimeMs < cutoff) {
       try {
-        await fs.unlink(f.path);
+        await unlinkFn(f.path);
         removed++;
         bytesFreed += f.size;
       } catch {
@@ -143,20 +150,34 @@ export async function gcInbox(opts: GcInboxOptions = {}): Promise<GcInboxResult>
   let totalSize = survivors.reduce((acc, f) => acc + f.size, 0);
   if (totalSize > maxSizeBytes) {
     survivors.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    // R2-followup: track unlink failures so the returned finalSize +
+    // remaining reflect what's ACTUALLY on disk, not what we wanted
+    // to remove. Pre-fix this branch unconditionally subtracted
+    // oldest.size from totalSize even on failure — `[inbox-gc] freed
+    // XMB (N remain, YMB total)` would lie about disk state.
+    //
+    // Loop termination: each iteration `shift()`s exactly one entry
+    // out of `survivors`. Even if EVERY remaining file is undeletable
+    // (and totalSize stays > cap forever), `survivors.length > 0`
+    // becomes false after exhausting the list. No infinite loop.
+    const undeletable: Entry[] = [];
     while (totalSize > maxSizeBytes && survivors.length > 0) {
       const oldest = survivors.shift()!;
       try {
-        await fs.unlink(oldest.path);
+        await unlinkFn(oldest.path);
         removed++;
         bytesFreed += oldest.size;
         totalSize -= oldest.size;
       } catch {
-        // unlink failed. Subtract from running total anyway so we don't
-        // loop forever on an undeletable file. Operator will see it on
-        // disk; we just can't reach it.
-        totalSize -= oldest.size;
+        // File is still on disk — do NOT subtract from totalSize
+        // (would misreport finalSize). Stash for post-loop push-back
+        // into `survivors` so the count of remaining files is right.
+        undeletable.push(oldest);
       }
     }
+    // Push failed unlinks back into the survivor set so finalSize +
+    // remaining returned below reflect the true on-disk state.
+    survivors.push(...undeletable);
   }
 
   return {

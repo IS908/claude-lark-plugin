@@ -238,6 +238,94 @@ try {
     if (r.removed !== 4) fail(`10: all 4 stale should be removed regardless of extension, got ${r.removed}`);
     testNum++;
   }
+
+  // 11. R2-followup: pass 1 (age expiry) — unlink failure pushes the
+  //     entry into survivors so finalSize + remaining reflect on-disk
+  //     state. Pre-followup the swallow worked but the stats counted
+  //     the file as evicted; pass 1 ALREADY did this correctly, so
+  //     this test is the symmetric guard / regression lock.
+  {
+    const dir = mkdtempSync(join(tmp, 'age-eacces-'));
+    makeFile(dir, 'undeletable.png', 100, NOW - 8 * DAY_MS); // stale
+    makeFile(dir, 'fresh.png', 200, NOW - 1 * DAY_MS); // not stale
+    const r = await gcInbox({
+      dir,
+      maxAgeMs: 7 * DAY_MS,
+      maxSizeBytes: 500 * MB,
+      now: NOW,
+      // Simulate EACCES on the stale file (and any other unlink) —
+      // cross-platform via injected mock.
+      unlinkFn: async (p) => {
+        if (p.endsWith('undeletable.png')) {
+          throw Object.assign(new Error('mock EACCES'), { code: 'EACCES' });
+        }
+        // For other paths, defer to real unlink
+        const realFs = await import('node:fs/promises');
+        return realFs.unlink(p);
+      },
+    });
+    if (r.removed !== 0) fail(`11: unlink failed, nothing should count as removed (got ${r.removed})`);
+    if (r.bytesFreed !== 0) fail(`11: bytesFreed must reflect actual freed, got ${r.bytesFreed}`);
+    if (r.remaining !== 2) fail(`11: both files still on disk → remaining=2, got ${r.remaining}`);
+    if (r.finalSize !== 300) fail(`11: finalSize must reflect both files, got ${r.finalSize}`);
+    if (!existsSync(join(dir, 'undeletable.png'))) fail(`11: undeletable.png still on disk per mock`);
+    testNum++;
+  }
+
+  // 12. R2-followup: pass 2 (LRU) — unlink failure must NOT silently
+  //     subtract from totalSize. Pre-followup THIS was the real bug:
+  //     undeletable file's bytes were subtracted as if freed, and the
+  //     entry was dropped from survivors → finalSize and remaining
+  //     lied about actual disk state.
+  {
+    const dir = mkdtempSync(join(tmp, 'lru-eacces-'));
+    // 3 files × 100MB each, cap 150MB → must evict 2 oldest.
+    // Make the oldest undeletable. Expected: middle+newest survive
+    // (size-evict middle one too since cap is 150MB and oldest blocks
+    // 100MB), undeletable counted in finalSize.
+    makeFile(dir, 'lru-old.png', 100 * MB, NOW - 3 * 60_000);
+    makeFile(dir, 'lru-mid.png', 100 * MB, NOW - 2 * 60_000);
+    makeFile(dir, 'lru-new.png', 100 * MB, NOW - 1 * 60_000);
+    const r = await gcInbox({
+      dir,
+      maxAgeMs: 7 * DAY_MS,
+      maxSizeBytes: 150 * MB,
+      now: NOW,
+      unlinkFn: async (p) => {
+        if (p.endsWith('lru-old.png')) {
+          throw Object.assign(new Error('mock EACCES'), { code: 'EACCES' });
+        }
+        const realFs = await import('node:fs/promises');
+        return realFs.unlink(p);
+      },
+    });
+    // Loop: shift old → unlink fails → undeletable. Still over cap (300MB).
+    //       shift mid → unlink succeeds → totalSize=200MB. Still over cap.
+    //       shift new → unlink succeeds → totalSize=100MB. Under cap, exit.
+    // Wait — that would leave NOTHING behind that we wanted to keep.
+    // Re-check: survivors after sort = [old, mid, new]. Cap is 150MB.
+    // After shift+fail(old): totalSize=300 (unchanged). survivors=[mid, new].
+    // After shift+succeed(mid): totalSize=200. survivors=[new]. Still > cap.
+    // After shift+succeed(new): totalSize=100. Under cap, exit.
+    // Push undeletables back into survivors: survivors=[old].
+    // So: removed=2 (mid, new), bytesFreed=200MB, finalSize=100MB (only
+    // the old's 100MB), remaining=1 (only old).
+    if (r.removed !== 2) fail(`12: 2 files actually deleted (mid+new), got ${r.removed}`);
+    if (r.bytesFreed !== 200 * MB) fail(`12: bytesFreed should be 200MB, got ${r.bytesFreed}`);
+    // Pre-followup: totalSize would have been mis-subtracted on the
+    // first iteration → finalSize=0, remaining=0. THE BUG.
+    // Post-followup: undeletable's bytes never subtracted → finalSize=100MB.
+    if (r.finalSize !== 100 * MB) {
+      fail(`12 (THE BUG): finalSize must reflect undeletable still on disk, got ${r.finalSize} (pre-fix would have reported 0)`);
+    }
+    if (r.remaining !== 1) {
+      fail(`12 (THE BUG): remaining must count the undeletable, got ${r.remaining} (pre-fix would have reported 0)`);
+    }
+    if (!existsSync(join(dir, 'lru-old.png'))) fail(`12: undeletable file still on disk per mock`);
+    if (existsSync(join(dir, 'lru-mid.png'))) fail(`12: lru-mid should be evicted`);
+    if (existsSync(join(dir, 'lru-new.png'))) fail(`12: lru-new should be evicted`);
+    testNum++;
+  }
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }
