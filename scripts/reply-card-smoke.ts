@@ -312,7 +312,12 @@ async function run() {
     identitySession.setCaller('chat_cron', cronThread, 'ou_cron_owner');
     identitySession.setCaller('chat_cron', 'thr_real_user', 'ou_real_user');
 
-    // Sub-case a: cron-thread → buffer.recorded stays at 0
+    // Sub-case a: cron-thread → buffer.recorded stays at 0, BUT the
+    // Feishu send still happens (we're only suppressing the buffer
+    // record, not the actual reply delivery — cron users still see
+    // the message). R2-followup: assert apiCalls confirms send
+    // happened so a future regression that disables both the record
+    // AND the send is caught here.
     apiCalls.length = 0;
     buffer.recorded.length = 0;
     await replyHandler({
@@ -323,8 +328,11 @@ async function run() {
     if (buffer.recorded.length !== 0) {
       fail(`8b-cron: cron-thread reply must NOT record (got ${buffer.recorded.length})`);
     }
+    if (apiCalls.length === 0) {
+      fail(`8b-cron: cron-thread reply must still SEND to Feishu (got 0 API calls)`);
+    }
 
-    // Sub-case b: non-cron thread → buffer.recorded === 1
+    // Sub-case b: non-cron thread → buffer.recorded === 1 AND send happens
     apiCalls.length = 0;
     buffer.recorded.length = 0;
     await replyHandler({
@@ -334,6 +342,9 @@ async function run() {
     });
     if (buffer.recorded.length !== 1) {
       fail(`8b-sanity: non-cron-thread reply MUST record (got ${buffer.recorded.length})`);
+    }
+    if (apiCalls.length === 0) {
+      fail(`8b-sanity: non-cron-thread reply must SEND (got 0 API calls)`);
     }
   }
 

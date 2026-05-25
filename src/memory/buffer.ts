@@ -31,7 +31,17 @@ export class ConversationBuffer {
   private readonly maxMessages: number;
 
   constructor(opts?: { maxMessages?: number }) {
-    this.maxMessages = opts?.maxMessages ?? appConfig.bufferMaxMessages;
+    // R2-followup: nullish-coalescing accepts 0 (false-ish but not
+    // null), which would make `length >= 0` true on the very first
+    // push — force-flush on every record. The env path is guarded by
+    // `optionalPositiveNumber` (#109 hardening), but the constructor
+    // override path bypassed that. Reject non-positive override here
+    // and snap back to the env-default with the same shape.
+    const override = opts?.maxMessages;
+    if (override != null && override <= 0) {
+      throw new Error(`ConversationBuffer: maxMessages must be > 0, got ${override}`);
+    }
+    this.maxMessages = override ?? appConfig.bufferMaxMessages;
   }
 
   setFlushHandler(handler: FlushHandler): void {

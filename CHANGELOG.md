@@ -34,6 +34,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - 5: per-chat independence (chat A at cap flushes; chat B unaffected)
 - New `reply-card-smoke.ts` test 8b: cron-thread reply (`thread_id` prefixed with `JOB_THREAD_PREFIX`) does NOT record into the buffer; non-cron-thread reply DOES (sanity check the detection isn't over-eager).
 
+### R1-audit followups (closed in this PR)
+- **Test 8b stale-ordering bug** — the "sanity check" (non-cron-thread DOES record) was effectively dead code: the first non-cron call ran BEFORE its identity was bound, then `buffer.recorded.length = 0` wiped the result before assertion. R1 caught the test could have silently passed even if the cron-skip logic broke on the first attempt. Fixed: bind both identities up front, two clean sub-cases (8b-cron expects 0 records, 8b-sanity expects 1).
+- **`isCronOriginated` alias** — `recordReply` reused the `isSyntheticThread` flag (also load-bearing for thread-routing). A future narrowing of the routing flag would have silently changed buffer behavior. Local alias with a comment forces the future maintainer to think about both consumers.
+
+### R2-audit followups (closed in this PR)
+- **`ConversationBuffer` constructor rejects `maxMessages <= 0`** — nullish coalescing accepted `0` (force-flush every push). Env path was guarded by `optionalPositiveNumber` (#109 hardening); constructor path bypassed it. Now throws at construct time to match the env-hardening contract.
+- **Test 8b also asserts `apiCalls.length > 0`** — pre-followup the test only checked `buffer.recorded.length`. A future regression that disabled both the buffer record AND the actual Feishu send (e.g. confused cron-skip with full short-circuit) would have passed the original assertion. Now both sub-cases (cron + non-cron) confirm send happened.
+
+### R2-audit findings filed as followups
+- **#148 — Concurrent `record()` between `flushing.delete` and `buffers.delete` is silently wiped.** Pre-existing race in `triggerFlush`'s cleanup sequence — not introduced by this PR. Race window is microscopically small (microtasks between finally and the next sync statement). Fix is straightforward (move buffer/timer cleanup INTO the finally before `flushing.delete`), filed for a focused PR.
+
 ### Operator notes
 - No data-format or config changes; existing buffers carry over.
 - Pre-#110 deployments may have accumulated large in-memory buffers for chats with active cronjobs. On first restart after upgrade those buffers are dropped (they're in-memory only) — no on-disk impact. Future flushes will produce cleaner episodes since cron output is no longer recorded.
