@@ -81,6 +81,48 @@ export class ConversationBuffer {
     return this.buffers.get(chatId) ?? [];
   }
 
+  /**
+   * Replace the most-recent assistant entry's text in the given chat's
+   * buffer (#111). Walks backwards from the end of the buffer.
+   *
+   * Use case: `edit_message` tool — when Claude patches a previously
+   * sent bot message, the buffer's stored assistant text becomes
+   * stale; this keeps distillation aligned with what the user
+   * actually saw.
+   *
+   * Returns true iff an assistant entry was found and updated. Returns
+   * false for:
+   *  - chat has no buffer (nothing was ever recorded)
+   *  - buffer exists but has no assistant entries (only user messages)
+   *  - the buffer is mid-flush (skipped — the distillation snapshot was
+   *    already taken via `[...messages]` before the await; mutating
+   *    afterwards would land in a buffer that's about to be wiped by
+   *    `triggerFlush`'s cleanup, so the edit would be silently lost)
+   *
+   * NOTE: this is the simplest possible fix shape — only catches the
+   * most-recent assistant entry. If Claude edits a much-earlier
+   * message (e.g. patching a card from 50 turns ago), this won't
+   * find it. The common case (correct-the-mistake-Claude-just-made)
+   * is covered; precise per-message-id tracking is filed as a future
+   * improvement if needed.
+   */
+  replaceLastAssistant(chatId: string, newText: string): boolean {
+    if (this.flushing.has(chatId)) return false;
+    const arr = this.buffers.get(chatId);
+    if (!arr) return false;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i].role === 'assistant') {
+        arr[i] = {
+          ...arr[i],
+          text: newText,
+          timestamp: new Date().toISOString(),
+        };
+        return true;
+      }
+    }
+    return false;
+  }
+
   clear(chatId: string): void {
     this.buffers.delete(chatId);
     this.clearTimer(chatId);
