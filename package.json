@@ -1,6 +1,6 @@
 {
   "name": "claude-lark-plugin",
-  "version": "1.0.39",
+  "version": "1.0.40",
   "description": "Claude Code channel plugin for Feishu/Lark — chat with Claude through Feishu with local-file memory and scheduled jobs",
   "type": "module",
   "main": "src/index.ts",
@@ -26,5 +26,17 @@
   "engines": {
     "node": ">=20.0.0"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "//overrides": "Transitive CVE pins (#94, v1.0.40). Source SDK varies per dep (R2-followup): axios/protobufjs/@protobufjs/utf8/qs/ws come via @larksuiteoapi/node-sdk; hono/fast-uri/ip-address/follow-redirects come via @modelcontextprotocol/sdk (through @hono/node-server / ajv / express-rate-limit / etc). When unpinning, check which SDK's upstream actually shipped the fix. Stay within the same major as whichever SDK declared the dep, to avoid breaking it (e.g. protobufjs 7.x not 8.x). NOTE (R1-followup): the axios override widens the SDK's `~1.13.3` tilde-pin to `^1.15.2` (caret), resolving to ~1.16.x. The Lark SDK doesn't use the parseProtocol / unescape / maxBodyLength / maxContentLength APIs that changed across 1.13→1.16 (verified via grep of its single-file bundle), so risk is low in practice — but watch for SDK breakage if you bump it later. Of the 4 deps Lark SDK declares directly (axios, protobufjs, qs, ws), only axios has this widening; the other 3 overrides stay within their caret-style declared ranges.",
+  "overrides": {
+    "axios": "^1.15.2",
+    "protobufjs": "^7.5.8",
+    "@protobufjs/utf8": "^1.1.1",
+    "fast-uri": "^3.1.2",
+    "follow-redirects": "^1.16.0",
+    "hono": "^4.12.18",
+    "ip-address": "^10.1.1",
+    "qs": "^6.15.2",
+    "ws": "^8.20.1"
+  }
 }
