@@ -1,6 +1,7 @@
 import type { BufferedMessage } from './buffer.js';
 import { flushPrompt, profileDistillationPrompt, wrapEnrichmentSection } from '../prompts.js';
 import { applyL1, loadL2Rules } from '../privacy-rules.js';
+import { audit as defaultAudit } from '../audit-log.js';
 
 /**
  * Distillation Stage 1: Buffer → Episode.
@@ -164,6 +165,21 @@ export interface ProfileDistillDeps {
   loadL2Rules?: () => Promise<string>;
   /** Optional override for the "now" timestamp — used by tests. */
   nowFn?: () => number;
+  /**
+   * Optional override for the audit-log writer. Defaults to the global
+   * `audit()` from `src/audit-log.ts`. Injectable so unit tests can
+   * assert that Stage 2 dispatches (and skip outcomes) are recorded
+   * without touching the operator's real `~/.claude/channels/lark/audit.log`.
+   *
+   * #176 fix (v1.0.58): pre-fix Stage 2 only logged to stderr — operators
+   * who enabled `LARK_PROFILE_DISTILL_ENABLED=true` had no audit-log
+   * trail for the autonomous Claude turns. Every dispatch, cooldown,
+   * and no-episodes skip now writes one line (tool='profile-distill-
+   * dispatch', outcome='ok' regardless of subroute — `reason` field
+   * distinguishes them in args). Per-user `error` outcomes write with
+   * outcome='error'. Pattern mirrors `src/tools.ts` boundary writes.
+   */
+  audit?: typeof defaultAudit;
 }
 
 export interface ProfileDistillOpts {
@@ -196,6 +212,7 @@ export async function triggerProfileDistillation(
   const now = (deps.nowFn ?? Date.now)();
   const chatType: 'p2p' | 'group' = deps.isPrivateChat(chatId) ? 'p2p' : 'group';
   const maxEpisodes = opts.maxEpisodes ?? 10;
+  const audit = deps.audit ?? defaultAudit;
 
   // L2 rules: global per-operator, shared across users in this pass.
   let l2Rules = '';
@@ -213,6 +230,14 @@ export async function triggerProfileDistillation(
         const remainHrs = ((opts.cooldownMs - (now - lastRun)) / 3_600_000).toFixed(1);
         console.error(`[distill-stage2] user ${userId} in cooldown (${remainHrs}h remaining); skipping`);
         outcomes[userId] = 'cooldown';
+        // #176: skip is still operator-visible activity. Use outcome='ok'
+        // because the gate functioned correctly (not an error); the
+        // `reason` arg distinguishes it from a real dispatch.
+        void audit('profile-distill-dispatch', userId, {
+          chat_id: chatId,
+          reason: 'cooldown',
+          remain_hours: Number(remainHrs),
+        }, 'ok');
         continue;
       }
       // 2. Min-episodes gate
@@ -220,6 +245,12 @@ export async function triggerProfileDistillation(
       if (episodes.length < opts.minEpisodes) {
         console.error(`[distill-stage2] user ${userId} chat ${chatId}: only ${episodes.length}/${opts.minEpisodes} episodes; skipping`);
         outcomes[userId] = 'no-episodes';
+        void audit('profile-distill-dispatch', userId, {
+          chat_id: chatId,
+          reason: 'no-episodes',
+          episode_count: episodes.length,
+          min_required: opts.minEpisodes,
+        }, 'ok');
         continue;
       }
       // 3. Gather inputs
@@ -257,9 +288,24 @@ export async function triggerProfileDistillation(
       //    failed Claude turns won't retry-storm into the next flush).
       opts.cooldownState.set(userId, now);
       outcomes[userId] = 'dispatched';
+      // #176: real dispatch audit-log entry. Operators grep
+      // `tool=profile-distill-dispatch outcome=ok` and exclude
+      // reason!=undefined rows to count actual Claude turns spent.
+      void audit('profile-distill-dispatch', userId, {
+        chat_id: chatId,
+        reason: 'dispatched',
+        episode_count: recentEpisodes.length,
+        distill_key: distillKey,
+        chat_type: chatType,
+      }, 'ok');
     } catch (err: any) {
       console.error(`[distill-stage2] user ${userId} failed: ${err?.message ?? err}`);
       outcomes[userId] = 'error';
+      void audit('profile-distill-dispatch', userId, {
+        chat_id: chatId,
+        reason: 'error',
+        error_message: String(err?.message ?? err).slice(0, 120),
+      }, 'error');
     }
   }
 
