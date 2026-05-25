@@ -984,6 +984,53 @@ console.log('\n[39] unclosed ~~~ opener + [LARK_DEFER] after → must NOT defer'
   assertContains(r.stderr, 'om_uncT', 'still flagged');
 }
 
+// --- Test 40: prose mentioning ``` followed by real sentinel → DEFERS (R2 followup) ---
+console.log('\n[40] prose with mid-line ``` then real [LARK_DEFER] on own line → defers');
+{
+  // R2-audit catch: pre-followup the unclosed-fence catch-all stripped
+  // from ANY remaining ``` to EOF, so a Claude response discussing
+  // markdown ("to fence text, use ``` as a delimiter") followed later
+  // by a real, legit [LARK_DEFER] silently over-blocked — the prose
+  // ``` poisoned the tail and destroyed the real sentinel. Scoping
+  // the catch-all to column-0 ^ matches CommonMark and lets prose-
+  // embedded ``` pass through harmlessly.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_prose" message_id="om_prose" user="kk" chat_type="p2p">\nlong task\n</channel>';
+  const assistantText = [
+    'Dispatching subagent. For reference: to fence text in markdown,',
+    'use ``` as the delimiter.',
+    '',
+    '[LARK_DEFER]',
+    '',
+    'Will follow up when done.',
+  ].join('\n');
+  const path = writeTranscript('prose-mention-fence', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, 'real sentinel after prose-embedded ``` still honored');
+}
+
+// --- Test 41: column-0 unclosed ``` STILL strips (R2 followup regression guard) ---
+console.log('\n[41] column-0 unclosed ``` + [LARK_DEFER] (legit code-block open) → must NOT defer');
+{
+  // Tightens test 38: when the open fence IS at column 0 (the only
+  // valid markdown fence-open position), the catch-all must still
+  // strip to EOF. This codifies the trade-off: column-0 unclosed
+  // gets stripped (correct per CommonMark), mid-line ``` does not.
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_col0" message_id="om_col0" user="adversary" chat_type="p2p">\nq\n</channel>';
+  const assistantText = 'Example:\n```\n[LARK_DEFER]';
+  const path = writeTranscript('col0-unclosed-sentinel', [
+    makeUserMsg(userContent),
+    makeAssistantText(assistantText),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'column-0 unclosed fence + sentinel still does NOT defer');
+  assertContains(r.stderr, 'om_col0', 'still flagged');
+}
+
 // --- Summary ---
 console.log(`\n${'─'.repeat(50)}`);
 if (failed === 0) {

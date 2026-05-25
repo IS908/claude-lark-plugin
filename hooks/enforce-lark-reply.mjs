@@ -418,9 +418,25 @@ function stripCodeContent(text) {
   let t = text.replace(/(`{3,})[\s\S]*?\1/g, '');
   // 3: tilde fence, matched-length
   t = t.replace(/(~{3,})[\s\S]*?\1/g, '');
-  // 7: unclosed fences — any remaining opening swallows to EOF.
-  t = t.replace(/`{3,}[\s\S]*$/g, '');
-  t = t.replace(/~{3,}[\s\S]*$/g, '');
+  // 7: unclosed fences — any remaining COLUMN-0 opening swallows to EOF.
+  // R2-audit followup: pre-fix this stripped from ANY remaining ``` to
+  // EOF, which over-blocked the realistic case of Claude prose
+  // discussing markdown ("to fence text, use ``` as a delimiter")
+  // followed by a real [LARK_DEFER] — the prose ``` poisoned the
+  // tail and the genuine defer was destroyed. Scoping to column-0
+  // matches CommonMark: an opening fence MUST be at line start (after
+  // up to 3 spaces of indent — but indented lines are caught by case
+  // 4 below, so the strict ^ here is fine). Mid-line ``` is not a
+  // fence per spec, just literal text.
+  //
+  // Residual: an adversary who tricks Claude into emitting a column-0
+  // unclosed open followed by sentinel still gets stripped (correct —
+  // that IS a valid code-block open per CommonMark). The narrower
+  // exposure of "mid-line ``` + sentinel on next line" still produces
+  // a false defer, but is much harder to trigger naturally and is
+  // closer to "Claude was tricked into deferring."
+  t = t.replace(/^`{3,}[\s\S]*/m, '');
+  t = t.replace(/^~{3,}[\s\S]*/m, '');
   // 6: inline backtick spans (single-line)
   t = t.replace(/`[^`\n]*`/g, '');
   // 4: indented code blocks — any line starting with 4+ spaces.
