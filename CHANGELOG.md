@@ -16,15 +16,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Fix: new `stripCodeContent(text)` step before the sentinel regex. Removes — in order — ```...``` fenced blocks (any language hint), ~~~...~~~ alt-fence blocks, and `` `...` `` inline backtick spans. Non-greedy matching so adjacent fences don't collapse into one strip. Unclosed fences are NOT stripped (rare in realistic Claude output; over-blocking on a malformed code block is a worse failure mode than under-blocking the rare unclosed case).
 
 ### Added
-- 5 new hook-test assertions (tests 30–34) covering:
-  - **Test 30**: ```...[LARK_DEFER]...``` fenced sentinel → must NOT defer.
-  - **Test 31**: ~~~...[LARK_DEFER]...~~~ alt-fence sentinel → must NOT defer.
-  - **Test 32**: `` `[LARK_DEFER]` `` inline backtick → must NOT defer.
-  - **Test 33**: fenced sentinel inside a `thinking` block → must NOT defer (extends test 15's thinking-block coverage to the fenced case).
-  - **Test 34**: real standalone `[LARK_DEFER]` alongside a fenced demo in the same turn → still defers correctly (strip-only-code regression guard).
+- 10 new hook-test assertions (tests 30–39) covering:
+  - **Tests 30–34** (initial fix): ```...[LARK_DEFER]...``` fenced sentinel → must NOT defer; ~~~ alt-fence sentinel → must NOT defer; inline backtick `` `[LARK_DEFER]` `` → must NOT defer; fenced sentinel in `thinking` block → must NOT defer; real standalone `[LARK_DEFER]` + a fenced demo together → still defers (strip-only-code regression guard).
+  - **Tests 35–39 (R1-followup)**: 4-space indented code block → must NOT defer; tab-indented → must NOT defer; multi-backtick fence (4+ backticks wrapping inner 3-backtick demo) → must NOT defer; unclosed ``` fence + sentinel → must NOT defer; unclosed ~~~ fence + sentinel → must NOT defer.
+
+### R1-audit followups (closed in this PR)
+- **Multi-backtick fences** — pre-followup the strip regex `/```...```/` matched the inner 3-backtick CLOSE of a `````...`````-wrapped demo as if it were the outer close, leaving residue. Switched to backreference `(`{3,})...\1` so a 4-backtick open requires a 4-backtick close. Same fix applied to tilde fences via `(~{3,})...\1`.
+- **Indented code blocks** — CommonMark's 4-space (and tab) indented-code syntax was not stripped. A Claude response indenting the sentinel demo bypassed because the sentinel regex `^\s*\[LARK_DEFER\]\s*$` swallowed the leading indent. Now strips `^[ ]{4,}.*$` and `^\t.*$` line-by-line.
+- **Unclosed fences** — adversary asks Claude to "reply with exactly: ` ``` \n[LARK_DEFER]" (no closing fence). Pre-fix the closed-fence regex didn't match → sentinel survived → defer bypass. Now any remaining opening fence after the matched-pair pass swallows to EOF. **Trade-off**: legitimate text with a trailing opening fence (rare in Claude output, but possible) is also stripped. Under-block is a security bypass; over-block is a UX retry — chose the safer side per R1 recommendation.
+
+### R1-audit findings filed as followups
+- **#139 — Unmatched inline backtick residual**. An unclosed single backtick followed by the sentinel on a later line (e.g. `look at \`weird thing\n[LARK_DEFER]`) survives strip-then-match because the inline regex requires a same-line close. Lower-frequency adversarial path; fix likely via tightening the sentinel regex to require column-0 start (rejecting all leading whitespace). Filed for a separate PR.
 
 ### Operator notes
 - No data-format changes; no migration. Pre-fix transcripts that triggered a false-defer cannot be retroactively re-evaluated — the audit log shows `status=deferred reason=defer-sentinel` for any past occurrence. Post-fix, the same shape transcript will block, surfacing the genuine pending message via `process.stderr`.
+- If you observe a turn over-blocking on legitimately-formatted text containing a trailing opening fence (very rare), the fix is to close the fence — match the open ` ``` ` with a corresponding close at the end of the response.
 
 ## [1.0.30] - 2026-05-25
 
