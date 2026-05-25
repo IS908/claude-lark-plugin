@@ -6,6 +6,23 @@ npx tsc --noEmit
 echo "PASS"
 
 echo ""
+echo "=== npm audit (high+ severity, production deps) ==="
+# #94 CI gate: fail red if any HIGH or CRITICAL CVE lands in the
+# production dependency tree. Most CVEs come in transitively via
+# @larksuiteoapi/node-sdk; the `overrides` block in package.json pins
+# each affected transitive to a patched version. A new CVE discovered
+# in any production dep after this point fails CI immediately so the
+# operator must add a new override (or wait for an SDK upstream bump)
+# rather than silently shipping vulnerable code.
+#
+# `--omit=dev` excludes devDependencies (tsx / typescript / @types/node).
+# `--audit-level=high` keeps moderate-level signal in stderr but only
+# exits non-zero on high+. Adjust to `moderate` if your deployment
+# context requires it.
+npm audit --omit=dev --audit-level=high
+echo "PASS"
+
+echo ""
 echo "=== Dry-run (module loading) ==="
 npm run --silent start -- --dry-run 1>/tmp/lark-test-stdout.txt 2>/tmp/lark-test-stderr.txt
 echo "PASS"

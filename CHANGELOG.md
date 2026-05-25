@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.40] - 2026-05-25
+
+### Fixed
+- **Vulnerable transitive deps via `@larksuiteoapi/node-sdk` — 22 CVEs covering SSRF / prototype pollution / DoS** (#94 — **HIGH supply-chain risk, persistent-daemon amplification**). `npm audit --omit=dev` showed 11 active vulns (1 CRITICAL, 3 HIGH, 7 MOD) across 9 transitive packages, all reachable via the Lark SDK's dep tree:
+
+  | Package | Pre-fix | Post-fix | Worst CVE |
+  |---|---|---|---|
+  | `axios` | ≤ 1.15.1 | `^1.15.2` | HIGH ×16 — SSRF via NO_PROXY bypass, prototype pollution in `validateStatus` / `parseReviver` / `withXSRFToken`, CRLF injection, null-byte injection, cloud metadata exfiltration |
+  | `protobufjs` | ≤ 7.5.7 | `^7.5.8` | **CRITICAL** — arbitrary code execution via bytes field defaults in generated `toObject` code |
+  | `@protobufjs/utf8` | ≤ 1.1.0 | `^1.1.1` | MOD — overlong UTF-8 decoding |
+  | `fast-uri` | ≤ 3.1.1 | `^3.1.2` | HIGH ×2 — path traversal via percent-encoded dot segments, host confusion via percent-encoded authority delimiters |
+  | `follow-redirects` | ≤ 1.15.11 | `^1.16.0` | MOD — leaks custom auth headers to cross-domain redirect targets |
+  | `hono` | ≤ 4.12.17 | `^4.12.18` | MOD ×6 — JSX SSR HTML/CSS injection, JWT NumericDate misvalidation, Vary-header cache leakage, bodyLimit bypass |
+  | `ip-address` | ≤ 10.1.0 | `^10.1.1` | MOD — XSS in Address6 HTML-emitting methods |
+  | `qs` | 6.11.1–6.15.1 | `^6.15.2` | MOD — DoS via `qs.stringify` crash on null/undefined entries with comma-format + encodeValuesOnly |
+  | `ws` | 8.0.0–8.20.0 | `^8.20.1` | MOD — uninitialized memory disclosure |
+
+  The Lark SDK upstream has not yet bumped to take the patched versions, so the fix uses `package.json` `overrides` to pin each transitive directly. Stayed within the SAME major as the SDK's declared range (e.g. `protobufjs` 7.x not 8.x) to avoid breaking SDK consumers. Re-evaluate / unpin when the SDK ships fixes upstream.
+
+  **Why this matters for a daemon**:
+  - The bot runs as a long-lived stdio MCP process. Prototype pollution is persistent-process amplified — once a pollution-gadget CVE fires, the process is contaminated until restart, affecting every subsequent inbound message.
+  - Combined with the path-traversal defenses (#93 / #108) already in place, axios's NO_PROXY bypass + cloud metadata exfiltration would have been a chained SSRF → local-disk-write vector.
+  - The README + CLAUDE.md both claim "trust boundary is OS file permissions" — vulnerable transitive deps weaken that assumption.
+
+### Added
+- **`scripts/test.sh` audit gate** — runs `npm audit --omit=dev --audit-level=high` early in the suite. CI fails red if any HIGH or CRITICAL CVE lands in the production dep tree. Forces the operator to either add a new override or wait for an upstream SDK bump, rather than silently shipping vulnerable code.
+- `package.json` `overrides` block with 9 pinned versions. Adjacent `//overrides` comment field documents the rationale + the "stay within SDK's declared major" constraint.
+
+### Operator notes
+- No code changes; no env vars added. The override block only changes which version of each package npm resolves to. SDK API surface is unchanged — same `client.im.v1.message.*` calls work as before.
+- Run `npm install` (or just restart the plugin's auto `prestart`) to apply. `npm audit --omit=dev` should report `found 0 vulnerabilities`.
+- **Upstream SDK bump tracking**: when `@larksuiteoapi/node-sdk` ships a release that depends on patched transitive versions natively, the overrides become no-ops (npm prefers the SDK's spec when it's already satisfied). Safe to leave indefinitely; can be removed in a future cleanup pass.
+- The audit gate uses `--audit-level=high`. Moderate-level CVEs are reported on stderr but don't fail CI. Adjust to `moderate` if your deployment requires stricter posture.
+
 ## [1.0.39] - 2026-05-25
 
 ### Fixed

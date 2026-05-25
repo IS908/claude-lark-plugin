@@ -1,6 +1,6 @@
 {
   "name": "claude-lark-plugin",
-  "version": "1.0.39",
+  "version": "1.0.40",
   "description": "Claude Code channel plugin for Feishu/Lark — chat with Claude through Feishu with local-file memory and scheduled jobs",
   "type": "module",
   "main": "src/index.ts",
@@ -26,5 +26,17 @@
   "engines": {
     "node": ">=20.0.0"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "//overrides": "Transitive CVE pins (#94, v1.0.40). All come in via @larksuiteoapi/node-sdk's dep tree; upstream hasn't bumped yet so we override directly. Stay within the same major as the SDK's declared range to avoid breaking it (e.g. protobufjs 7.x not 8.x). Re-evaluate / unpin when the SDK ships fixes upstream.",
+  "overrides": {
+    "axios": "^1.15.2",
+    "protobufjs": "^7.5.8",
+    "@protobufjs/utf8": "^1.1.1",
+    "fast-uri": "^3.1.2",
+    "follow-redirects": "^1.16.0",
+    "hono": "^4.12.18",
+    "ip-address": "^10.1.1",
+    "qs": "^6.15.2",
+    "ws": "^8.20.1"
+  }
 }
