@@ -8,6 +8,7 @@ import { MessageQueue } from './queue.js';
 import { LARK_ID_REGEX } from './tools.js';
 import { TTLCache } from './ttl-cache.js';
 import { appendWithRotationSync } from './log-rotation.js';
+import { withFeishuRetry } from './feishu-retry.js';
 import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
@@ -600,10 +601,26 @@ export class LarkChannel {
     // Fire-and-forget ack reaction (Typing for P2P, MeMeMe for group @bot)
     const ackEmoji = chatType === 'p2p' ? 'Typing' : appConfig.ackEmoji;
     if (ackEmoji) {
-      this.client.im.v1.messageReaction.create({
-        path: { message_id: messageId },
-        data: { reaction_type: { emoji_type: ackEmoji } },
-      }).then((resp: any) => {
+      // #112 fix: wrap in withFeishuRetry so a rate-limit (99991400 /
+      // 99991663) doesn't silently disappear. Pre-fix the bare
+      // `.catch(() => {})` swallowed every error including transient
+      // ones; users saw the bot "go dead" in a busy group when the
+      // per-bot reaction QPS limit kicked in. With retry, transient
+      // failures get up to 3 short backoff attempts (500ms / 1500ms
+      // / 5000ms); on final exhaustion we debugLog the reason for
+      // operator visibility rather than silently no-oping.
+      withFeishuRetry(
+        () => this.client.im.v1.messageReaction.create({
+          path: { message_id: messageId },
+          data: { reaction_type: { emoji_type: ackEmoji } },
+        }),
+        {
+          label: 'ack',
+          onRetry: (attempt, delayMs, err) => {
+            debugLog(`[channel] ack retry ${attempt} after ${delayMs}ms (${(err as any)?.message ?? err})`);
+          },
+        },
+      ).then((resp: any) => {
         const reactionId = resp?.data?.reaction_id;
         if (reactionId) {
           // addedAt timestamp powers the TTL backstop (#85): pruneStaleAcks
@@ -612,7 +629,12 @@ export class LarkChannel {
           // forever or leak Map memory.
           this.ackReactions.set(messageId, { reactionId, addedAt: Date.now() });
         }
-      }).catch(() => {});
+      }).catch((err) => {
+        // #112: at least log on final exhaustion so an operator can see
+        // why a user's MeMeMe never landed. Silent-swallow pre-fix made
+        // this invisible.
+        debugLog(`[channel] ack gave up for ${messageId}: ${(err as any)?.message ?? err}`);
+      });
     }
 
     // Parse mentions

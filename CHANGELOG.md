@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.37] - 2026-05-25
+
+### Fixed
+- **Feishu rate-limit (99991663 / 99991400) silently swallowed on ack + no retry on `reply` / `edit_message` / `react`** (#112 — **MEDIUM ack-disappears + reply retry-storm**). The scheduler had a proper retry-with-backoff for transient errors (30s/60s/120s, full coverage of rate-limit + 5xx + network), but the HOT-PATH call sites duplicated none of that classification:
+  - **ack-reaction `messageReaction.create`** (channel.ts): `.then(...).catch(() => {})` — bare swallow. A rate-limit hit (per-bot reaction QPS limit ~50, easily reached in a busy group with bursts of @-mentions) silently dropped the ack. User saw "the bot died" with no signal.
+  - **`reply`** (tools.ts text/card paths): rate-limit threw immediately → Stop hook treated as unreplied → forced retry → again rate-limit → death-spin until the turn budget. The retry storm was the user-visible symptom; the root cause was treating transient errors as permanent.
+  - **`edit_message`**, **`react` tool**: same shape, same exposure.
+
+  Fix: new `src/feishu-retry.ts` exports the consolidated classification (`isRetryableError`, `PERMANENT_TARGET_CODES`, `getFeishuApiCode`, `getFeishuApiMsg`) — moved out of `scheduler.ts` (which now imports them back, preserving its existing API). New `withFeishuRetry(op, opts)` harness with configurable delay schedules:
+  - **Scheduler context** (cronjob async): keeps existing 30s / 60s / 120s schedule.
+  - **Hot path** (user-facing reply): new `HOT_PATH_RETRY_DELAYS_MS = [500, 1500, 5000]`. Total worst case ~7s, then surface the error.
+
+  Permanent errors (`PERMANENT_TARGET_CODES`, `230001` param error) short-circuit via `isRetryableError(false)` — no wasted retries on a kicked-bot / chat-gone scenario.
+
+  Wired at every hot-path send:
+  - `channel.ts` ack-reaction (with `onRetry` debugLog breadcrumb + final-exhaust debugLog instead of silent swallow)
+  - `tools.ts` `sendFollowup` (covers all card chunks beyond the first, attachment uploads' followup send)
+  - `tools.ts` raw card path (`message.reply` / `message.create` first call)
+  - `tools.ts` text path first-chunk reply
+  - `tools.ts` `edit_message` `message.patch`
+  - `tools.ts` `react` tool's `messageReaction.create`
+
+### Added
+- New module `src/feishu-retry.ts` — shared classification + harness. Exports `isRetryableError`, `withFeishuRetry`, `getFeishuApiCode`, `getFeishuApiMsg`, `PERMANENT_TARGET_CODES`, `HOT_PATH_RETRY_DELAYS_MS`. `WithFeishuRetryOptions` lets callers customize delays, attach a label for logs, and pass an `onRetry` breadcrumb callback.
+- New `scripts/feishu-retry-smoke.ts` (19 tests, wired into `scripts/test.sh`):
+  - Part A (9): `isRetryableError` classification — rate-limit codes, permanent target codes, param error, HTTP 429/5xx, HTTP 4xx non-429, network errors with `.code` + `.cause.code`, message heuristics (`timeout` / `econnreset`), generic unclassified, 9999xxxx generic.
+  - Part B (2): `getFeishuApiCode` / `getFeishuApiMsg` extraction with fallbacks.
+  - Part C (8): `withFeishuRetry` — first-attempt success, permanent error short-circuit, transient success after retries, exhaustion-throws-last-error, `onRetry` callback firing, mixed transient→permanent aborts on permanent, default `HOT_PATH_RETRY_DELAYS_MS` shape + total budget ≤ 10s, empty `delays` array → no retries.
+
+### Changed
+- `src/scheduler.ts` re-exports `PERMANENT_TARGET_CODES`, `getFeishuApiCode`, `getFeishuApiMsg` for back-compat (existing `tools.ts` imports from `./scheduler.js`). The internal `isRetryableError` and the `RETRYABLE_NETWORK_ERRORS` / `RETRYABLE_HTTP_CODES` constants are now sourced from `./feishu-retry.js`. No behavior change for the scheduler — same classification, same delay schedule.
+
+### Operator notes
+- No data-format or config changes; no env vars added.
+- Pre-#112 deployments may have seen sporadic "ack didn't land" or "reply death-spiral" issues in busy groups; both should be resolved post-deploy without intervention.
+- The new debug log lines `[channel] ack retry N after Xms (...)`  and `[reply.text.first|reply.card.first|reply.followup|edit_message|react] retry N after Xms` give operator visibility into retry frequency. If the log fills with retries (sustained rate-limit), the deployment may need to throttle inbound traffic or request a Feishu rate-limit increase.
+- Total hot-path retry budget is bounded at ~7s (500+1500+5000ms). A reply that takes longer than that under rate-limit pressure surfaces the error to Claude, which will see it in the tool result and can decide what to do next (defer, retry differently, etc.).
+
 ## [1.0.36] - 2026-05-25
 
 ### Fixed

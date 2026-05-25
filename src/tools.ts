@@ -13,6 +13,7 @@ import { audit } from './audit-log.js';
 import { buildCards, shouldUseCard } from './feishu-card.js';
 import { parseTieredProfile } from './memory/distiller.js';
 import { JOB_THREAD_PREFIX, PERMANENT_TARGET_CODES, getFeishuApiCode, getFeishuApiMsg } from './scheduler.js';
+import { withFeishuRetry } from './feishu-retry.js';
 import { writeSdkResource, WriteSdkResourceTooLargeError } from './sdk-resource.js';
 
 /**
@@ -410,21 +411,34 @@ export function registerTools(
       const isSyntheticThread = !!thread_id && thread_id.startsWith(JOB_THREAD_PREFIX);
       const shouldStayInThread = !!thread_id && !isSyntheticThread && !!effectiveReplyTo;
       async function sendFollowup(data: { content: string; msg_type: string }): Promise<any> {
-        if (shouldStayInThread) {
-          // `reply_in_thread: true` is a Feishu HTTP API field that routes the
-          // new message into the source's thread without rendering as a quote.
-          // The `@larksuiteoapi/node-sdk` type definitions currently omit it,
-          // hence the cast. Feishu docs:
-          //   https://open.feishu.cn/document/server-docs/im-v1/message/reply
-          return client.im.v1.message.reply({
-            path: { message_id: effectiveReplyTo! },
-            data: { ...data, reply_in_thread: true } as any,
-          });
-        }
-        return client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: { receive_id: chat_id, ...data },
-        });
+        // #112 fix: wrap every send in withFeishuRetry so a Feishu
+        // rate-limit (99991400 / 99991663 — common in busy groups
+        // where the bot replies to multiple users in quick succession)
+        // gets short-backoff retries instead of throwing immediately
+        // and triggering a Stop-hook retry storm. Permanent target
+        // errors (230002 chat-not-found, etc.) short-circuit via
+        // isRetryableError(false), so we don't burn 3 retries on
+        // a kicked-bot scenario.
+        return withFeishuRetry(
+          async () => {
+            if (shouldStayInThread) {
+              // `reply_in_thread: true` is a Feishu HTTP API field that routes the
+              // new message into the source's thread without rendering as a quote.
+              // The `@larksuiteoapi/node-sdk` type definitions currently omit it,
+              // hence the cast. Feishu docs:
+              //   https://open.feishu.cn/document/server-docs/im-v1/message/reply
+              return client.im.v1.message.reply({
+                path: { message_id: effectiveReplyTo! },
+                data: { ...data, reply_in_thread: true } as any,
+              });
+            }
+            return client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: { receive_id: chat_id, ...data },
+            });
+          },
+          { label: 'reply.followup' },
+        );
       }
 
       // Helper: record the bot's reply text into the conversation buffer.
@@ -508,22 +522,27 @@ export function registerTools(
         }
         const content = JSON.stringify(cardObj);
         try {
-          let resp: any;
-          if (effectiveReplyTo) {
-            resp = await client.im.v1.message.reply({
-              path: { message_id: effectiveReplyTo },
-              data: { content, msg_type: 'interactive' },
-            });
-          } else {
-            resp = await client.im.v1.message.create({
-              params: { receive_id_type: 'chat_id' },
-              data: {
-                receive_id: chat_id,
-                content,
-                msg_type: 'interactive',
-              },
-            });
-          }
+          // #112: retry-wrapped — rate-limit / 5xx auto-retry, permanent
+          // target errors short-circuit (handlePermanentTargetError below).
+          const resp: any = await withFeishuRetry(
+            () => {
+              if (effectiveReplyTo) {
+                return client.im.v1.message.reply({
+                  path: { message_id: effectiveReplyTo },
+                  data: { content, msg_type: 'interactive' },
+                });
+              }
+              return client.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: {
+                  receive_id: chat_id,
+                  content,
+                  msg_type: 'interactive',
+                },
+              });
+            },
+            { label: 'reply.card.raw' },
+          );
           const sentId = resp?.data?.message_id;
           if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
         } catch (err: any) {
@@ -556,15 +575,17 @@ export function registerTools(
         for (let i = 0; i < cards.length; i++) {
           const content = JSON.stringify(cards[i]);
           try {
-            let resp: any;
-            if (i === 0 && effectiveReplyTo) {
-              resp = await client.im.v1.message.reply({
-                path: { message_id: effectiveReplyTo },
-                data: { content, msg_type: 'interactive' },
-              });
-            } else {
-              resp = await sendFollowup({ content, msg_type: 'interactive' });
-            }
+            // #112: i===0 first-chunk reply is retry-wrapped (later
+            // chunks go through sendFollowup which already wraps).
+            const resp: any = (i === 0 && effectiveReplyTo)
+              ? await withFeishuRetry(
+                  () => client.im.v1.message.reply({
+                    path: { message_id: effectiveReplyTo },
+                    data: { content, msg_type: 'interactive' },
+                  }),
+                  { label: 'reply.card.first' },
+                )
+              : await sendFollowup({ content, msg_type: 'interactive' });
             const sentId = resp?.data?.message_id;
             if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
           } catch (err: any) {
@@ -596,21 +617,23 @@ export function registerTools(
         sentCount = chunks.length;
         for (let i = 0; i < chunks.length; i++) {
           try {
-            let resp: any;
-            if (effectiveReplyTo && i === 0) {
-              resp = await client.im.v1.message.reply({
-                path: { message_id: effectiveReplyTo },
-                data: {
+            // #112: first-chunk reply retry-wrapped (later chunks go
+            // through sendFollowup which already wraps).
+            const resp: any = (effectiveReplyTo && i === 0)
+              ? await withFeishuRetry(
+                  () => client.im.v1.message.reply({
+                    path: { message_id: effectiveReplyTo },
+                    data: {
+                      content: JSON.stringify({ text: chunks[i] }),
+                      msg_type: 'text',
+                    },
+                  }),
+                  { label: 'reply.text.first' },
+                )
+              : await sendFollowup({
                   content: JSON.stringify({ text: chunks[i] }),
                   msg_type: 'text',
-                },
-              });
-            } else {
-              resp = await sendFollowup({
-                content: JSON.stringify({ text: chunks[i] }),
-                msg_type: 'text',
-              });
-            }
+                });
             const sentId = resp?.data?.message_id;
             if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
           } catch (err: any) {
@@ -730,24 +753,32 @@ export function registerTools(
       // and return a clean isError + LARK_DEFER hint; rethrow other
       // errors with the diagnostic shape reply uses.
       try {
-        if (format === 'card_markdown') {
-          await client.im.v1.message.patch({
-            path: { message_id },
-            data: {
-              content: Lark.messageCard.defaultCard({
-                title: '',
-                content: safeText,
-              }),
-            },
-          });
-        } else {
-          await client.im.v1.message.patch({
-            path: { message_id },
-            data: {
-              content: JSON.stringify({ text: safeText }),
-            },
-          });
-        }
+        // #112: retry-wrap message.patch — rate-limit is just as
+        // common on edits as on creates. Permanent target errors
+        // (target message deleted, bot kicked) short-circuit via
+        // isRetryableError(false) → no wasted retries.
+        await withFeishuRetry(
+          () => {
+            if (format === 'card_markdown') {
+              return client.im.v1.message.patch({
+                path: { message_id },
+                data: {
+                  content: Lark.messageCard.defaultCard({
+                    title: '',
+                    content: safeText,
+                  }),
+                },
+              });
+            }
+            return client.im.v1.message.patch({
+              path: { message_id },
+              data: {
+                content: JSON.stringify({ text: safeText }),
+              },
+            });
+          },
+          { label: 'edit_message' },
+        );
       } catch (err: any) {
         const defer = handlePermanentTargetError(err, { tool: 'edit_message', message_id });
         if (defer) return defer;
@@ -777,12 +808,17 @@ export function registerTools(
       }),
     },
     async ({ message_id, emoji }) => {
-      await client.im.v1.messageReaction.create({
-        path: { message_id },
-        data: {
-          reaction_type: { emoji_type: emoji },
-        },
-      });
+      // #112: retry-wrap — same rate-limit exposure as the ack-reaction
+      // path in channel.ts.
+      await withFeishuRetry(
+        () => client.im.v1.messageReaction.create({
+          path: { message_id },
+          data: {
+            reaction_type: { emoji_type: emoji },
+          },
+        }),
+        { label: 'react' },
+      );
 
       return {
         content: [{ type: 'text' as const, text: `Added ${emoji} reaction to ${message_id}` }],
