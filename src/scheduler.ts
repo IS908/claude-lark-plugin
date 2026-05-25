@@ -97,6 +97,41 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * #134 helper: detect whether a fresh-read JobFile represents a
+ * different "logical" job from the original (same sanitized id /
+ * filename, but the original was deleted and a new one created in
+ * the ≤210s execution window).
+ *
+ * Identity is the `(id, created_at)` tuple. Returns true ONLY when
+ * BOTH sides have non-empty `created_at` AND they differ — a missing
+ * `created_at` on either side (legacy job pre-dating the field, or a
+ * future schema migration that nulls it) falls through to "no
+ * recycle detected" so we preserve pre-fix behavior rather than
+ * spuriously skipping writebacks on legacy data.
+ *
+ * R1-followup asymmetry note: a legacy OLD snapshot (`created_at: ''`)
+ * delete+create-replaced by a NEW job with a real timestamp returns
+ * `false` here — the OLD execution WILL stomp the NEW job's runtime.
+ * This is the documented trade-off: detecting "OLD lacks created_at,
+ * NEW has one" as a recycle would also flag the common case of an
+ * operator running create_job to re-attribute a legacy job, where
+ * the OLD snapshot is genuinely the same logical job. Legacy jobs
+ * are typically long-running daily/weekly cronjobs (not delete+create
+ * churn targets); the asymmetric gap is acceptable and shrinks every
+ * time an operator touches a legacy job via update_job (which now
+ * always sets created_at).
+ *
+ * Pure helper, exported `static`-style at module scope so the smoke
+ * test can pin the contract without instantiating a full scheduler.
+ */
+export function isRecycledJob(original: JobFile, fresh: JobFile): boolean {
+  const a = original.meta.created_at;
+  const b = fresh.meta.created_at;
+  if (!a || !b) return false;
+  return a !== b;
+}
+
 export class JobScheduler {
   private timer: NodeJS.Timeout | null = null;
   private server: Server;
@@ -105,7 +140,7 @@ export class JobScheduler {
   private botMessageTracker: BotMessageTracker | undefined;
   private running = false;
   /**
-   * Per-job re-entrancy guard (#77, v1.0.29).
+   * Per-job re-entrancy guard (#77, v1.0.29; recycle-aware in v1.0.43).
    *
    * `tick()` runs on a 60s setInterval, but `executeJob()` can sit inside
    * the retry loop for up to 210s (30 + 60 + 120). Without this guard,
@@ -114,16 +149,43 @@ export class JobScheduler {
    * fire executeJob a second time — duplicate execution, the exact
    * symptom #62 already tried to eliminate via filename-as-id.
    *
-   * Membership is keyed by `job.meta.id` (the filename stem). The
-   * Set is in-process: a daemon restart clears it, but on restart
-   * recoverMissedJobs runs once before tick begins, so there is no
-   * window for cross-restart re-entrancy.
+   * v1.0.43 #134 fix: switched from `Set<string>` (keyed on bare id) to
+   * `Map<string, string>` (id → created_at) so the guard respects the
+   * `(id, created_at)` identity tuple introduced by `isRecycledJob`.
+   * Pre-fix, a `delete_job('foo')` + `create_job('foo')` during the
+   * 210s in-flight window would have the NEW job's tick blocked by
+   * the OLD execution's still-pending `inFlight` entry — the new job
+   * would miss its first fire even though the OLD execution's
+   * writeback now correctly skips. Post-fix, `tick()` skips only
+   * when `inFlight.get(id) === job.meta.created_at`; a different
+   * `created_at` (recycled job) is treated as a distinct logical
+   * job and gets its own re-entrancy slot.
+   *
+   * Legacy jobs without `created_at` (very old jobs that pre-date
+   * the field) use the empty string as their key value. Two legacy
+   * jobs with the same id would still collide — but the PRE-#134
+   * design had no way to distinguish them either; this matches the
+   * pre-fix legacy behavior.
+   *
+   * Cleanup uses CAS-on-delete (R2-followup correction): the
+   * finally-block compares the slot's current value to the
+   * `created_at` captured in tick()'s closure and only deletes on
+   * match. Without this, a recycle could play out as:
+   *   1. tick: inFlight.set(foo, A); launch executeJob(A)
+   *   2. recycle: file replaced with B
+   *   3. tick: inFlight.get(foo)=A, jobA.created_at=B → release;
+   *      inFlight.set(foo, B); launch executeJob(B)
+   *   4. A finishes; A's finally — if id-only — runs
+   *      inFlight.delete(foo), erasing B's entry; B is now
+   *      unprotected and a third tick could re-launch it
+   * The CAS makes step 4 a no-op for A (slot holds B, not A), so
+   * B's re-entrancy stays gated until B's own finally fires.
    *
    * NOT used by recoverMissedJobs — start() awaits recoverMissedJobs
    * before installing the tick timer, so the two paths are temporally
    * disjoint.
    */
-  private inFlight = new Set<string>();
+  private inFlight = new Map<string, string>();
 
   constructor(opts: SchedulerOptions) {
     this.server = opts.server;
@@ -334,17 +396,43 @@ export class JobScheduler {
       // #77 re-entrancy guard: skip jobs whose previous execution is
       // still in flight. Without this, a job in the 30+60+120s retry
       // sleep window would be re-launched on each subsequent tick.
-      if (this.inFlight.has(job.meta.id)) continue;
+      //
+      // v1.0.43 #134 fix: compare BOTH id AND created_at. If the
+      // user delete+create'd inside the window, the new job's
+      // created_at differs from the in-flight entry's — treat as a
+      // distinct logical job and let it run. The OLD execution's
+      // writeback will skip via isRecycledJob, so the two don't
+      // collide on disk either.
+      const jobCreatedAt = job.meta.created_at ?? '';
+      const inFlightCreatedAt = this.inFlight.get(job.meta.id);
+      if (inFlightCreatedAt !== undefined && inFlightCreatedAt === jobCreatedAt) {
+        continue;
+      }
 
       const nextRun = new Date(job.runtime.next_run_at).getTime();
       if (nextRun <= now) {
-        this.inFlight.add(job.meta.id);
+        // R2-followup: capture `jobCreatedAt` in the closure so the
+        // finally-block can perform a CAS-on-delete. Pre-followup the
+        // delete was id-only, which broke the re-entrancy invariant
+        // under recycle: if OLD execution was in flight and a recycle
+        // landed a NEW job, this tick overwrote OLD's slot with NEW's
+        // — then OLD's finally fired `inFlight.delete(id)`, erasing
+        // NEW's entry. NEW was still in flight but unprotected, and
+        // the next tick would re-launch NEW (the exact #77 duplicate-
+        // execution bug, on the recycled job). Post-followup: each
+        // execution's finally only clears its OWN slot.
+        this.inFlight.set(job.meta.id, jobCreatedAt);
         this.executeJob(job)
           .catch((err) => {
             console.error(`[scheduler] Failed to execute job ${job.meta.id}:`, err);
           })
           .finally(() => {
-            this.inFlight.delete(job.meta.id);
+            // CAS: only clear if the slot still holds OUR generation.
+            // A concurrent recycle that overwrote our entry must keep
+            // its own slot intact until its own executeJob finishes.
+            if (this.inFlight.get(job.meta.id) === jobCreatedAt) {
+              this.inFlight.delete(job.meta.id);
+            }
           });
       }
     }
@@ -401,6 +489,49 @@ export class JobScheduler {
             `the run succeeded but no runtime is recorded (not resurrecting the file).`,
           );
           return;
+        }
+        // #134 fix: same-id-recycled detection. A delete_job + create_job
+        // with the same sanitized id (filename) inside the ≤210s
+        // execution window produces a fresh file at the same path. The
+        // fresh-read above sees the NEW job's meta — applying our OLD
+        // execution's runtime (last_run_at from before the new job
+        // existed, run_count++ pretending the new job has run once)
+        // corrupts the new job's state. Identity is the (id, created_at)
+        // tuple; if either side lacks created_at (legacy job), we can't
+        // reliably detect recycling and fall back to pre-fix behavior.
+        if (isRecycledJob(job, fresh)) {
+          console.error(
+            `[scheduler] Job ${job.meta.id} was recycled during execution ` +
+            `(created_at: ${job.meta.created_at} → ${fresh.meta.created_at}); ` +
+            `skipping runtime writeback for the stale execution. ` +
+            `The OLD run's side effects (message/prompt) already fired; ` +
+            `the NEW job is unaffected and will run on its own schedule.`,
+          );
+          return;
+        }
+        // #133 audit log: type/target divergence detection. If the user
+        // ran update_job(type=...) or update_job(target_chat_id=...)
+        // mid-flight, the in-flight execution used the OLD values
+        // (already sent / already injected); writeJob below persists
+        // the NEW meta and increments run_count, leaving the operator
+        // with a misleading "this prompt-type job ran once" when
+        // actually the OLD message-type job ran. We can't undo the
+        // side effect — surface it in the log so the operator who
+        // greps for the anomaly finds an explanation rather than
+        // having to reverse-engineer the timeline. run_count is still
+        // incremented (the run DID happen, just under different meta);
+        // the NEXT run uses fresh meta normally.
+        if (
+          fresh.meta.type !== job.meta.type ||
+          fresh.meta.target_chat_id !== job.meta.target_chat_id
+        ) {
+          console.error(
+            `[scheduler] Job ${job.meta.id}: meta changed during execution ` +
+            `(was type=${job.meta.type} target=${job.meta.target_chat_id}; ` +
+            `now type=${fresh.meta.type} target=${fresh.meta.target_chat_id}). ` +
+            `The in-flight run used the OLD values and ALREADY took effect; ` +
+            `next run will use the FRESH values.`,
+          );
         }
         fresh.runtime.last_run_at = new Date(startTime).toISOString();
         fresh.runtime.run_count = (fresh.runtime.run_count ?? 0) + 1;
@@ -471,6 +602,21 @@ export class JobScheduler {
       );
       return;
     }
+    // #134 fix (failure path): same recycle check as success path.
+    // Without this, an OLD execution's failure (e.g. retry exhaustion
+    // on a target the NEW job doesn't even use) would stomp
+    // last_run_at + last_error onto the new job and — worse, via
+    // #106's auto-pause — flip the NEW job to status=paused on the
+    // OLD target's permanent error.
+    if (isRecycledJob(job, freshFail)) {
+      console.error(
+        `[scheduler] Job ${job.meta.id} was recycled during execution ` +
+        `(created_at: ${job.meta.created_at} → ${freshFail.meta.created_at}); ` +
+        `the OLD run failed (${lastErr?.message ?? lastErr}) but the NEW job ` +
+        `is unaffected — no runtime writeback, no auto-pause.`,
+      );
+      return;
+    }
     freshFail.runtime.last_run_at = new Date(startTime).toISOString();
     // Same dead-letter defense as the success path (R1-audit followup).
     // A poisoned on-disk schedule throws here and would otherwise leave
@@ -498,19 +644,38 @@ export class JobScheduler {
     // The owner gets a one-shot DM with the failure reason so they
     // can decide whether to re-target, re-create, or delete the job.
     //
-    // Note: the auto-pause OVERRIDES whatever status was on disk. If
-    // the user paused mid-flight, the disk already says 'paused' →
-    // setting 'paused' again is a no-op. If the user un-paused or
-    // changed nothing, the auto-pause still applies — correct, because
-    // the target is unreachable regardless of user intent.
+    // #132 fix: only auto-pause when the target HAS NOT CHANGED mid-
+    // flight. Pre-fix, an operator who noticed the failure and ran
+    // `update_job(target_chat_id='oc_new', status='active')` mid-
+    // retry would get their un-pause silently reverted on the
+    // failure path (the OLD target's permanent error fired the auto-
+    // pause regardless). Post-fix: if the operator retargeted, give
+    // the new target a chance on the NEXT tick. If THAT also fails
+    // with a permanent error, the next executeJob's failure path
+    // will auto-pause — for real this time, with no concurrent
+    // retarget to clobber. The old comment ("regardless of user
+    // intent is correct") was over-stated; respecting an explicit
+    // retarget is the better trade-off.
     const apiCode = getFeishuApiCode(lastErr);
-    const isPermanentTarget = apiCode !== null && PERMANENT_TARGET_CODES.has(apiCode);
+    const targetUnchanged = freshFail.meta.target_chat_id === job.meta.target_chat_id;
+    const isPermanentTarget =
+      apiCode !== null && PERMANENT_TARGET_CODES.has(apiCode) && targetUnchanged;
     if (isPermanentTarget) {
       freshFail.meta.status = 'paused';
       console.error(
         `[scheduler] Job ${freshFail.meta.id} AUTO-PAUSED — target chat ${freshFail.meta.target_chat_id} ` +
         `permanently unreachable (Feishu code ${apiCode}: ${getFeishuApiMsg(lastErr)}). ` +
         `Owner ${freshFail.meta.created_by} notified via DM (best-effort).`,
+      );
+    } else if (apiCode !== null && PERMANENT_TARGET_CODES.has(apiCode) && !targetUnchanged) {
+      // #132: explicit log for the retarget-skip path so an operator
+      // who greps for the missing auto-pause has an explanation.
+      console.error(
+        `[scheduler] Job ${freshFail.meta.id} target changed during execution ` +
+        `(was ${job.meta.target_chat_id}, now ${freshFail.meta.target_chat_id}); ` +
+        `skipping AUTO-PAUSE for the OLD target's permanent error (Feishu code ${apiCode}). ` +
+        `The NEW target will be attempted on the next tick — if it also fails ` +
+        `permanently, auto-pause will fire then.`,
       );
     } else {
       const retryNote = isRetryableError(lastErr)

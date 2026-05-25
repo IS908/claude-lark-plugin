@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.43] - 2026-05-25
+
+### Fixed
+- **Three scheduler races during `executeJob`'s ≤210s in-flight window** (#132 #133 #134 — batch-fix, all touching the same fresh-read merge in `src/scheduler.ts`). The #77/#78 fresh-read merge (v1.0.29) closed the headline read-modify-write race but left three residual sharp edges:
+
+  1. **#134 — same-id recycle stomp**: `delete_job('foo')` + `create_job(name='foo', ...)` within the execution window produces a NEW file at the same `jobs/foo.json` path with a different `created_at`. The OLD execution's fresh-read merge then read the NEW job, applied the OLD execution's `last_run_at` / `run_count++` / `last_error` to it, and (on the failure path) potentially auto-paused the NEW job for the OLD target's permanent error. The NEW job's runtime stats were lies; the user thought their freshly-created job had already run.
+
+  2. **#133 — mid-flight `type` / `target_chat_id` divergence**: an `update_job(type='prompt', ...)` issued during execution made the in-flight run use the OLD `type` / `target` (already sent / already injected) while the persisted state showed NEW. `run_count++` then implied "a prompt-type run happened" when actually a message-type run happened. No data loss, but a silent misrepresentation in the audit trail.
+
+  3. **#132 — retarget vs auto-pause clobber**: when the user noticed a failure and ran `update_job(target_chat_id='oc_new', status='active')` mid-retry, the in-flight execution's failure path saw the FRESH state (`target=oc_new`, `status=active`), then unconditionally auto-paused for the OLD target's permanent error code (#106 path). The user's recovery looked successful but the next tick saw `status=paused` — they had to un-pause a second time.
+
+  Shared fix shape — identity is the `(id, created_at)` tuple, not the bare id:
+  - **New `isRecycledJob(original, fresh): boolean`** module-scope helper (exported `static`-style for direct unit testing). Returns true ONLY when BOTH sides have non-empty `created_at` AND they differ — legacy jobs without `created_at` fall through to pre-fix behavior so the fix doesn't spuriously skip writebacks on existing data.
+  - **Success + failure paths in `executeJob`** call `isRecycledJob` immediately after the fresh-read. On match: log the recycle, skip the writeback, return. The OLD execution's side effect (message / prompt) has already fired — that's an in-flight execution's owned cost — but the NEW job's runtime is left alone.
+  - **#133 divergence log** fires when `fresh.meta.type !== job.meta.type` OR `fresh.meta.target_chat_id !== job.meta.target_chat_id` (and we're not in the recycled path). The OLD run's side effect cannot be undone, but the operator who greps for the run anomaly now finds a one-line explanation rather than reverse-engineering the timeline. `run_count` still increments — the run DID happen, just under different meta.
+  - **#132 retarget skip**: auto-pause now requires `freshFail.meta.target_chat_id === job.meta.target_chat_id` as a precondition. If the target changed mid-flight, the OLD target's permanent error is logged but does NOT pause the job — the NEW target gets a chance on the next tick. If THAT also fails permanently, the next executeJob's failure path will auto-pause (the precondition holds because no concurrent retarget is racing). Replaces the previous "regardless of user intent" comment which over-stated the soundness of the trade-off.
+
+### Added
+- New `isRecycledJob(original, fresh): boolean` exported from `src/scheduler.ts` — pure, no side effects, safe for direct unit testing.
+- New `scripts/scheduler-race-smoke.ts` (10 tests, wired into `scripts/test.sh`):
+  - Part A (5): `isRecycledJob` pure-helper contract — different/same `created_at`, legacy empty-`created_at` fallback, identity-is-only-`created_at` (target change alone is NOT a recycle), sub-second precision matters.
+  - Part B (2): integration on success + failure paths — recycled job's runtime is NOT stomped, NEW job stays `active` despite OLD execution's permanent target error.
+  - Part C (1): #133 divergence log fires + `run_count` still increments on legitimate mid-flight `type` update.
+  - Part D (2): #132 retarget skips auto-pause (control: unchanged target + permanent error STILL auto-pauses — the fix is conditional, not an unconditional disable).
+
+### R2-audit followups (closed in this PR)
+- **`inFlight` cleanup needed CAS-on-delete; the R1 Set→Map migration introduced a re-entrancy regression for recycled jobs.** Pre-R2-followup, the `.finally()` block called `inFlight.delete(id)` unconditionally — so if OLD was in flight when a recycle landed and tick fired NEW (overwriting the slot with the NEW generation's `created_at`), OLD's finally would then erase NEW's slot. NEW was still in flight but unprotected; a third tick saw no slot for `id` and re-launched NEW (the exact #77 duplicate-execution bug, now on the recycled job — duplicate Feishu sends for message jobs, duplicate Claude session injections for prompt jobs). Post-R2-followup: tick captures `jobCreatedAt` in its closure and the finally only deletes if `inFlight.get(id) === jobCreatedAt` — OLD's finally becomes a no-op when the slot holds a different generation. The `inFlight` docstring updated to spell out the CAS invariant with a worked trace.
+- **New test 12** — deterministic end-to-end integration of the CAS contract. Uses mock-blocking to control the OLD/NEW execution interleaving, fires 3 ticks, asserts no duplicate execution (`sends.length === 2`, `run_count === 1`). Without the CAS fix, tick 3 would relaunch NEW (asserting `sends.length === 3` would fire). Unlike test 11 (which manipulates `inFlight` directly), test 12 actually exercises the production tick + executeJob + finally code path.
+
+### R1-audit followups (closed in this PR)
+- **`inFlight` re-entrancy guard switched from `Set<string>` (id-only) to `Map<string, string>` (id → created_at).** Pre-followup, the `(id, created_at)` identity fix at the writeback layer was inconsistent with the tick-level re-entrancy gate: a recycled NEW job's first scheduled tick would have been blocked by the still-pending OLD execution's `inFlight` entry, missing its first fire (silent for up to 210s). Post-followup, `tick()` compares both id AND `created_at` — a recycled job is treated as a distinct logical job and gets its own re-entrancy slot.
+- **Test 6 contract tightened** — added assertions on `last_error === null`, `next_run_at` unchanged, and `created_at` preserved so a future regression that selectively writes back fields can't pass with only `run_count` / `last_run_at` / `content` checked.
+- **Test 10 mock cleaned up** — mock no longer throws on the owner DM (`ou_owner`) call. The pre-followup stack-trace in the smoke output was benign but looked like a failure; now the smoke verifies the owner DM actually fires with the AUTO-PAUSED text.
+- **New test 11** — pinning the `inFlight` Map keying contract directly: same id with different `created_at` does NOT block; same `created_at` does block.
+- **`isRecycledJob` docstring** clarifies the asymmetric legacy gap (`created_at: ''` OLD snapshot + real-timestamp NEW will NOT be flagged — accepted trade-off documented).
+
+### Known limitations / forward links
+- **`recoverMissedJobs` boot-time window** (#156): the same recycle race exists during boot recovery, between `listAllJobs()` and the per-job `executeJob` call. Window is much smaller (no 210s retry budget; just the few ms of tier-1/tier-2 notification sends) and only the OLD side effect lands — `executeJob`'s isRecycledJob guard already protects the NEW runtime. Tracked separately.
+- **TOCTOU between `isRecycledJob` and `writeJob`** (#157): two delete_job+create_job calls inside ~milliseconds of an executeJob writeback can still stomp the second recycle's runtime. Vanishingly rare (requires sub-ms tool-call spacing); documented and tracked.
+
+### Operator notes
+- **Behavior changes are conservative and only fire on documented race scenarios.** Normal `executeJob` execution (no concurrent `update_job` / `delete_job` + `create_job`) is unaffected.
+- **#106 auto-pause is now retarget-aware.** If you're firefighting a kicked-bot scenario and want immediate re-targeting to "stick," the post-fix behavior is what you'd expect: change the target → next tick uses it. The race window between "Feishu API call started" and "auto-pause decision" is the only place the old behavior could surprise; it's now closed.
+- **Legacy jobs without `created_at`** retain the pre-fix recycle behavior (recycle detection requires both sides to have a non-empty `created_at`). If you have very old jobs in flight, recycle stomping is still theoretically possible on them — but those are typically long-running daily / weekly cronjobs, not delete+create churn targets. New jobs (post-v0.9 — every job since `create_job` started setting `created_at`) are protected.
+- **If you're scripting rapid delete_job + create_job cycles** for testing or migration, sleep ≥100ms between calls to give the executeJob writeback path time to commit. The #157 TOCTOU window is small but real.
+- **No data-format changes.** Existing job files on disk are unaffected. Only `executeJob`'s decision logic changes.
+
+---
+
 ## [1.0.42] - 2026-05-25
 
 ### Fixed

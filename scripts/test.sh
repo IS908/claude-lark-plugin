@@ -163,4 +163,8 @@ echo "=== Episode cap + empty-keyword unit checks ==="
 npx tsx scripts/episode-cap-smoke.ts
 
 echo ""
+echo "=== Scheduler race (recycle / divergence / retarget) unit checks ==="
+npx tsx scripts/scheduler-race-smoke.ts
+
+echo ""
 echo "All tests passed."
