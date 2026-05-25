@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.58] - 2026-05-26
+
+### Added
+- **Stage 2 dispatch audit-log trail** (#176, closes R2 followup of #113/#175). Pre-fix `triggerProfileDistillation` only logged to stderr (`[distill-stage2] dispatching profile distillation for user X`). For an operator who enables `LARK_PROFILE_DISTILL_ENABLED=true` against a 50-user/10-chat deployment (~50 extra Claude turns daily at default 24h cooldown), counting actual dispatches required grepping stderr/debug.log — every other sensitive-tool boundary in the plugin already writes to `~/.claude/channels/lark/audit.log`. Post-fix: each outcome path (`dispatched`, `cooldown`, `no-episodes`, `error`) writes one line via the existing `audit()` boundary. The `tool` field is `profile-distill-dispatch` (single grep target) and `args.reason` distinguishes real dispatches from skips. Cost: 4 calls per Stage 2 pass at worst, each best-effort and non-blocking — identical pattern to `src/tools.ts` boundary writes.
+
+### Implementation
+- `src/memory/distiller.ts`: import `audit` from `../audit-log.js`; extend `ProfileDistillDeps` with optional `audit?: typeof defaultAudit` for unit-test injection (defaults to the global writer). Add 4 audit call sites — one per outcome — inside `triggerProfileDistillation`. All use `void audit(...)` (best-effort fire-and-forget) so a logging hiccup never affects dispatch behavior.
+- `scripts/profile-distill-stage2-smoke.ts`: add Part D (4 tests, 10→14 total) — assert audit fires on dispatch (outcome='ok', reason='dispatched', includes chat_id+episode_count+distill_key), cooldown skip (reason='cooldown', includes remain_hours), no-episodes skip (reason='no-episodes', includes episode_count+min_required), and per-user error (outcome='error', reason='error', includes truncated error_message).
+
 ## [1.0.57] - 2026-05-26
 
 ### Added

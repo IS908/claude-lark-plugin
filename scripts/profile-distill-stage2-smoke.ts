@@ -20,6 +20,7 @@
 
 import { triggerProfileDistillation } from '../src/memory/distiller.js';
 import type { ProfileDistillDeps } from '../src/memory/distiller.js';
+import type { AuditOutcome } from '../src/audit-log.js';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -30,6 +31,12 @@ let passed = 0;
 const HOUR_MS = 60 * 60 * 1000;
 
 // Test scaffolding: minimal mock deps with assertion hooks.
+interface AuditCall {
+  tool: string;
+  caller: string | null;
+  args: Record<string, unknown>;
+  outcome: AuditOutcome;
+}
 interface MockHooks {
   injections: Array<{ text: string; distillKey: string }>;
   callerBindings: Array<{ chatId: string; threadId: string; callerId: string }>;
@@ -41,6 +48,8 @@ interface MockHooks {
   l2RulesError?: Error;
   // Per-userId override to inject getProfile errors
   profileErrors?: Record<string, Error>;
+  // #176: captured audit-log calls
+  audits: AuditCall[];
 }
 
 function makeDeps(hooks: MockHooks, nowFn?: () => number): ProfileDistillDeps {
@@ -73,6 +82,9 @@ function makeDeps(hooks: MockHooks, nowFn?: () => number): ProfileDistillDeps {
       return hooks.l2Rules;
     },
     nowFn,
+    audit: async (tool, caller, args, outcome) => {
+      hooks.audits.push({ tool, caller, args, outcome });
+    },
   };
 }
 
@@ -84,6 +96,7 @@ function freshHooks(overrides: Partial<MockHooks> = {}): MockHooks {
     profiles: {},
     isPrivate: false,
     l2Rules: '',
+    audits: [],
     ...overrides,
   };
 }
@@ -321,6 +334,100 @@ function freshHooks(overrides: Partial<MockHooks> = {}): MockHooks {
   // The prompt's L2 section shows "(none set)" when empty.
   if (!hooks.injections[0].text.includes('(none set)')) {
     fail(`9: prompt should show '(none set)' for empty l2Rules after error fallback`);
+  }
+  passed++;
+}
+
+// ── Part D: audit-log (#176, v1.0.58) ──
+
+// 10. Audit fires on dispatch with shape {tool, caller, outcome='ok',
+//     args.reason='dispatched', chat_id, episode_count, distill_key}.
+{
+  const hooks = freshHooks({ episodeCounts: { 'oc_audit_disp': 10 } });
+  await triggerProfileDistillation(
+    'oc_audit_disp',
+    [{ role: 'user', senderId: 'ou_audit1' }],
+    makeDeps(hooks),
+    { cooldownMs: 24 * HOUR_MS, minEpisodes: 5, cooldownState: new Map() },
+  );
+  if (hooks.audits.length !== 1) fail(`10: expected 1 audit call on dispatch, got ${hooks.audits.length}`);
+  const a = hooks.audits[0];
+  if (a.tool !== 'profile-distill-dispatch') fail(`10: tool mismatch, got ${a.tool}`);
+  if (a.caller !== 'ou_audit1') fail(`10: caller should be userId, got ${a.caller}`);
+  if (a.outcome !== 'ok') fail(`10: outcome=ok on dispatch, got ${a.outcome}`);
+  if (a.args.reason !== 'dispatched') fail(`10: reason=dispatched, got ${a.args.reason}`);
+  if (a.args.chat_id !== 'oc_audit_disp') fail(`10: chat_id mismatch`);
+  if (a.args.episode_count !== 10) fail(`10: episode_count should be 10, got ${a.args.episode_count}`);
+  if (typeof a.args.distill_key !== 'string' || !String(a.args.distill_key).startsWith('distill-ou_audit1-')) {
+    fail(`10: distill_key should be distill-<user>-<ts>, got ${a.args.distill_key}`);
+  }
+  passed++;
+}
+
+// 11. Audit fires on cooldown skip with reason='cooldown' and outcome='ok'.
+{
+  const hooks = freshHooks({ episodeCounts: { 'oc_audit_cd': 10 } });
+  const cooldownState = new Map<string, number>();
+  let now = 1_000_000;
+  await triggerProfileDistillation(
+    'oc_audit_cd',
+    [{ role: 'user', senderId: 'ou_audit2' }],
+    makeDeps(hooks, () => now),
+    { cooldownMs: 24 * HOUR_MS, minEpisodes: 5, cooldownState },
+  );
+  // Re-fire inside cooldown window
+  now += 1 * HOUR_MS;
+  await triggerProfileDistillation(
+    'oc_audit_cd',
+    [{ role: 'user', senderId: 'ou_audit2' }],
+    makeDeps(hooks, () => now),
+    { cooldownMs: 24 * HOUR_MS, minEpisodes: 5, cooldownState },
+  );
+  // Two audits total: the first dispatch, then the cooldown skip.
+  if (hooks.audits.length !== 2) fail(`11: expected 2 audits (dispatch + cooldown), got ${hooks.audits.length}`);
+  const cd = hooks.audits[1];
+  if (cd.args.reason !== 'cooldown') fail(`11: 2nd audit reason should be 'cooldown', got ${cd.args.reason}`);
+  if (cd.outcome !== 'ok') fail(`11: cooldown skip is outcome=ok (gate worked), got ${cd.outcome}`);
+  if (typeof cd.args.remain_hours !== 'number') fail(`11: remain_hours should be numeric`);
+  passed++;
+}
+
+// 12. Audit fires on no-episodes skip with reason='no-episodes'.
+{
+  const hooks = freshHooks({ episodeCounts: { 'oc_audit_ne': 3 } });
+  await triggerProfileDistillation(
+    'oc_audit_ne',
+    [{ role: 'user', senderId: 'ou_audit3' }],
+    makeDeps(hooks),
+    { cooldownMs: 24 * HOUR_MS, minEpisodes: 5, cooldownState: new Map() },
+  );
+  if (hooks.audits.length !== 1) fail(`12: expected 1 audit on no-episodes skip, got ${hooks.audits.length}`);
+  const a = hooks.audits[0];
+  if (a.args.reason !== 'no-episodes') fail(`12: reason should be 'no-episodes', got ${a.args.reason}`);
+  if (a.outcome !== 'ok') fail(`12: no-episodes skip is outcome=ok, got ${a.outcome}`);
+  if (a.args.episode_count !== 3) fail(`12: episode_count should reflect actual count, got ${a.args.episode_count}`);
+  if (a.args.min_required !== 5) fail(`12: min_required should be 5, got ${a.args.min_required}`);
+  passed++;
+}
+
+// 13. Audit fires on per-user error with outcome='error'.
+{
+  const hooks = freshHooks({
+    episodeCounts: { 'oc_audit_err': 10 },
+    profileErrors: { 'ou_audit4': new Error('mock profile read failure') },
+  });
+  await triggerProfileDistillation(
+    'oc_audit_err',
+    [{ role: 'user', senderId: 'ou_audit4' }],
+    makeDeps(hooks),
+    { cooldownMs: 24 * HOUR_MS, minEpisodes: 5, cooldownState: new Map() },
+  );
+  if (hooks.audits.length !== 1) fail(`13: expected 1 audit on error, got ${hooks.audits.length}`);
+  const a = hooks.audits[0];
+  if (a.outcome !== 'error') fail(`13: outcome should be 'error', got ${a.outcome}`);
+  if (a.args.reason !== 'error') fail(`13: reason should be 'error', got ${a.args.reason}`);
+  if (typeof a.args.error_message !== 'string' || !String(a.args.error_message).includes('mock profile read failure')) {
+    fail(`13: error_message should include underlying error text, got ${a.args.error_message}`);
   }
   passed++;
 }
