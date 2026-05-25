@@ -411,4 +411,74 @@ let testNum = 0;
   }
 }
 
+// ── #98 — `migrated` flag surfaces on Skill from searchSkills ──
+
+// 20. searchSkills surfaces `migrated: true` for a skill whose sidecar
+//     has migrated=true (the legacy-claim path). enrichWithMemory
+//     (channel.ts) uses this to prepend a trust-calibration marker.
+{
+  testNum++;
+  const { store, baseDir } = freshStore();
+  const skillsDir = path.join(baseDir, 'skills');
+  await fs.mkdir(skillsDir, { recursive: true });
+  // Write a legacy .md (no sidecar yet) — the v1.0.14-shape.
+  await fs.writeFile(
+    path.join(skillsDir, 'legacy-deploy.md'),
+    '# legacy-deploy\nDeploy procedure docs from pre-v1.0.14.\n',
+    'utf-8',
+  );
+  // Trigger the migration so the sidecar gets `migrated: true`.
+  await store.migrateLegacySkills('ou_owner');
+
+  const results = await store.searchSkills('deploy');
+  const match = results.find((s) => s.name === 'legacy-deploy');
+  if (!match) fail(`20: searchSkills did not surface legacy-deploy, got: ${JSON.stringify(results.map(r => r.name))}`);
+  if (match!.migrated !== true) {
+    fail(`20: migrated flag missing on legacy-claimed skill, got migrated=${JSON.stringify(match!.migrated)}`);
+  }
+}
+
+// 21. searchSkills does NOT set migrated on a freshly-saved (non-migrated) skill.
+{
+  testNum++;
+  const { store } = freshStore();
+  await store.saveSkill('fresh-deploy', '# fresh-deploy\nFresh skill written via save_skill.', 'replace', { caller: 'ou_owner' });
+  const results = await store.searchSkills('deploy');
+  const match = results.find((s) => s.name === 'fresh-deploy');
+  if (!match) fail(`21: searchSkills did not surface fresh-deploy`);
+  if (match!.migrated === true) {
+    fail(`21: fresh skill MUST NOT carry migrated flag, got migrated=true`);
+  }
+}
+
+// 22. searchSkills with no sidecar at all (legacy + OWNER unset → no claim)
+//     does NOT surface migrated:true (the flag specifically signals the
+//     migrated-claim path, not "missing sidecar in general").
+{
+  testNum++;
+  const { store, baseDir } = freshStore();
+  const skillsDir = path.join(baseDir, 'skills');
+  await fs.mkdir(skillsDir, { recursive: true });
+  await fs.writeFile(
+    path.join(skillsDir, 'orphan-deploy.md'),
+    '# orphan-deploy\nNo sidecar at all.\n',
+    'utf-8',
+  );
+  // Migrate with null OWNER — no claim happens, no sidecar written.
+  await store.migrateLegacySkills(null);
+
+  const results = await store.searchSkills('deploy');
+  const match = results.find((s) => s.name === 'orphan-deploy');
+  if (!match) fail(`22: searchSkills did not surface orphan-deploy`);
+  // No sidecar → readSkillMeta returns null → migrated flag is undefined,
+  // NOT true. The channel.ts marker logic uses strict truthiness on the
+  // flag (matches the audit's stated acceptance: "when a MIGRATED skill
+  // surfaces, mark it"). Orphan skills without sidecars are a separate
+  // category (no provenance signal either way) — operator review tooling
+  // (#98 option 3, deferred) covers that case.
+  if (match!.migrated === true) {
+    fail(`22: orphan skill (no sidecar, no claim) MUST NOT carry migrated:true`);
+  }
+}
+
 console.log(`skill ownership smoke: ${testNum}/${testNum} PASS`);

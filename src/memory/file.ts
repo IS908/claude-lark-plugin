@@ -139,6 +139,26 @@ export interface Skill {
   description: string;
   content: string;
   score?: number;
+  /**
+   * #98 fix: true when this skill's sidecar carries `migrated: true`,
+   * meaning it was claimed by `migrateLegacySkills` (v1.0.14) rather
+   * than authored via `save_skill`. Pre-v1.0.14 anyone in any chat
+   * could write skills; v1.0.14 closed the write path but the
+   * content of those legacy skills was unchanged when claimed for
+   * the OWNER. Read-time surfacing of this flag lets the enrichment
+   * step prepend a trust-calibration marker so Claude treats migrated
+   * skills with appropriate skepticism (per the audit's stated
+   * acceptance criterion).
+   *
+   * Undefined for skills with no sidecar at all (legacy skill +
+   * LARK_OWNER_OPEN_ID unset → no claim happens, no sidecar written).
+   * Those skills are equally low-provenance, but the marker
+   * specifically signals the migration-claim path — channel.ts uses
+   * a strict truthy check (`if (skill.migrated)`) so orphan-no-sidecar
+   * skills do NOT get the marker. Operator-review tooling for that
+   * separate category is deferred (#98 option 3).
+   */
+  migrated?: boolean;
 }
 
 /**
@@ -970,10 +990,36 @@ export class MemoryStore {
       }
 
       results.sort((a, b) => b.score - a.score);
-      return results.slice(0, appConfig.maxSearchResults).map(r => ({
-        ...r.skill,
-        score: r.score,
+      const top = results.slice(0, appConfig.maxSearchResults);
+      // #98 fix: attach `migrated` flag from sidecar for each surfaced
+      // skill. enrichWithMemory uses it to prepend a trust-calibration
+      // marker so Claude treats migrated (pre-v1.0.14) skills with
+      // appropriate skepticism. Reads happen ONLY for the top-N
+      // results (default 2) so the IO cost is bounded.
+      //
+      // Sidecar read returns null for skills with no sidecar (orphan
+      // case: legacy .md + LARK_OWNER_OPEN_ID unset → no claim
+      // happened). Those return `migrated: undefined`; channel.ts
+      // uses a strict `if (skill.migrated)` truthy check so the
+      // marker does NOT fire for orphans. Orphan-skill review is
+      // deferred to #98 option 3 (operator tooling).
+      const withMeta = await Promise.all(top.map(async (r) => {
+        const slug = MemoryStore.sanitizeSkillSlug(r.skill.name);
+        let migrated: boolean | undefined;
+        try {
+          const meta = await this.readSkillMeta(slug);
+          migrated = meta?.migrated === true ? true : undefined;
+        } catch {
+          // readSkillMeta swallows its own errors but defensive
+          migrated = undefined;
+        }
+        return {
+          ...r.skill,
+          score: r.score,
+          ...(migrated ? { migrated: true } : {}),
+        };
       }));
+      return withMeta;
     } catch {
       return [];
     }
