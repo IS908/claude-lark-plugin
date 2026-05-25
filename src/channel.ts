@@ -391,6 +391,39 @@ export class LarkChannel {
    * eviction expectation). Treat as `readonly` from external code.
    */
   static readonly PENDING_REVOKE_CAP = 500;
+
+  /**
+   * #159 + #160 fix: TTL cache of recent inbound user message_ids.
+   * Populated by `handleMessageEvent` on every accepted inbound;
+   * `revokeAckFor` in src/tools.ts checks `isRecentInbound(id)` to
+   * decide whether to call `markPendingAckRevoke` when the Map has
+   * no entry.
+   *
+   * Pre-#159/#160: reply unconditionally marked pending (its
+   * `reply_to` was assumed to be inbound — usually but not always
+   * true). React / download_attachment never marked at all because
+   * their `message_id` parameter is even less inbound-correlated.
+   *
+   * Post-fix: any tool's `revokeAckFor` call with `markIfMissing=true`
+   * additionally gates on `channel.isRecentInbound(messageId)`.
+   * If true, mark pending (race-protect the late-landing ack).
+   * If false, skip the mark — the id isn't a known inbound, so
+   * marking would leak Set entries on bot-message reacts /
+   * stale-reply quotes (the original #159 and #160 attack shapes).
+   *
+   * TTL window: 60s — covers the slowest plausible reply turn
+   * (Claude generation + Feishu round-trips + retries). Shorter
+   * would race the slowest legitimate path; longer would weakly
+   * dilute the "recent" signal.
+   *
+   * Cap: 500 — same as `pendingAckRevokes` cap, well above any
+   * realistic per-minute inbound rate. FIFO eviction via TTLCache's
+   * built-in `maxSize` enforcement.
+   */
+  private recentInboundIds = new TTLCache<string, true>({
+    maxSize: 500,
+    ttlMs: 60_000,
+  });
   private ackPruneTimer: NodeJS.Timeout | null = null;
   /** Guards `start()` against double-invocation (R1-followup on #85). */
   private started = false;
@@ -499,6 +532,30 @@ export class LarkChannel {
    */
   getPendingAckRevokeSize(): number {
     return this.pendingAckRevokes.size;
+  }
+
+  /**
+   * #159 + #160: record an inbound user message_id in the recent-inbound
+   * TTL cache. Called once from `handleMessageEvent` per accepted message.
+   * Idempotent on re-record (TTLCache.set bumps insertion order, refreshing
+   * the entry's TTL window).
+   */
+  recordInboundId(messageId: string): void {
+    if (!messageId) return;
+    this.recentInboundIds.set(messageId, true);
+  }
+
+  /**
+   * #159 + #160: gate for `revokeAckFor`'s `markIfMissing` path.
+   * Returns true iff the given message_id is in the recent-inbound
+   * TTL cache (i.e. was an accepted user message within the last
+   * 60s). Tools use this to avoid marking pending-revoke for
+   * non-inbound ids (bot messages, stale quotes, etc.) — which
+   * would leak entries into the FIFO-capped pendingAckRevokes Set.
+   */
+  isRecentInbound(messageId: string): boolean {
+    if (!messageId) return false;
+    return this.recentInboundIds.get(messageId) === true;
   }
 
   /**
@@ -725,6 +782,14 @@ export class LarkChannel {
       threadId,
       timestamp: Date.now(),
     });
+
+    // #159 + #160 fix: also record into the recent-inbound TTL cache so
+    // tools' `revokeAckFor(messageId, ..., markIfMissing=true)` can gate
+    // the pending-revoke mark on `channel.isRecentInbound(messageId)`.
+    // Without this gate, reply with a stale `reply_to` (Claude quoting
+    // an older message / bot card) or react/download with a non-inbound
+    // message_id would leak entries into pendingAckRevokes Set.
+    this.recordInboundId(messageId);
 
     // Fire-and-forget ack reaction (Typing for P2P, MeMeMe for group @bot)
     const ackEmoji = chatType === 'p2p' ? 'Typing' : appConfig.ackEmoji;

@@ -399,17 +399,26 @@ export function registerTools(
    * race for fast bots whose reply turn outpaces the ack-create HTTP
    * round-trip.
    *
-   * `markIfMissing` is FALSE by default and is opted into ONLY by
-   * `reply` (where `reply_to` is guaranteed to be the inbound user
-   * message id — race protection is correctly targeted). React and
-   * download_attachment leave it OFF: their `message_id` parameter
-   * can legitimately point at a BOT message (Claude reacting to its
-   * own previous card) or any other id, and marking those pending
-   * would leak entries into the FIFO-capped Set — under sustained
-   * react-to-bot workload the legit reply-side marks would get
-   * evicted before their ack-create `.then()` lands, re-opening
-   * the original #136 stuck-MeMeMe symptom. R1-followup tracked in
-   * #159 for a smarter inbound-id-aware variant.
+   * `markIfMissing` is FALSE by default. Callers opt in when they
+   * have high confidence the `messageId` IS the inbound user message
+   * id (e.g. `reply` passing `reply_to`). Even when opted in,
+   * `markIfMissing` is GATED by `channel.isRecentInbound(messageId)`
+   * (#159 + #160 fix) — only marks pending if the channel confirms
+   * the id was recently seen as an inbound user message (60s TTL).
+   *
+   * Why the gate matters:
+   *   - #160: Claude can legally pass `reply_to=<stale or non-inbound>`
+   *     (quoting an older message or a bot card). Marking that id as
+   *     pending-revoke would leak into the FIFO-capped Set.
+   *   - #159: `react` / `download_attachment` can now safely pass
+   *     `markIfMissing=true` if they want race protection — the gate
+   *     filters out bot-message reacts and arbitrary file downloads,
+   *     so the leak path the original #159 R1 audit caught is closed.
+   *
+   * The gate is "fail-closed": if the id ISN'T a known inbound,
+   * skip the mark. Race protection is lost for that path, but no
+   * leak. The TTL backstop (channel.pruneStaleAcks) handles any
+   * orphaned ack the missed mark would have caught.
    */
   function revokeAckFor(
     messageId: string,
@@ -432,14 +441,20 @@ export function registerTools(
     const entry = ackReactions.get(messageId);
     if (!entry) {
       if (markIfMissing) {
-        // #136: mark as pending so a deferred ack lands → delete, not store.
-        // Only fires when caller has high confidence that `messageId` IS
-        // the inbound user message id (currently: reply only).
-        channel.markPendingAckRevoke(messageId);
-        console.error(
-          `[${callerLabel}] revokeAckFor: no ack for message_id=${messageId} yet ` +
-          `(marked pending-revoke; ${ackReactions.size} other ack(s) left intact)`,
-        );
+        // #136 + #159 + #160: mark only when channel confirms the id
+        // was a recently-seen inbound. Otherwise skip — see docstring
+        // for the leak prevention rationale.
+        if (channel.isRecentInbound(messageId)) {
+          channel.markPendingAckRevoke(messageId);
+          console.error(
+            `[${callerLabel}] revokeAckFor: no ack for message_id=${messageId} yet ` +
+            `(confirmed recent inbound, marked pending-revoke; ${ackReactions.size} other ack(s) left intact)`,
+          );
+        } else {
+          // Not a known inbound (stale quote, bot message reply_to, etc.).
+          // Quiet — over-logging would be noise on legitimate non-inbound
+          // ids (Claude quoting older cards is a common pattern).
+        }
       } else {
         // Quiet: react/download_attachment may legitimately pass a
         // non-inbound id (Claude reacting to a bot message; download

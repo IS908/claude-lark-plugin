@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.53] - 2026-05-26
+
+### Fixed
+- **`revokeAckFor`'s `markIfMissing` path leaked into the FIFO-capped pending-revoke Set on non-inbound message ids** (#159 + #160 — paired-fix, both touching the same `markIfMissing` decision). PR #158 (v1.0.44) added the `markIfMissing` mechanic for the set-vs-revoke race (#136) but two residual leaks remained:
+
+  - **#160**: `reply` opts in to `markIfMissing=true` on the rationale that `reply_to` is the inbound user message id. That's true in the common case but not validated — Claude can legally call `reply(reply_to=<stale/non-inbound>)` (quoting an older message or a bot card). Each such call would mark a non-inbound id as pending-revoke → leaked Set entry.
+  - **#159**: `react` / `download_attachment` couldn't safely opt in because their `message_id` parameter is even less inbound-correlated (Claude reacting to a bot message, downloading a file from an older message). So they defaulted to `markIfMissing=false`, losing race protection for the rare case when react/download IS the sole response to an inbound.
+
+  Shared fix shape — new `recentInboundIds: TTLCache<messageId, true>` on `LarkChannel` (cap 500, TTL 60s, FIFO eviction via the existing `TTLCache` helper):
+  - **`LarkChannel.recordInboundId(messageId)`** — populated in `handleMessageEvent` on every accepted inbound, alongside the existing `latestMessageTracker.record(...)` call. Idempotent (TTLCache.set bumps insertion order).
+  - **`LarkChannel.isRecentInbound(messageId)`** — gate check used by `revokeAckFor` in `src/tools.ts`. Returns true only if the id was recorded within the 60s window.
+  - **`revokeAckFor`'s `markIfMissing` path now ALSO gates on `channel.isRecentInbound(messageId)`**. If the channel doesn't recognize the id, skip the mark. This is fail-closed — race protection is lost for unrecognized ids, but no leak. The TTL backstop (`channel.pruneStaleAcks`) handles any orphaned ack that the missed mark would have caught.
+
+  Trade-offs:
+  - **TTL window 60s** covers the slowest plausible reply turn (Claude generation + Feishu round-trips + retries). Shorter would race the slowest legitimate path; longer would weakly dilute the "recent" signal.
+  - **Cap 500** — same as `pendingAckRevokes`, well above any realistic per-minute inbound rate. FIFO eviction via TTLCache's built-in `maxSize`.
+  - **`react` / `download_attachment` keep `markIfMissing=false` by default**. They could safely opt in now (the gate would filter out non-inbound ids), but the LOW-frequency benefit doesn't justify the schema change. If a future deployment exhibits stuck-MeMeMe on react-only responses, flipping the default is now safe.
+
+### Added
+- New `LarkChannel.recordInboundId(messageId)` + `LarkChannel.isRecentInbound(messageId): boolean` public methods.
+- New `recentInboundIds: TTLCache<string, true>` private field (500 entries, 60s TTL).
+- `scripts/ack-reaction-batch-smoke.ts` grows from 12 → 15 cases:
+  - **Test 5b**: reply with non-inbound `reply_to` (Claude quoting a bot card) must NOT mark pending — closes #160 leak.
+  - **Test 12**: `recordInboundId` + `isRecentInbound` round-trip + empty-id rejection.
+  - **Test 13**: end-to-end through the reply tool — recorded inbound marks pending, unrecorded does not.
+- Test 5 + Test 10 (positive control) updated to `recordInboundId` before reply (verifies the new gate fires correctly on the success path).
+- Existing smoke stubs (reply-card / reply-thread / download-attachment / auto-flush) extended with `isRecentInbound` stub method.
+
+### Operator notes
+- **Default `markIfMissing=true` callers (only `reply` today)** now silently no-op the pending-revoke mark when `reply_to` is not a recent inbound. Pre-fix this would have marked anyway, sometimes leaking. Post-fix, the MeMeMe on a non-inbound reply_to falls back to the ~6 min TTL backstop — which is the SAME fallback that existed pre-#136 for the not-yet-landed ack scenario. No new failure modes, just a closed leak surface.
+- **No data-format or storage changes.** All new state is in-memory on `LarkChannel`; restart clears everything.
+- **The followup queue is now empty of deferred items.** Pre-PR: 2 deferred-by-design followups (#159 #160). Post-PR: 0. The session's net followup queue movement is 0 — discipline held.
+
+---
+
 ## [1.0.52] - 2026-05-25
 
 ### Fixed
