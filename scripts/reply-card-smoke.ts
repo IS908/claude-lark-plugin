@@ -6,7 +6,8 @@
 import { registerTools } from '../src/tools.js';
 import type { MemoryStore } from '../src/memory/file.js';
 import { IdentitySession } from '../src/identity-session.js';
-import type { LarkChannel } from '../src/channel.js';
+import { pruneStaleAcksImpl, ACK_TTL_MS } from '../src/channel.js';
+import type { LarkChannel, AckRevokeClient } from '../src/channel.js';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -103,7 +104,9 @@ async function run() {
     has(id: string) { return this.ids.has(id); },
   };
   const buffer = makeBuffer();
-  const ackReactions = new Map<string, string>();
+  // v1.0.30 (#85): ackReactions is now { reactionId, addedAt }, not bare string,
+  // so the TTL backstop in channel.pruneStaleAcks has timestamps to work with.
+  const ackReactions = new Map<string, { reactionId: string; addedAt: number }>();
 
   // Register tools (captures handlers via fake server)
   const identitySession = new IdentitySession(() => null);
@@ -197,7 +200,7 @@ async function run() {
 
   // ── Test 5: card path revokes ack reactions (exact match) ──
   apiCalls.length = 0;
-  ackReactions.set('om_ack_msg', 'reaction_abc');
+  ackReactions.set('om_ack_msg', { reactionId: 'reaction_abc', addedAt: Date.now() });
 
   await replyHandler({
     chat_id: 'chat_ack',
@@ -211,21 +214,43 @@ async function run() {
   if (!deleteCall) fail('Test 5: messageReaction.delete not called');
   if (deleteCall.args.path.reaction_id !== 'reaction_abc') fail('Test 5: wrong reaction_id');
 
-  // ── Test 6: card path revokes all acks when no exact match ──
+  // ── Test 6: NO bulk-wipe when reply_to doesn't match (#85 fix) ──
+  //   Pre-v1.0.30: a reply without reply_to (or with a stale/wrong
+  //   reply_to) called the bulk-wipe branch and deleted EVERY other
+  //   user's pending ack in the Map — cross-chat, cross-user. A single
+  //   misrouted reply could erase every "I'm processing it" emoji.
+  //   Post-fix: silent no-op + stderr breadcrumb; TTL backstop in
+  //   channel.pruneStaleAcks cleans orphans.
   apiCalls.length = 0;
-  ackReactions.set('om_other1', 'r1');
-  ackReactions.set('om_other2', 'r2');
+  ackReactions.set('om_other1', { reactionId: 'r1', addedAt: Date.now() });
+  ackReactions.set('om_other2', { reactionId: 'r2', addedAt: Date.now() });
 
-  await replyHandler({
-    chat_id: 'chat_ack2',
-    text: '',
-    card: validCard,
-    // no reply_to — should revoke all pending acks
-  });
+  const errors6: string[] = [];
+  const origError6 = console.error;
+  console.error = (...args: unknown[]) => { errors6.push(args.map(String).join(' ')); };
+  try {
+    await replyHandler({
+      chat_id: 'chat_ack2',
+      text: '',
+      card: validCard,
+      // no reply_to — used to bulk-wipe; now must no-op
+    });
+  } finally {
+    console.error = origError6;
+  }
 
-  if (ackReactions.size !== 0) fail(`Test 6: ack reactions not fully cleared (size=${ackReactions.size})`);
-  const deleteCalls = apiCalls.filter((c) => c.method === 'messageReaction.delete');
-  if (deleteCalls.length !== 2) fail(`Test 6: expected 2 reaction deletes, got ${deleteCalls.length}`);
+  if (ackReactions.size !== 2) {
+    fail(`Test 6: other-user acks must be preserved (got size=${ackReactions.size})`);
+  }
+  const deleteCalls6 = apiCalls.filter((c) => c.method === 'messageReaction.delete');
+  if (deleteCalls6.length !== 0) {
+    fail(`Test 6: NO reactions should be deleted (got ${deleteCalls6.length})`);
+  }
+  if (!errors6.some((e) => /revokeAckFor/.test(e) && /no message_id/.test(e))) {
+    fail(`Test 6: must log stderr breadcrumb on no-match; got: ${errors6.join(' | ')}`);
+  }
+  // Cleanup for subsequent tests
+  ackReactions.clear();
 
   // ── Test 7: card with empty text uses '[card]' fallback in buffer ──
   buffer.recorded.length = 0;
@@ -254,6 +279,163 @@ async function run() {
     (c) => c.method === 'message.create' && c.args.data.msg_type === 'text'
   );
   if (!normalCreate) fail('Test 8: plain text path should use msg_type=text');
+
+  // ── Test 9: partial-failure leak — ack STILL revoked when send throws (#85) ──
+  //   Pre-v1.0.30: recordAndRevokeAck was called ONLY after every send
+  //   succeeded. A thrown card / text-chunk / attachment error left the
+  //   user's MeMeMe emoji on their message permanently AND leaked the
+  //   ackReactions Map entry. With Stop-hook strong-replay, the bot was
+  //   forced to retry → ack count grew unbounded per retry storm.
+  //   Post-fix: try/finally wraps the send body so revokeAckFor runs
+  //   on success, on thrown error, and on early-return alike.
+  {
+    apiCalls.length = 0;
+    ackReactions.clear();
+    ackReactions.set('om_throw_test', { reactionId: 'r_throw', addedAt: Date.now() });
+
+    // Hot-swap message.reply to throw a Feishu-shaped 500 once
+    const origReply = client.im.v1.message.reply;
+    let replyCount = 0;
+    client.im.v1.message.reply = async (args: any) => {
+      apiCalls.push({ method: 'message.reply', args });
+      replyCount++;
+      const err: any = new Error('Feishu API [500]: synthetic server error');
+      err.response = { data: { code: 500, msg: 'synthetic server error' } };
+      throw err;
+    };
+
+    let threw = false;
+    try {
+      await replyHandler({
+        chat_id: 'chat_throw_test',
+        text: 'hello',
+        reply_to: 'om_throw_test',
+      });
+    } catch {
+      threw = true;
+    } finally {
+      client.im.v1.message.reply = origReply;
+    }
+
+    if (!threw) fail(`Test 9: expected reply to propagate the synthetic 500`);
+    // CRITICAL assertion: ack must be revoked despite the throw.
+    if (ackReactions.size !== 0) {
+      fail(`Test 9: ack must be revoked on thrown send (got size=${ackReactions.size})`);
+    }
+    const delCalls9 = apiCalls.filter((c) => c.method === 'messageReaction.delete');
+    if (delCalls9.length !== 1) {
+      fail(`Test 9: expected 1 messageReaction.delete in finally, got ${delCalls9.length}`);
+    }
+    if (delCalls9[0].args.path.reaction_id !== 'r_throw') {
+      fail(`Test 9: wrong reaction_id revoked: ${delCalls9[0].args.path.reaction_id}`);
+    }
+  }
+
+  // ── Tests 10-12: pruneStaleAcks TTL backstop (#85) ──
+  //   Pure-function tests exercising pruneStaleAcksImpl directly so
+  //   they don't need a real LarkChannel (which needs LARK_APP_ID env
+  //   to construct an SDK client). Verifies stale entries are removed
+  //   AND best-effort revoked via messageReaction.delete.
+
+  // 10. Fresh entry preserved; stale entry pruned + revoked.
+  {
+    const ackPrune = new Map<string, { reactionId: string; addedAt: number }>();
+    const now = 1_700_000_000_000;
+    ackPrune.set('msg_fresh', { reactionId: 'r_fresh', addedAt: now - 60_000 });        // 1 min old → kept
+    ackPrune.set('msg_stale', { reactionId: 'r_stale', addedAt: now - 10 * 60_000 });    // 10 min old → pruned
+
+    const deletes10: any[] = [];
+    const mockClient: AckRevokeClient = {
+      im: { v1: { messageReaction: { delete: async (args: any) => { deletes10.push(args); } } } },
+    };
+
+    const pruned = pruneStaleAcksImpl(ackPrune, mockClient, now, ACK_TTL_MS);
+
+    if (pruned !== 1) fail(`Test 10: expected 1 pruned, got ${pruned}`);
+    if (ackPrune.size !== 1) fail(`Test 10: fresh entry should remain (size=${ackPrune.size})`);
+    if (!ackPrune.has('msg_fresh')) fail(`Test 10: msg_fresh must be preserved`);
+    if (ackPrune.has('msg_stale')) fail(`Test 10: msg_stale must be removed`);
+    if (deletes10.length !== 1) fail(`Test 10: expected 1 messageReaction.delete, got ${deletes10.length}`);
+    if (deletes10[0].path.message_id !== 'msg_stale') fail(`Test 10: wrong target message_id`);
+    if (deletes10[0].path.reaction_id !== 'r_stale') fail(`Test 10: wrong target reaction_id`);
+  }
+
+  // 11. All-fresh case: nothing pruned, no API calls.
+  {
+    const ackPrune = new Map<string, { reactionId: string; addedAt: number }>();
+    const now = 1_700_000_000_000;
+    ackPrune.set('msg_a', { reactionId: 'r_a', addedAt: now - 10_000 });
+    ackPrune.set('msg_b', { reactionId: 'r_b', addedAt: now - 60_000 });
+
+    const deletes11: any[] = [];
+    const mockClient: AckRevokeClient = {
+      im: { v1: { messageReaction: { delete: async (args: any) => { deletes11.push(args); } } } },
+    };
+
+    const pruned = pruneStaleAcksImpl(ackPrune, mockClient, now, ACK_TTL_MS);
+
+    if (pruned !== 0) fail(`Test 11: all-fresh should prune 0, got ${pruned}`);
+    if (ackPrune.size !== 2) fail(`Test 11: both entries should remain`);
+    if (deletes11.length !== 0) fail(`Test 11: no API calls when nothing stale`);
+  }
+
+  // 12. Boundary: entry exactly at ACK_TTL_MS old is NOT stale (strict >).
+  {
+    const ackPrune = new Map<string, { reactionId: string; addedAt: number }>();
+    const now = 1_700_000_000_000;
+    ackPrune.set('msg_exact', { reactionId: 'r_exact', addedAt: now - ACK_TTL_MS });
+    ackPrune.set('msg_over', { reactionId: 'r_over', addedAt: now - ACK_TTL_MS - 1 });
+
+    const mockClient: AckRevokeClient = {
+      im: { v1: { messageReaction: { delete: async () => {} } } },
+    };
+
+    const pruned = pruneStaleAcksImpl(ackPrune, mockClient, now, ACK_TTL_MS);
+
+    if (pruned !== 1) fail(`Test 12: only over-threshold should prune (got ${pruned})`);
+    if (!ackPrune.has('msg_exact')) fail(`Test 12: exactly-at-threshold must be kept (strict >)`);
+    if (ackPrune.has('msg_over')) fail(`Test 12: just-over-threshold must be pruned`);
+  }
+
+  // 13. Empty Map: returns 0, no API calls (safety check for the
+  //     setInterval idle case).
+  {
+    const ackPrune = new Map<string, { reactionId: string; addedAt: number }>();
+    const deletes13: any[] = [];
+    const mockClient: AckRevokeClient = {
+      im: { v1: { messageReaction: { delete: async (args: any) => { deletes13.push(args); } } } },
+    };
+    const pruned = pruneStaleAcksImpl(ackPrune, mockClient, Date.now(), ACK_TTL_MS);
+    if (pruned !== 0) fail(`Test 13: empty map must return 0 (got ${pruned})`);
+    if (deletes13.length !== 0) fail(`Test 13: empty map must skip API calls`);
+  }
+
+  // 14. Delete API throws → swallowed; prune count still reflects removed entries.
+  //     Guards against a future regression where a Feishu error in revoke
+  //     propagates and aborts the prune mid-iteration.
+  {
+    const ackPrune = new Map<string, { reactionId: string; addedAt: number }>();
+    const now = 1_700_000_000_000;
+    ackPrune.set('msg_stale_1', { reactionId: 'r1', addedAt: now - 10 * 60_000 });
+    ackPrune.set('msg_stale_2', { reactionId: 'r2', addedAt: now - 10 * 60_000 });
+
+    const mockClient: AckRevokeClient = {
+      im: { v1: { messageReaction: { delete: async () => {
+        throw new Error('synthetic Feishu 500');
+      } } } },
+    };
+
+    let threw = false;
+    let pruned = 0;
+    try {
+      pruned = pruneStaleAcksImpl(ackPrune, mockClient, now, ACK_TTL_MS);
+    } catch {
+      threw = true;
+    }
+    if (threw) fail(`Test 14: prune must not throw when revoke API throws`);
+    if (pruned !== 2) fail(`Test 14: prune count should be 2 despite revoke throws (got ${pruned})`);
+    if (ackPrune.size !== 0) fail(`Test 14: both entries should still be removed from Map`);
+  }
 
   console.log('PASS');
 }

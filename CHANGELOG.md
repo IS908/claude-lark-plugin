@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.30] - 2026-05-25
+
+### Fixed
+- **Ack reaction lifecycle: bulk-wipe + partial-failure leak** (#85 — **HIGH cross-user ack erasure + permanently-stuck acks under retry storms**). Three related bugs in the `recordAndRevokeAck` flow in `src/tools.ts`:
+  - **Bulk-wipe**: when the reply tool's `effectiveReplyTo` had no matching entry in `ackReactions`, the no-match branch iterated the ENTIRE Map and called `messageReaction.delete` on every entry — cross-chat, cross-user. A single reply with a wrong/missing `reply_to` (Claude occasionally omits or misroutes it under load) silently erased every other user's pending "I'm processing it" MeMeMe emoji. From the affected users' perspective the bot looked dead.
+  - **Partial-failure leak**: `recordAndRevokeAck` was called ONLY after every card-send / text-chunk / attachment had succeeded. Any thrown error mid-stream (Feishu 5xx, rate-limit 99991400, message-too-large, network jitter) skipped the revoke entirely — the user's ack reaction stayed on their message PERMANENTLY and the `ackReactions` Map entry leaked. With the Stop-hook strong-replay path (v1.0.10+), the bot was forced to retry → each retry added another ack → unbounded growth per retry storm.
+  - **No TTL backstop**: the `ackReactions` Map had no time-based pruning, so any entry that escaped the normal revoke path (cron-only turn that doesn't reply, hook block, Claude abandoned the turn, etc.) sat there until process restart.
+
+  Fix:
+  - **Bulk-wipe**: the no-match branch is now a silent no-op + stderr breadcrumb (`[reply] revokeAckFor: no ack for message_id=...`). Other users' acks are left intact; orphan cleanup is the TTL backstop's job.
+  - **Partial-failure**: split `recordAndRevokeAck` into `recordReply` (buffer-record only, success-path) and `revokeAckFor(messageId)` (ack revoke only). Wrapped the entire reply handler body in `try { ... } finally { revokeAckFor(effectiveReplyTo); }` so the ack ALWAYS revokes — success path, thrown send error from any send stage, early-return on bad-card-JSON input alike.
+  - **TTL backstop**: `ackReactions` value shape widened from raw `string` to `{ reactionId: string; addedAt: number }`. New `pruneStaleAcksImpl(map, client, now, maxAgeMs)` pure function (exported for testability) removes entries older than `ACK_TTL_MS` (5 min) AND best-effort fires `messageReaction.delete` so the orphan emoji is also cleaned up on Feishu's side. New per-channel `setInterval(pruneStaleAcks, ACK_PRUNE_INTERVAL_MS)` runs every 60s in `LarkChannel.start()`; `.unref()` so the timer never holds the process open by itself.
+
+### Added
+- 6 new reply-card-smoke assertions:
+  - **Test 6 inverted**: a reply without `reply_to` (or with a stale one) MUST preserve other entries in `ackReactions` and emit a stderr breadcrumb — pre-fix it would have wiped them.
+  - **Test 9 (partial-failure)**: hot-swap `message.reply` to throw a synthetic 500, confirm `ackReactions` is empty after the throw and exactly one `messageReaction.delete` fired in the finally block.
+  - **Tests 10–12 (pruneStaleAcksImpl)**: fresh entry preserved + stale entry pruned + revoked via `messageReaction.delete`; all-fresh case prunes 0 with no API call; boundary case (entry exactly at `ACK_TTL_MS` is NOT stale — strict `>`).
+  - **Test 13**: empty Map → 0 returned, no API call (safety check for the idle setInterval tick).
+  - **Test 14**: `messageReaction.delete` throwing must NOT abort the prune loop — count and Map state still reflect all removed entries.
+
+### Changed
+- `ackReactions` Map value shape: `string` → `{ reactionId: string; addedAt: number }`. The only setter (`src/channel.ts:handleMessageEvent`) was updated to include `addedAt: Date.now()`. The only consumer (`src/tools.ts:reply`) was updated to read `entry.reactionId`. No on-disk state is involved — the Map is in-process only, so nothing to migrate.
+
+### Operator notes
+- The 5-minute TTL is intentionally longer than any reasonable Claude turn. If you have a deployment where turns regularly exceed 5 minutes (very large prompts + slow tools), the TTL backstop could revoke an ack mid-turn — the user would see the MeMeMe disappear before the reply lands. Tune via `ACK_TTL_MS` if needed (constant is exported from `src/channel.ts`).
+- The prune timer runs every 60s but uses `.unref()`, so it doesn't keep an otherwise-idle process alive (e.g. during `--dry-run`).
+- No data-format changes; no migration needed.
+
 ## [1.0.29] - 2026-05-25
 
 ### Fixed

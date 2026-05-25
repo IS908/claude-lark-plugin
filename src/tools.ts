@@ -256,7 +256,7 @@ export function registerTools(
   identitySession: IdentitySession,
   channel: LarkChannel,
   conversationBuffer?: ConversationBuffer,
-  ackReactions?: Map<string, string>,
+  ackReactions?: Map<string, { reactionId: string; addedAt: number }>,
   botMessageTracker?: BotMessageTracker,
   latestMessageTracker?: LatestMessageTracker
 ): void {
@@ -427,43 +427,74 @@ export function registerTools(
         });
       }
 
-      // Helper: record in buffer + revoke ack (shared by card & normal paths)
-      function recordAndRevokeAck(replyText: string) {
-        // Buffer stores what the USER ACTUALLY SAW — sanitize <at> on
-        // record so the on-disk episode reflects Feishu's rendered
-        // output (which post-#96 has no @-mention payloads). Without
-        // this, a prompt-injected `<at>` in `replyText` would land in
-        // the buffer → distilled into an episode .md → re-injected
-        // into Claude's context on next enrichment, where Claude
-        // might quote it again. Outbound sanitization catches the
-        // re-emission, but storing the sanitized form is cleaner and
-        // avoids audit-trail confusion (R2-audit followup on #96).
+      // Helper: record the bot's reply text into the conversation buffer.
+      // Called ONLY on successful send — a failed reply shouldn't pollute
+      // the buffer with content the user never saw.
+      //
+      // Buffer stores what the USER ACTUALLY SAW — sanitize <at> on
+      // record so the on-disk episode reflects Feishu's rendered
+      // output (which post-#96 has no @-mention payloads). Without
+      // this, a prompt-injected `<at>` in `replyText` would land in
+      // the buffer → distilled into an episode .md → re-injected
+      // into Claude's context on next enrichment, where Claude
+      // might quote it again. Outbound sanitization catches the
+      // re-emission, but storing the sanitized form is cleaner and
+      // avoids audit-trail confusion (R2-audit followup on #96).
+      function recordReply(replyText: string) {
         conversationBuffer?.record(chat_id, {
           role: 'assistant',
           senderId: 'bot',
           text: sanitizeOutboundText(replyText).slice(0, 500),
           timestamp: new Date().toISOString(),
         });
-
-        if (ackReactions && ackReactions.size > 0) {
-          const msgId = effectiveReplyTo || '';
-          const reactionId = msgId ? ackReactions.get(msgId) : undefined;
-          if (reactionId) {
-            ackReactions.delete(msgId);
-            client.im.v1.messageReaction.delete({
-              path: { message_id: msgId, reaction_id: reactionId },
-            }).catch(() => {});
-          } else {
-            for (const [mid, rid] of ackReactions.entries()) {
-              ackReactions.delete(mid);
-              client.im.v1.messageReaction.delete({
-                path: { message_id: mid, reaction_id: rid },
-              }).catch(() => {});
-            }
-          }
-        }
       }
 
+      // Helper: revoke the ack reaction for a specific inbound message_id.
+      // Called from `finally` so it ALWAYS runs (success or failure) — pre-#85
+      // the revoke only fired on full success, so any thrown card-send / text-
+      // chunk / attachment error would leave the ack emoji on the user's
+      // message forever AND leak the Map entry.
+      //
+      // Bulk-wipe fix (#85): pre-fix the no-exact-match branch wiped the
+      // ENTIRE Map (cross-chat, cross-user). One reply with a wrong/missing
+      // reply_to could erase every other user's pending "I'm working on it"
+      // ack. Post-fix: silent no-op with a stderr breadcrumb — the TTL
+      // backstop in channel.pruneStaleAcks handles orphans.
+      function revokeAckFor(messageId: string) {
+        if (!ackReactions || ackReactions.size === 0) return;
+        if (!messageId) {
+          console.error(
+            `[reply] revokeAckFor: no message_id to revoke against ` +
+            `(reply called without reply_to; ${ackReactions.size} ack(s) ` +
+            `remain pending, TTL backstop will clean up)`,
+          );
+          return;
+        }
+        const entry = ackReactions.get(messageId);
+        if (!entry) {
+          console.error(
+            `[reply] revokeAckFor: no ack for message_id=${messageId} ` +
+            `(may have been pruned by TTL or never set; ${ackReactions.size} ` +
+            `other ack(s) left intact)`,
+          );
+          return;
+        }
+        ackReactions.delete(messageId);
+        client.im.v1.messageReaction.delete({
+          path: { message_id: messageId, reaction_id: entry.reactionId },
+        }).catch(() => {});
+      }
+
+      // #85 fix: try/finally wraps the entire send body so revokeAckFor
+      // runs whether we exit via success-return, early-return on input
+      // validation failure, or a thrown send error from any of the
+      // card-send / text-chunk / attachment paths. Pre-fix the revoke
+      // only fired on full success → any thrown error left the user's
+      // ack reaction stuck on their message forever AND leaked a Map
+      // entry. The body below keeps its original indentation (versus
+      // re-indenting ~200 lines) to keep the diff tight; the `try`
+      // and `} finally {` lines mark the wrap boundary.
+      try {
       // Raw card JSON path — bypass buildCards entirely
       if (card) {
         let cardObj: object;
@@ -506,7 +537,7 @@ export function registerTools(
           throw err;
         }
 
-        recordAndRevokeAck((text || '[card]'));
+        recordReply((text || '[card]'));
 
         return {
           content: [{ type: 'text' as const, text: 'Sent 1 card message' }],
@@ -652,11 +683,19 @@ export function registerTools(
         }
       }
 
-      recordAndRevokeAck(text);
+      recordReply(text);
 
       return {
         content: [{ type: 'text' as const, text: `Sent ${sentCount} message(s)` }],
       };
+      } finally {
+        // #85: ack ALWAYS revokes — success path, thrown send error,
+        // early-return on bad input. effectiveReplyTo may be empty
+        // (reply called without reply_to); revokeAckFor logs and
+        // no-ops in that case, deferring orphan cleanup to the TTL
+        // backstop in channel.pruneStaleAcks.
+        revokeAckFor(effectiveReplyTo || '');
+      }
     }
   );
 
