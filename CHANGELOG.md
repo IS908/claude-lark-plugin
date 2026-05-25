@@ -36,6 +36,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Changed
 - `src/scheduler.ts` re-exports `PERMANENT_TARGET_CODES`, `getFeishuApiCode`, `getFeishuApiMsg` for back-compat (existing `tools.ts` imports from `./scheduler.js`). The internal `isRetryableError` and the `RETRYABLE_NETWORK_ERRORS` / `RETRYABLE_HTTP_CODES` constants are now sourced from `./feishu-retry.js`. No behavior change for the scheduler — same classification, same delay schedule.
 
+### R1-audit followups (closed in this PR)
+- **`isRetryableError` truthy check tightened** — was `if (apiCode)`, now `if (apiCode != null)`. Code 0 is Feishu's success and never throws in practice, but the truthy check would have silently bypassed the lookup table for any code-0 error shape (SDK drift). Consistency with the `typeof === 'number'` contract in `getFeishuApiCode`.
+- **`onRetry` callback failures now swallowed** — pre-followup a throwing `onRetry` (e.g. operator-injected logger fails) would abandon the retry loop and surface the callback's error instead of the actual API failure. The retry harness now wraps the call in `try { ... } catch {}` — `onRetry` is a breadcrumb, not a circuit-breaker.
+- **Aggregate-budget note added to `HOT_PATH_RETRY_DELAYS_MS`** — clarifies that the 7s budget is per-call, not per-tool-invocation. A 5-chunk text reply where every chunk hits rate-limit can take up to 35s wall-clock. Acceptable for the pathological case; a future optimization could share a budget across chunks via a caller-supplied AbortController.
+- **2 new tests (20, 21)**: onRetry throw doesn't abort loop; code=0 doesn't misclassify post-truthy-check fix.
+
 ### Operator notes
 - No data-format or config changes; no env vars added.
 - Pre-#112 deployments may have seen sporadic "ack didn't land" or "reply death-spiral" issues in busy groups; both should be resolved post-deploy without intervention.

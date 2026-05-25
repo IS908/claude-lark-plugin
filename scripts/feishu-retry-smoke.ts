@@ -300,4 +300,50 @@ let testNum = 0;
   testNum++;
 }
 
+// 20. R1-followup: onRetry throwing must NOT abandon the retry loop.
+//     The callback is a breadcrumb; a failing logger shouldn't surface
+//     instead of the real API error.
+{
+  let calls = 0;
+  let onRetryCalls = 0;
+  const r = await withFeishuRetry(
+    async () => {
+      calls++;
+      if (calls < 3) throw feishuErr(99991400);
+      return 'ok-despite-onretry-throws';
+    },
+    {
+      delays: [1, 1, 1],
+      onRetry: () => {
+        onRetryCalls++;
+        throw new Error('synthetic onRetry failure');
+      },
+    },
+  );
+  if (r !== 'ok-despite-onretry-throws') {
+    fail(`20: onRetry throw should NOT abandon retry loop, got ${r}`);
+  }
+  if (calls !== 3) fail(`20: expected 3 calls, got ${calls}`);
+  if (onRetryCalls !== 2) fail(`20: onRetry should fire 2x (per retry), got ${onRetryCalls}`);
+  testNum++;
+}
+
+// 21. R1-followup: code 0 (Feishu success) does not classify as
+//     anything retryable / non-retryable (it shouldn't even reach this
+//     code path since success doesn't throw). Tightening the truthy
+//     check to `!= null` keeps the contract consistent.
+{
+  // Synthetic: an error object with code=0 (would be SDK shape drift).
+  // Pre-fix: `if (apiCode)` skipped the code-0 branch entirely → fell
+  // through to message-heuristic / unclassified = false. Post-fix:
+  // `if (apiCode != null)` checks code=0 too. Code 0 doesn't match
+  // any non-retryable or 9999xxxx range, so still falls through =
+  // unclassified = false. No behavior change in this synthetic case,
+  // but consistency.
+  const errCode0: any = new Error('weird');
+  errCode0.response = { data: { code: 0, msg: 'weird success error' } };
+  if (isRetryableError(errCode0)) fail(`21: code 0 should NOT classify as retryable`);
+  testNum++;
+}
+
 console.log(`feishu-retry smoke: ${testNum}/${testNum} PASS`);

@@ -78,9 +78,13 @@ export function isRetryableError(err: any): boolean {
   const status = err?.response?.status ?? err?.status;
   if (status && RETRYABLE_HTTP_CODES.has(status)) return true;
 
-  // Feishu API error codes — permission/param errors are NOT retryable
+  // Feishu API error codes — permission/param errors are NOT retryable.
+  // R1-followup: use `!= null` instead of truthy `if (apiCode)` for
+  // consistency with the typeof contract elsewhere. (Code 0 is Feishu's
+  // success and never throws, but the truthy check would have skipped
+  // it differently from a numeric typecheck — tighten regardless.)
   const apiCode = err?.response?.data?.code ?? err?.data?.code;
-  if (apiCode) {
+  if (apiCode != null) {
     // Known non-retryable Feishu codes
     if (apiCode === 99991672 || apiCode === 230001) return false;
     // Other Feishu codes starting with 9999 are usually transient
@@ -108,6 +112,16 @@ function sleep(ms: number): Promise<void> {
  * surfaces the error.
  *
  * Scheduler keeps its own 30/60/120s schedule (cronjob async, can wait).
+ *
+ * **Aggregate budget note (R1-followup)**: this is the PER-CALL budget,
+ * not per-tool-invocation. A multi-chunk reply (e.g. 5 text chunks)
+ * makes 5 separate `withFeishuRetry` calls; if every chunk hits the
+ * rate-limit, total wall-clock is 5 × 7s = 35s. Acceptable for the
+ * pathological case (sustained rate-limit is rare; the operator's fix
+ * is to slow inbound traffic or request a Feishu QPS bump). A
+ * future optimization could share a budget across chunks via a
+ * caller-supplied AbortController, but that adds complexity for a
+ * corner case.
  */
 export const HOT_PATH_RETRY_DELAYS_MS = [500, 1500, 5000];
 
@@ -147,7 +161,16 @@ export async function withFeishuRetry<T>(
         throw err;
       }
       const delay = delays[attempt];
-      opts.onRetry?.(attempt + 1, delay, err);
+      // R1-followup: onRetry is a breadcrumb, not a circuit-breaker.
+      // If a callback throws (e.g. operator-injected logger fails), it
+      // must not abandon the retry loop — the API error is what the
+      // caller cares about. Swallow callback failures silently; logging
+      // them would risk recursion if the failing onRetry IS the logger.
+      try {
+        opts.onRetry?.(attempt + 1, delay, err);
+      } catch {
+        // ignore
+      }
       await sleep(delay);
     }
   }
