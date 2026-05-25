@@ -118,4 +118,16 @@ echo "=== Inbox GC unit checks ==="
 npx tsx scripts/inbox-gc-smoke.ts
 
 echo ""
+echo "=== TTL cache unit checks ==="
+npx tsx scripts/ttl-cache-smoke.ts
+
+echo ""
+echo "=== Log rotation unit checks ==="
+npx tsx scripts/log-rotation-smoke.ts
+
+echo ""
+echo "=== Episode prune unit checks ==="
+npx tsx scripts/episode-prune-smoke.ts
+
+echo ""
 echo "All tests passed."

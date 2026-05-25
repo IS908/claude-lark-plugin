@@ -37,6 +37,29 @@ function optionalNumber(key: string, fallback: number): number {
 }
 
 /**
+ * Strictly positive numeric env (#109 R1-followup). Reject 0 / negatives
+ * as well as NaN, because for the sizing knobs (`LARK_LOG_MAX_BYTES`,
+ * `LARK_*_CACHE_SIZE`, `LARK_*_TTL_HOURS`, `LARK_EPISODE_RETENTION_DAYS`,
+ * etc.) a `0` is a footgun:
+ *   - `LARK_LOG_MAX_BYTES=0` rotates after every write — debug.log
+ *     retains 1 live line + 1 in .1, history is lost in seconds.
+ *   - `LARK_NAME_CACHE_TTL_HOURS=0` makes the cache write-only (100%
+ *     contact-API miss → Feishu rate-limit risk).
+ *   - `LARK_EPISODE_RETENTION_DAYS=0` deletes every episode on next
+ *     prune.
+ * The strict-positive guard prevents these failure modes by snapping
+ * back to the fallback with a stderr breadcrumb.
+ */
+function optionalPositiveNumber(key: string, fallback: number): number {
+  const n = optionalNumber(key, fallback);
+  if (n <= 0) {
+    console.error(`[config] ${key}=${n} must be > 0 — using fallback ${fallback}.`);
+    return fallback;
+  }
+  return n;
+}
+
+/**
  * Read and validate `LARK_OWNER_OPEN_ID`.
  *
  * Trims whitespace, treats empty after trim as unset, and refuses values
@@ -142,6 +165,49 @@ export const appConfig = {
   inboxMaxSizeMB: optionalNumber('LARK_INBOX_MAX_SIZE_MB', 500),
   inboxGcIntervalMin: optionalNumber('LARK_INBOX_GC_INTERVAL_MIN', 60),
   inboxGcDisabled: (process.env.LARK_INBOX_GC_DISABLED ?? '').toLowerCase() === 'true',
+
+  // Daemon hygiene (#109). The bot's in-memory caches and append-only
+  // log files grew without bound pre-v1.0.36. These tunables bound
+  // each surface; defaults are sized for a typical org-wide bot
+  // (thousands of users / hundreds of chats / multi-week deployment).
+  //
+  // nameCache: open_id / chat_id → display name. ~50 bytes/entry; 2000
+  // entries ≈ 100KB. 24h TTL is generous — names rarely change within
+  // a day, and a re-resolution miss costs one Feishu contact API call.
+  // R1-followup on #109: use optionalPositiveNumber so a misconfigured
+  // `=0` (or negative) falls back to the safe default with a stderr
+  // breadcrumb instead of silently nuking history / blowing past rate
+  // limits / write-only-ing the cache.
+  nameCacheTtlHours: optionalPositiveNumber('LARK_NAME_CACHE_TTL_HOURS', 24),
+  nameCacheSize: optionalPositiveNumber('LARK_NAME_CACHE_SIZE', 2000),
+  // chatTypeCache: chat_id → 'p2p' | 'group'. Chat type is STRUCTURAL —
+  // a p2p chat doesn't become a group chat. A short TTL (like the 24h
+  // initial proposal) would just spuriously recompute; worse, R2 audit
+  // caught that an idle p2p chat past TTL expiry would have
+  // `isPrivateChat` return false (cache miss → default-to-group), and
+  // any tool call from a cronjob in that chat (no fresh inbound to
+  // re-set the entry) would widen the visibility filter — silent
+  // privacy regression.
+  //
+  // Default 720 hours (30 days) effectively means "never expire while
+  // the daemon is running"; LRU cap (5000) is the real defender against
+  // pathological growth. Operator who wants tighter TTL (e.g. a
+  // deployment that frequently re-uses chat_ids for different chats —
+  // shouldn't happen but defensive) can shorten via the env.
+  chatTypeCacheTtlHours: optionalPositiveNumber('LARK_CHAT_TYPE_CACHE_TTL_HOURS', 720),
+  chatTypeCacheSize: optionalPositiveNumber('LARK_CHAT_TYPE_CACHE_SIZE', 5000),
+  // Log rotation: single rotated copy (`<file>.1`). Effective on-disk
+  // cap is ~2 × maxBytes per log. 50MB default × 2 × 3 logs = 300MB
+  // worst case, which is much smaller than the pre-fix multi-GB growth.
+  logMaxBytes: optionalPositiveNumber('LARK_LOG_MAX_BYTES', 50 * 1024 * 1024),
+  // Episode retention. saveEpisode writes one .md per buffer flush;
+  // listEpisodes / searchEpisodes do `readdir + per-file score` so cost
+  // is O(N) per enrichment — prune keeps the search amortized. 180 days
+  // is generous (half-year history); operator can shorten for tighter
+  // privacy or extend for archival.
+  episodeRetentionDays: optionalPositiveNumber('LARK_EPISODE_RETENTION_DAYS', 180),
+  episodePruneIntervalMin: optionalPositiveNumber('LARK_EPISODE_PRUNE_INTERVAL_MIN', 1440),
+  episodePruneDisabled: (process.env.LARK_EPISODE_PRUNE_DISABLED ?? '').toLowerCase() === 'true',
 } as const;
 
 export type AppConfig = typeof appConfig;

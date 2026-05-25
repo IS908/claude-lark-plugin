@@ -4,6 +4,64 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.36] - 2026-05-25
+
+### Fixed
+- **Daemon hygiene: in-memory caches and append-only logs grew without bound** (#109 — **HIGH production disk + memory leak**). 5 surfaces all monotonic pre-v1.0.36 — a multi-week deployment would silently leak GBs of disk and MBs of process memory:
+  - `nameCache` (channel.ts) — `Map<open_id|chat_id, displayName>`. Org-wide bot resolved thousands of names; never evicted.
+  - `chatTypeCache` (channel.ts) — `Map<chat_id, 'p2p'|'group'>`. Same shape.
+  - `debug.log` (channel.ts) — `~200B/event × ~10 events/sec ≈ 5GB/month`. The disk-fill speed leader.
+  - `audit.log` (audit-log.ts) — sensitive-tool invocations. Slower but unbounded.
+  - `hook-audit.log` (hooks/enforce-lark-reply.mjs) — Stop hook decisions. Same shape as audit.log.
+  - `episodes/<chat>/*.md` (memory/file.ts) — one file per buffer flush; `listEpisodes` does `readdir + per-file score` so cost is O(N) per memory enrichment. **Read amplification** hits before disk fills — search slows as the daemon ages.
+
+  Three fixes, all in this PR:
+
+  **1. TTL + LRU cache** for `nameCache` + `chatTypeCache`. New `src/ttl-cache.ts` exports `TTLCache<K, V>` with TTL expiry on `get` (lazy, no background sweep) + FIFO eviction at `maxSize`. Defaults: names 24h × 2000 entries (~100KB), chat types 24h × 5000 entries. Re-resolution after expiry costs one Feishu contact API call — cheap.
+
+  **2. Single-generation log rotation** for the 3 log files. New `src/log-rotation.ts` exports `appendWithRotationSync(path, line, maxBytes)` — when live file > maxBytes, rename to `<path>.1` (overwriting any prior `.1`), start fresh. Effective on-disk cap ~2× maxBytes per log. Default 50MB → ~300MB worst case across all 3 logs vs the pre-fix multi-GB growth. Inlined into `hooks/enforce-lark-reply.mjs` (can't import from `src/`).
+
+  **3. Episode retention prune** in `MemoryStore.pruneEpisodes(maxAgeMs)`. Recursive walk over `episodes/<chat>/*.md` and `episodes/<chat>/threads/<thread>/*.md`, unlinks files whose mtime is older than the cutoff. `src/index.ts` runs once at startup, then on `LARK_EPISODE_PRUNE_INTERVAL_MIN` cadence (default 1440 = 24h). Default retention 180 days. Strict `<` boundary so an entry exactly at the threshold survives. Non-`.md` files (operator-archived `.txt`, etc.) are NOT touched.
+
+### Added
+- New module `src/ttl-cache.ts` — generic `TTLCache<K, V>` with TTL + FIFO/LRU eviction, optional `touchOnGet` for true LRU semantics.
+- New module `src/log-rotation.ts` — `appendWithRotationSync(path, line, maxBytes, onError?)` helper.
+- New `MemoryStore.pruneEpisodes(maxAgeMs, nowMs?)` method.
+- 3 new smoke tests (wired into `scripts/test.sh`):
+  - `scripts/ttl-cache-smoke.ts` — 12 tests (set/get + TTL boundary + LRU eviction + touchOnGet + has/delete/clear + invalid-args throws + edge cases ttl=0 / size=1)
+  - `scripts/log-rotation-smoke.ts` — 9 tests (first write + simple append + rotation + overwrite-prior-`.1` + boundary + stat ENOENT + append EISDIR + multi-line + empty write)
+  - `scripts/episode-prune-smoke.ts` — 9 tests (missing dir + age expiry + thread recursion + multi-chat independence + boundary + non-`.md` preserved + bytesFreed accounting + EACCES skipped accounting + ENOENT NOT counted as skipped)
+
+### New env vars
+| Env | Default | Effect |
+|---|---|---|
+| `LARK_NAME_CACHE_TTL_HOURS` | 24 | nameCache entry lifetime |
+| `LARK_NAME_CACHE_SIZE` | 2000 | nameCache max entries (LRU) |
+| `LARK_CHAT_TYPE_CACHE_TTL_HOURS` | 24 | chatTypeCache entry lifetime |
+| `LARK_CHAT_TYPE_CACHE_SIZE` | 5000 | chatTypeCache max entries (LRU) |
+| `LARK_LOG_MAX_BYTES` | 52428800 (50MB) | per-log rotation threshold |
+| `LARK_EPISODE_RETENTION_DAYS` | 180 | episode age cutoff |
+| `LARK_EPISODE_PRUNE_INTERVAL_MIN` | 1440 (24h) | prune cadence |
+| `LARK_EPISODE_PRUNE_DISABLED` | false | opt-out |
+
+### R1-audit followups (closed in this PR)
+- **`optionalPositiveNumber` env helper** — new validator in `src/config.ts` rejects `0` and negatives for the sizing knobs (`LARK_LOG_MAX_BYTES`, `LARK_*_CACHE_SIZE`, `LARK_*_TTL_HOURS`, `LARK_EPISODE_RETENTION_DAYS`, `LARK_EPISODE_PRUNE_INTERVAL_MIN`). Pre-followup `LARK_LOG_MAX_BYTES=0` would have rotated after every write — debug.log retains 1 live line + 1 in `.1`, all history lost in seconds. The hook had the right guard; the src side now matches. Falls back to default with stderr breadcrumb on invalid value.
+- **`TTLCache` constructor: `ttlMs > 0`** (was `ttlMs >= 0`). `ttlMs=0` made the cache write-only (every read past the same-tick set expires) — a rate-limit risk for the contact-API-backed nameCache. Now throws at construct time.
+- **`TTLCache.has()` is now PURE** — pre-followup it delegated to `get()` which lazy-evicted expired entries and (with `touchOnGet=true`) re-inserted. Standard `Map.has` is read-only; the side-effect would have surprised a future contributor. Now just consults `addedAt` without mutating; the expired entry stays in the Map until the next `get`/`set`/`delete` does the sweep.
+- **`pruneEpisodes` skipped counter** — previously per-file stat/unlink failures were silently swallowed with no operator visibility. Now `pruneEpisodes` returns `{ removedFiles, bytesFreed, skipped }`; `[episode-prune]` log line includes `(N skipped — stat/unlink failed)` when non-zero. A perms-protected file no longer grows forever invisibly.
+
+### R2-audit followups (closed in this PR)
+- **`LARK_CHAT_TYPE_CACHE_TTL_HOURS` default 24 → 720 (30 days)** — R2 caught a real regression: chat type is STRUCTURAL (a p2p chat doesn't become a group chat), so a 24h TTL was spurious recomputation. Worse, an idle p2p chat past expiry caused `isPrivateChat` to return `false` (cache miss → default-to-group), which would silently WIDEN the visibility filter for any tool call from a cronjob in that chat (no fresh inbound to re-set the entry — e.g. cronjob's `list_jobs`, `what_do_you_know` from a stale thread, delayed flush). 30-day TTL effectively means "never expire while the daemon runs"; LRU cap (5000) is the real defender against pathological growth.
+- **`pruneEpisodes` ENOENT no longer counted as skipped** — pre-followup the `skipped` counter conflated benign ENOENT (file vanished concurrently with a parallel prune or operator `rm`) with real EACCES / EBUSY. Operator would see "N skipped" notices that were false alarms. Now only non-ENOENT errors increment.
+- **Test 8 root-skip** — `chmod 0500` to force EACCES doesn't block root from `unlink`. Skip the assertion under `process.getuid() === 0` (Docker / devcontainer / root CI) with an `[skip]` line. New test 9 confirms ENOENT semantics directly.
+- **CHANGELOG test count drift** — episode-prune-smoke is now 9 tests (was 7 in the initial, became 8 with R1's EACCES, then 9 with R2's ENOENT separation).
+
+### Operator notes
+- **Pre-#109 deployments on first startup after upgrade**: episode prune sweeps everything older than 180 days; if you have valuable historical episode notes, set `LARK_EPISODE_PRUNE_DISABLED=true` for one-time archival before re-enabling. Log rotation also fires on first write — large pre-fix `debug.log` rotates to `debug.log.1` (preserving it for one cycle, then overwriting on the next rotation).
+- Caches start cold. First few minutes after restart have higher Feishu contact API traffic as names re-resolve; well within standard rate limits.
+- Re-enabling episode prune after disabling: `LARK_EPISODE_PRUNE_DISABLED=false` (or unset) restores the periodic timer on next start.
+- All numeric tuning envs now snap back to defaults on `=0` or negative values with a stderr breadcrumb. To disable the relevant subsystem, use the dedicated `_DISABLED=true` flag (currently only `LARK_EPISODE_PRUNE_DISABLED` exists; log rotation and caches have no disable knob — bound them via the size envs).
+
 ## [1.0.35] - 2026-05-25
 
 ### Fixed

@@ -210,7 +210,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.35' },
+    { name: 'claude-lark-plugin', version: '1.0.36' },
     {
       capabilities: {
         logging: {},
@@ -426,6 +426,39 @@ async function main() {
     );
   } else {
     console.error('[index] Inbox GC disabled via LARK_INBOX_GC_DISABLED');
+  }
+
+  // 12. Episode retention prune (#109). saveEpisode writes one .md per
+  //     buffer flush; listEpisodes / searchEpisodes do `readdir +
+  //     per-file score` on every memory enrichment, so cost is O(N) per
+  //     inbound message. Run once at startup, then on
+  //     LARK_EPISODE_PRUNE_INTERVAL_MIN cadence (default 24h).
+  if (!appConfig.episodePruneDisabled) {
+    const pruneOnce = async (): Promise<void> => {
+      try {
+        const ageMs = appConfig.episodeRetentionDays * 86_400_000;
+        const r = await memoryStore.pruneEpisodes(ageMs);
+        if (r.removedFiles > 0 || r.skipped > 0) {
+          const mb = (r.bytesFreed / (1024 * 1024)).toFixed(2);
+          const skipPart = r.skipped > 0 ? ` (${r.skipped} skipped — stat/unlink failed)` : '';
+          console.error(
+            `[episode-prune] removed ${r.removedFiles} stale episode file(s), freed ${mb}MB${skipPart}`,
+          );
+        }
+      } catch (err) {
+        console.error('[episode-prune] run failed:', err);
+      }
+    };
+    void pruneOnce();
+    const intervalMs = appConfig.episodePruneIntervalMin * 60 * 1000;
+    const timer = setInterval(() => { void pruneOnce(); }, intervalMs);
+    timer.unref();
+    console.error(
+      `[index] Episode prune enabled (retention=${appConfig.episodeRetentionDays}d, ` +
+      `interval=${appConfig.episodePruneIntervalMin}min)`,
+    );
+  } else {
+    console.error('[index] Episode prune disabled via LARK_EPISODE_PRUNE_DISABLED');
   }
 
   console.error('[index] claude-lark-plugin started successfully');

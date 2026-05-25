@@ -1,11 +1,13 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
 import { enrichmentPrompt, wrapEnrichmentSection } from './prompts.js';
 import { MessageQueue } from './queue.js';
 import { LARK_ID_REGEX } from './tools.js';
+import { TTLCache } from './ttl-cache.js';
+import { appendWithRotationSync } from './log-rotation.js';
 import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
@@ -73,7 +75,11 @@ export function pruneStaleAcksImpl(
 }
 function debugLog(msg: string) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
-  try { appendFileSync(DEBUG_LOG, line); } catch {}
+  // #109 fix: rotate at LARK_LOG_MAX_BYTES (default 50MB). Pre-fix the
+  // debug.log grew ~5GB/month at high event rate. Effective cap is now
+  // ~100MB (live + one rotated copy). All errors swallowed — log must
+  // never affect tool behavior.
+  appendWithRotationSync(DEBUG_LOG, line, appConfig.logMaxBytes);
   console.error(msg);
 }
 
@@ -307,8 +313,19 @@ export function computeBotMentioned(
 
 export class LarkChannel {
   private client: Lark.Client;
-  private nameCache = new Map<string, string>(); // open_id/chat_id → display name
-  private chatTypeCache = new Map<string, 'p2p' | 'group'>(); // chatId → type (populated from inbound events)
+  // #109 fix: bounded TTL + LRU caches replace unbounded Maps. Pre-fix
+  // these grew monotonically — an org-wide bot retained every name it
+  // ever resolved. Defaults from config: 24h TTL × 2000 entries for
+  // names, 24h × 5000 for chat types. Re-resolution after expiry costs
+  // one Feishu contact API call.
+  private nameCache = new TTLCache<string, string>({
+    maxSize: appConfig.nameCacheSize,
+    ttlMs: appConfig.nameCacheTtlHours * 60 * 60 * 1000,
+  });
+  private chatTypeCache = new TTLCache<string, 'p2p' | 'group'>({
+    maxSize: appConfig.chatTypeCacheSize,
+    ttlMs: appConfig.chatTypeCacheTtlHours * 60 * 60 * 1000,
+  });
   private botOpenId: string = '';
   private wsClient: Lark.WSClient | null = null;
   private queue = new MessageQueue();

@@ -11,7 +11,7 @@
 
 import {
   readFileSync, appendFileSync, mkdirSync, existsSync,
-  statSync, openSync, readSync, closeSync,
+  statSync, renameSync, openSync, readSync, closeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -19,6 +19,17 @@ import { dirname, join } from 'node:path';
 const AUDIT_LOG =
   process.env.LARK_HOOK_AUDIT_LOG ||
   join(homedir(), '.claude', 'channels', 'lark', 'hook-audit.log');
+
+// #109 fix: single-rotation cap for the hook audit log. The hook
+// can't import from src/ (it's a standalone mjs invoked by Claude
+// Code's hook framework), so the rotation logic is inlined here.
+// Same shape and env var as src/log-rotation.ts.
+const LOG_MAX_BYTES = (() => {
+  const raw = process.env.LARK_LOG_MAX_BYTES;
+  if (!raw) return 50 * 1024 * 1024;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 50 * 1024 * 1024;
+})();
 
 // Tools that count as fulfilling a reply obligation for an inbound message.
 // - reply: standard answer; reply.reply_to → user's inbound message_id
@@ -46,6 +57,14 @@ function audit(line) {
   try {
     if (!existsSync(dirname(AUDIT_LOG))) {
       mkdirSync(dirname(AUDIT_LOG), { recursive: true });
+    }
+    // #109 fix: rotate at LOG_MAX_BYTES (default 50MB). Single
+    // rotated copy at `<path>.1`. Best-effort: stat / rename / append
+    // failures all swallowed — hook must never block on log I/O.
+    let size = 0;
+    try { size = statSync(AUDIT_LOG).size; } catch { /* not yet created */ }
+    if (size > LOG_MAX_BYTES) {
+      try { renameSync(AUDIT_LOG, AUDIT_LOG + '.1'); } catch { /* swallow */ }
     }
     appendFileSync(AUDIT_LOG, `${new Date().toISOString()}  ${line}\n`);
   } catch {
