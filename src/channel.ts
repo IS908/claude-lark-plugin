@@ -289,6 +289,8 @@ export class LarkChannel {
    */
   private ackReactions = new Map<string, { reactionId: string; addedAt: number }>();
   private ackPruneTimer: NodeJS.Timeout | null = null;
+  /** Guards `start()` against double-invocation (R1-followup on #85). */
+  private started = false;
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
   private latestMessageTracker = new LatestMessageTracker();
 
@@ -349,6 +351,17 @@ export class LarkChannel {
   }
 
   async start(): Promise<void> {
+    // R1-followup on #85: guard against double-invocation. Pre-fix a
+    // second start() call would arm a second ackPruneTimer and a second
+    // wsClient — leaking timers AND opening duplicate WebSockets. No
+    // current call site does this (main() calls start once), but the
+    // guard is cheap and removes a future-regression footgun.
+    if (this.started) {
+      console.error('[channel] start() called twice; ignoring second call');
+      return;
+    }
+    this.started = true;
+
     // Fetch bot's own open_id for filtering group @mentions
     await this.fetchBotOpenId();
 
@@ -404,6 +417,23 @@ export class LarkChannel {
     // .unref() so the timer never holds the process open by itself; if
     // everything else stops, Node can exit even with the timer pending.
     this.ackPruneTimer.unref?.();
+  }
+
+  /**
+   * Shutdown hook (R1-followup on #85). Clears the ackPrune timer and
+   * marks the channel un-started so a subsequent `start()` can re-init
+   * cleanly. Not called by the default `main()` flow (the process exit
+   * is responsible for releasing handles), but available for tests and
+   * for any future shutdown orchestration.
+   *
+   * Idempotent — safe to call multiple times.
+   */
+  stop(): void {
+    if (this.ackPruneTimer) {
+      clearInterval(this.ackPruneTimer);
+      this.ackPruneTimer = null;
+    }
+    this.started = false;
   }
 
   /**

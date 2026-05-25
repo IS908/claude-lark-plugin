@@ -28,8 +28,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Changed
 - `ackReactions` Map value shape: `string` → `{ reactionId: string; addedAt: number }`. The only setter (`src/channel.ts:handleMessageEvent`) was updated to include `addedAt: Date.now()`. The only consumer (`src/tools.ts:reply`) was updated to read `entry.reactionId`. No on-disk state is involved — the Map is in-process only, so nothing to migrate.
 
+### R1-audit followups (closed in this PR)
+- **`start()` double-call guard + idempotent `stop()`** — `LarkChannel` had no protection against `start()` being called twice. A double-call would have armed two `ackPruneTimer`s AND opened two WebSocket clients — silent timer/socket leak. No current caller does this (`main()` calls once), but the guard is cheap insurance against a future regression. Added a sibling `stop()` method that clears the timer and resets the `started` flag; idempotent, safe to call multiple times, useful for tests and any future shutdown orchestration.
+- **Tightened the TTL claim in operator notes** below — worst-case orphan lifetime is `ACK_TTL_MS + ACK_PRUNE_INTERVAL_MS` (= 6 min, not 5 min) because the strict-`>` staleness check (test 12) means an entry can be marked stale up to 60s after crossing the threshold, waiting for the next setInterval tick.
+
+### R1-audit findings filed as followups
+- **#136 — Pre-existing set-vs-revoke race exposed by the bulk-wipe fix**. `LarkChannel.handleMessageEvent` sets `ackReactions` inside an async `.then()` callback. If the ack-create HTTP round-trip outlasts Claude's reply formation, `revokeAckFor` runs BEFORE the entry exists → no-match branch → emoji sits on the user's message until the TTL backstop sweeps it (up to 6 min). Pre-fix the bulk-wipe accidentally caught this (next reply with no-match would wipe the just-created entry along with everything else); this PR removes that accidental safety net. The TTL backstop covers the worst case; a tighter fix (record `Promise<reactionId>`, or `pendingAckRevokes` Set so the .then() callback can see and act on a pending revoke) is filed for a separate PR.
+- **#137 — `react` and `download_attachment` tools don't revoke acks**. Pre-existing; not introduced by this PR. The Stop hook explicitly accepts `react` as a satisfying response to a Lark message, so a user message answered by reaction-only leaves the MeMeMe stuck until TTL. Worth closing for symmetry with this PR's "ack always clears" promise.
+
 ### Operator notes
-- The 5-minute TTL is intentionally longer than any reasonable Claude turn. If you have a deployment where turns regularly exceed 5 minutes (very large prompts + slow tools), the TTL backstop could revoke an ack mid-turn — the user would see the MeMeMe disappear before the reply lands. Tune via `ACK_TTL_MS` if needed (constant is exported from `src/channel.ts`).
+- The 5-minute TTL is intentionally longer than any reasonable Claude turn. **Worst-case orphan lifetime is ~6 minutes** (5 min TTL + 60s prune interval, with strict-`>` staleness check). If you have a deployment where turns regularly exceed 5 minutes (very large prompts + slow tools), the TTL backstop could revoke an ack mid-turn — the user would see the MeMeMe disappear before the reply lands. Tune via `ACK_TTL_MS` if needed (constant is exported from `src/channel.ts`).
 - The prune timer runs every 60s but uses `.unref()`, so it doesn't keep an otherwise-idle process alive (e.g. during `--dry-run`).
 - No data-format changes; no migration needed.
 
