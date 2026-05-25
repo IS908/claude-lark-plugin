@@ -27,7 +27,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JobScheduler } from '../src/scheduler.js';
-import { parseJobIdFromThread, setCronjobOutcomeHandler } from '../src/tools.js';
+import { parseJobIdFromThread, setCronjobOutcomeHandler, handlePermanentTargetError } from '../src/tools.js';
 import { IdentitySession } from '../src/identity-session.js';
 import { appConfig } from '../src/config.js';
 import { writeJob, readJob, deleteJob } from '../src/job-store.js';
@@ -248,43 +248,56 @@ try {
 
   // ── Part E: end-to-end via the cronjob outcome handler hook ──
 
-  // 9. setCronjobOutcomeHandler wiring: a 'permanent_failure' signal
-  //    routed through the handler increments the on-disk counter.
+  // 9. R1-followup: genuine end-to-end through handlePermanentTargetError.
+  //    Pre-followup this test re-imported tools.js with dead code and
+  //    just called notePromptJobOutcome directly — same as Part B, no
+  //    actual coverage of the handler-wiring chain. Now: wire the
+  //    handler, synthesize a Feishu permanent error, call
+  //    handlePermanentTargetError with a synthetic cronjob thread_id,
+  //    verify the counter increments via the full chain
+  //    (handlePermanentTargetError → cronjobOutcomeHandler →
+  //    scheduler.notePromptJobOutcome → fs writeJob).
   {
     const scheduler = makeScheduler(mockClient([]));
-    const job = makePromptJob('hook-test');
+    const job = makePromptJob('e2e-handler-test');
     await writeJob(job);
 
-    let handlerCallCount = 0;
+    let handlerSeen: { jobId: string; kind: string } | null = null;
     setCronjobOutcomeHandler((jobId, kind, ctx) => {
-      handlerCallCount++;
+      handlerSeen = { jobId, kind };
       void scheduler.notePromptJobOutcome(jobId, kind, ctx);
     });
 
-    // Simulate what reply tool does on permanent error:
-    const fakeThreadId = `job-hook-test-${Date.now()}`;
-    const parsedJobId = parseJobIdFromThread(fakeThreadId);
-    if (parsedJobId !== 'hook-test') fail(`9a: parseJobIdFromThread broken`);
+    // Synthetic Feishu permanent target error (shape from feishu-retry.ts)
+    const err: any = new Error('mock: chat not found');
+    err.response = { data: { code: 230002, msg: 'chat_not_found' } };
 
-    // Now call the handler as the tool would
-    // (need to reach the module-scope handler — we set it above)
-    // The actual signal comes from handlePermanentTargetError; here
-    // we simulate by direct call.
-    const { setCronjobOutcomeHandler: _set2 } = await import('../src/tools.js');
-    // Trigger via the cronjobOutcomeHandler path that tools.ts owns:
-    // we already set it above. Re-import doesn't reset.
-    // Direct invoke via the captured closure isn't possible — but
-    // calling scheduler.notePromptJobOutcome directly via the test
-    // proves the wiring. We've already proved the handler-call shape
-    // by Part B; this test is the integration check that the wiring
-    // is in place and increments persist across calls.
-    await scheduler.notePromptJobOutcome('hook-test', 'permanent_failure', { code: 230002, reason: 'kicked' });
+    // Call handlePermanentTargetError as the reply tool's catch block
+    // would, with the cronjob synthetic thread_id.
+    const fakeThreadId = `job-e2e-handler-test-${Date.now()}`;
+    const result = handlePermanentTargetError(err, {
+      tool: 'reply',
+      chat_id: 'oc_e2e-handler-test',
+      thread_id: fakeThreadId,
+    });
 
-    const after = await readJob('hook-test');
-    if (after!.runtime.consecutive_target_failures !== 1) {
-      fail(`9: hook-routed failure should increment counter, got ${after!.runtime.consecutive_target_failures}`);
+    // The handler returns a defer payload for the reply tool to return.
+    if (!result || !result.isError) {
+      fail(`9: handlePermanentTargetError should return a defer payload, got ${JSON.stringify(result)}`);
     }
-    await deleteJob('hook-test');
+    // Handler chain should have been invoked synchronously
+    if (!handlerSeen) fail(`9: cronjobOutcomeHandler was not invoked`);
+    if ((handlerSeen as any).jobId !== 'e2e-handler-test') fail(`9: wrong jobId, got ${(handlerSeen as any).jobId}`);
+    if ((handlerSeen as any).kind !== 'permanent_failure') fail(`9: wrong kind, got ${(handlerSeen as any).kind}`);
+
+    // notePromptJobOutcome is async (void-wrapped) — wait for fs write
+    await new Promise((r) => setTimeout(r, 30));
+
+    const after = await readJob('e2e-handler-test');
+    if (after!.runtime.consecutive_target_failures !== 1) {
+      fail(`9: end-to-end chain should increment counter on disk, got ${after!.runtime.consecutive_target_failures}`);
+    }
+    await deleteJob('e2e-handler-test');
     passed++;
   }
 
