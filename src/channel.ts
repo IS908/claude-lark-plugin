@@ -66,9 +66,21 @@ export function pruneStaleAcksImpl(
   for (const [messageId, entry] of ackReactions.entries()) {
     if (now - entry.addedAt > maxAgeMs) {
       ackReactions.delete(messageId);
-      client.im.v1.messageReaction.delete({
-        path: { message_id: messageId, reaction_id: entry.reactionId },
-      }).catch(() => {});
+      // #112 R2-followup: wrap in withFeishuRetry. Pre-followup a bare
+      // `.catch(() => {})` swallowed every error including rate-limits,
+      // so the orphaned MeMeMe could sit on the user's message
+      // forever under sustained QPS pressure (exactly the symptom
+      // #112 was filed against, just on the cleanup edge).
+      withFeishuRetry(
+        () => client.im.v1.messageReaction.delete({
+          path: { message_id: messageId, reaction_id: entry.reactionId },
+        }),
+        { label: 'ack.prune.delete' },
+      ).catch(() => {
+        // Final exhaustion — still swallow at the call-site level
+        // because this is best-effort cleanup. The retry already
+        // tried; nothing more to do.
+      });
       pruned++;
     }
   }

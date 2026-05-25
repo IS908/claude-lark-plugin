@@ -42,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Aggregate-budget note added to `HOT_PATH_RETRY_DELAYS_MS`** — clarifies that the 7s budget is per-call, not per-tool-invocation. A 5-chunk text reply where every chunk hits rate-limit can take up to 35s wall-clock. Acceptable for the pathological case; a future optimization could share a budget across chunks via a caller-supplied AbortController.
 - **2 new tests (20, 21)**: onRetry throw doesn't abort loop; code=0 doesn't misclassify post-truthy-check fix.
 
+### R2-audit followups (closed in this PR)
+- **Attachment uploads (`image.create`, `file.create`) now retry-wrapped** — R2 caught these bare `await`s in `tools.ts`. The outer loop's `catch (err) { console.error(...) }` silently dropped a rate-limited upload with only a stderr line; the user's attached image / file just vanished from the reply. Same rate-limit envelope as message sends, same fix shape (`reply.image.upload` / `reply.file.upload` labels).
+- **Ack-delete paths wrapped on both sides** — `pruneStaleAcksImpl` (channel.ts TTL backstop) and `revokeAckFor` (tools.ts reply finally-block) were still bare `.catch(() => {})`. Under sustained rate-limit, orphaned MeMeMe emojis would sit on user messages until the 5-min TTL re-tried — and even then could fail again silently. Now both wrapped (`ack.prune.delete` / `reply.ack.revoke` labels). Final-exhaustion still swallowed at the call-site since these are best-effort cleanup.
+- **CHANGELOG count drift** — scheduler suite is `40/40` (not `33/33` as initial PR body said; the #109 work added scheduler-side tracker tests). Reflects current state.
+
 ### Operator notes
 - No data-format or config changes; no env vars added.
 - Pre-#112 deployments may have seen sporadic "ack didn't land" or "reply death-spiral" issues in busy groups; both should be resolved post-deploy without intervention.

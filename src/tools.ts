@@ -494,9 +494,18 @@ export function registerTools(
           return;
         }
         ackReactions.delete(messageId);
-        client.im.v1.messageReaction.delete({
-          path: { message_id: messageId, reaction_id: entry.reactionId },
-        }).catch(() => {});
+        // #112 R2-followup: wrap in withFeishuRetry. Bare swallow
+        // pre-followup meant a rate-limited ack-revoke left the
+        // MeMeMe emoji on the user's message until the TTL backstop
+        // swept it (6 min worst case). With retry, transient
+        // failures get up to 3 attempts; the outer .catch only
+        // catches final exhaustion (still swallowed — best-effort).
+        withFeishuRetry(
+          () => client.im.v1.messageReaction.delete({
+            path: { message_id: messageId, reaction_id: entry.reactionId },
+          }),
+          { label: 'reply.ack.revoke' },
+        ).catch(() => {});
       }
 
       // #85 fix: try/finally wraps the entire send body so revokeAckFor
@@ -663,12 +672,21 @@ export function registerTools(
           try {
             const fileData = await fs.readFile(file.path);
             if (file.type === 'image') {
-              const resp = await client.im.v1.image.create({
-                data: {
-                  image_type: 'message',
-                  image: fileData as any,
-                },
-              });
+              // #112 R2-followup: wrap image.create in withFeishuRetry —
+              // attachment uploads share the same QPS envelope as message
+              // sends; pre-followup a rate-limited upload threw raw and
+              // the catch at the loop bottom silently dropped the
+              // user's image with only a stderr line. sendFollowup
+              // below already wraps separately.
+              const resp = await withFeishuRetry(
+                () => client.im.v1.image.create({
+                  data: {
+                    image_type: 'message',
+                    image: fileData as any,
+                  },
+                }),
+                { label: 'reply.image.upload' },
+              );
               const imageKey = (resp as any)?.data?.image_key ?? (resp as any)?.image_key;
               if (imageKey) {
                 const sent = await sendFollowup({
@@ -679,14 +697,17 @@ export function registerTools(
                 if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
               }
             } else {
-              // For file uploads, use im.v1.file.create
-              const resp = await client.im.v1.file.create({
-                data: {
-                  file_type: 'stream',
-                  file_name: path.basename(file.path),
-                  file: fileData as any,
-                },
-              });
+              // #112 R2-followup: same wrap for file.create.
+              const resp = await withFeishuRetry(
+                () => client.im.v1.file.create({
+                  data: {
+                    file_type: 'stream',
+                    file_name: path.basename(file.path),
+                    file: fileData as any,
+                  },
+                }),
+                { label: 'reply.file.upload' },
+              );
               const fileKey = (resp as any)?.data?.file_key ?? (resp as any)?.file_key;
               if (fileKey) {
                 const sent = await sendFollowup({
