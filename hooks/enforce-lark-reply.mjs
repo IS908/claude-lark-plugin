@@ -426,11 +426,34 @@ const SENTINEL_LINE_REGEXES = DEFER_SENTINELS.map(
 //   - Then indented code blocks (4+ spaces / tab at line start),
 //     stripped line-by-line.
 //
-// Residual gap filed for followup: unmatched single-backtick spans
-// (e.g. ``Look at `this then\n[LARK_DEFER]\nanyway``) survive because
-// the inline regex requires a close on the same line. Adversary-
-// reachable via "echo this verbatim" but lower-frequency than 1-7.
+// #139 fix (was: residual gap from #82): unmatched single-backtick
+// spans (e.g. "look at `weird thing\n[LARK_DEFER]\nokay") used to
+// survive because the inline case-6 regex required a close on the
+// same line. The naive fix (broaden case 6 to allow EOF as close)
+// over-blocked the realistic test-40 scenario (prose discussing
+// markdown with mid-line ``` followed by a legit defer sentinel) —
+// case 6 strips the first two of three backticks as an empty
+// inline span, leaving ONE residual backtick that the broadened
+// regex then eats along with the legit sentinel.
+//
+// Targeted fix: count ORIGINAL backticks in the text. If exactly
+// ONE, we're in the #139 attack shape (single solitary backtick) —
+// apply EOF-extend to consume it + anything that follows. Multi-`
+// patterns (test 40's "```") have count >= 3 and skip the extra
+// strip; their handling stays at case 6's same-line-close behavior.
+//
+// Trade-off limits:
+//   - Two unmatched solitary backticks across lines (count=2, even
+//     pair-able by case 6) → adversary path remains. More contrived
+//     to set up via "echo this" prompts; deferred.
+//   - Three solitary backticks not in a cluster (count=3) → would
+//     match test 40's heuristic and skip EOF-extend → adversary
+//     path remains for that very-contrived case.
+// Both residuals are documented LOW per the issue; this fix closes
+// the documented headline attack without regressing test 40.
 function stripCodeContent(text) {
+  // Pre-compute ORIGINAL backtick count for the #139 targeted strip below.
+  const originalTickCount = (text.match(/`/g) || []).length;
   // 1+2: matched-length backtick fence — \1 forces the close to be the
   // same length as the open, so outer 4-backtick fence around a
   // 3-backtick demo strips as one unit.
@@ -458,6 +481,12 @@ function stripCodeContent(text) {
   t = t.replace(/^~{3,}[\s\S]*/m, '');
   // 6: inline backtick spans (single-line)
   t = t.replace(/`[^`\n]*`/g, '');
+  // #139: targeted EOF-extend ONLY when original text had exactly 1
+  // backtick (the documented attack shape). See comment block above
+  // for the trade-off discussion.
+  if (originalTickCount === 1) {
+    t = t.replace(/`[^`]*$/, '');
+  }
   // 4: indented code blocks — any line starting with 4+ spaces.
   //    Per CommonMark these are code blocks; the sentinel regex would
   //    otherwise match because `^\s*` consumes the indent.

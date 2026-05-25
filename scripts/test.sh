@@ -179,4 +179,8 @@ echo "=== Prompt-job auto-pause unit checks ==="
 npx tsx scripts/prompt-job-auto-pause-smoke.ts
 
 echo ""
+echo "=== Stop hook (enforce-lark-reply) end-to-end checks ==="
+node hooks/test-enforce-lark-reply.mjs
+
+echo ""
 echo "All tests passed."
