@@ -183,4 +183,8 @@ echo "=== Stop hook (enforce-lark-reply) end-to-end checks ==="
 node hooks/test-enforce-lark-reply.mjs
 
 echo ""
+echo "=== Profile distillation Stage 2 orchestrator unit checks ==="
+npx tsx scripts/profile-distill-stage2-smoke.ts
+
+echo ""
 echo "All tests passed."

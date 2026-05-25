@@ -9,7 +9,7 @@ import { appConfig } from './config.js';
 import { LarkChannel } from './channel.js';
 import { registerTools, setCronjobOutcomeHandler } from './tools.js';
 import { ConversationBuffer } from './memory/buffer.js';
-import { buildFlushPrompt } from './memory/distiller.js';
+import { buildFlushPrompt, triggerProfileDistillation } from './memory/distiller.js';
 import { MemoryStore } from './memory/file.js';
 import { IdentitySession, SYSTEM_FLUSH_CALLER } from './identity-session.js';
 import { JobScheduler } from './scheduler.js';
@@ -210,7 +210,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.56' },
+    { name: 'claude-lark-plugin', version: '1.0.57' },
     {
       capabilities: {
         logging: {},
@@ -228,6 +228,14 @@ async function main() {
   channel.setIdentitySession(identitySession);
 
   // 4. Create conversation buffer + wire flush handler
+
+  // #113: per-user TTL cache for profile-distillation cooldown. Map<userId, lastDistillTimestamp>.
+  // No persistence across daemon restarts — restart resets the cooldown (acceptable;
+  // first post-restart flush may double-distill one user at worst). Orchestration
+  // logic lives in `triggerProfileDistillation` (src/memory/distiller.ts) so the
+  // shape is unit-testable; this Map is per-process state owned by main().
+  const profileDistillCooldownState = new Map<string, number>();
+
   const buffer = new ConversationBuffer();
   buffer.setFlushHandler(async (chatId, messages) => {
     // Generate flushKey FIRST so it can be interpolated into the
@@ -295,6 +303,43 @@ async function main() {
         text: flushPrompt,
         messageType: 'text',
         rawContent: flushPrompt,
+      });
+    }
+
+    // #113: Stage 2 — Episodes → Profile distillation. Fire-and-forget,
+    // per active user, rate-limited via per-user TTL cache. Off by
+    // default (LARK_PROFILE_DISTILL_ENABLED). See `triggerProfileDistillation`
+    // (src/memory/distiller.ts) for the per-user gating + dispatch logic.
+    if (appConfig.profileDistillEnabled) {
+      void triggerProfileDistillation(
+        chatId,
+        messages,
+        {
+          listEpisodes: (cid: string) => memoryStore.listEpisodes(cid),
+          getProfile: (uid: string, caller: string) => memoryStore.getProfile(uid, caller),
+          setCaller: (cid: string, tid: string, uid: string) => identitySession.setCaller(cid, tid, uid),
+          isPrivateChat: (cid: string) => channel.isPrivateChat(cid),
+          injectNotification: async (text: string, distillKey: string) => {
+            if (!channel['messageHandler']) return;
+            await channel['messageHandler']({
+              messageId: distillKey,
+              chatId,
+              chatType: 'system', // Stop-hook exempt
+              senderId: 'system',
+              threadId: distillKey,
+              text,
+              messageType: 'text',
+              rawContent: text,
+            });
+          },
+        },
+        {
+          cooldownMs: appConfig.profileDistillCooldownHours * 60 * 60 * 1000,
+          minEpisodes: appConfig.profileDistillMinEpisodes,
+          cooldownState: profileDistillCooldownState,
+        },
+      ).catch((err) => {
+        console.error(`[distill-stage2] orchestration error for chat ${chatId}: ${err?.message ?? err}`);
       });
     }
   });

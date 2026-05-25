@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.57] - 2026-05-26
+
+### Added
+- **Autonomous Stage 2 profile distillation, opt-in** (#113). Pre-#113, `profileDistillationPrompt` and `buildProfileDistillationPrompt` existed and were tested but had **no caller anywhere in src/** — profiles only got populated via explicit user-initiated `save_memory(type='profile_tiered')`. The product narrative ("bot remembers users") was unwired.
+
+  Post-fix: when `LARK_PROFILE_DISTILL_ENABLED=true`, after every Stage 1 (Buffer → Episode) auto-flush completes its dispatch, the system fires a follow-up Stage 2 (Episodes → Profile) turn for each active user in the just-flushed buffer. Gated by:
+  - **Cooldown** (`LARK_PROFILE_DISTILL_COOLDOWN_HOURS`, default 24h) — per-userId TTL. The same user across any chat won't be re-distilled until the cooldown expires.
+  - **Min-episodes** (`LARK_PROFILE_DISTILL_MIN_EPISODES`, default 5) — skip users whose `listEpisodes(chat)` length is below this floor. Avoids distilling sparse data into spurious facts.
+
+  Identity binding: each Stage 2 turn binds the **target user** as caller under a synthetic `thread_id=distill-<userId>-<ts>`. Claude's `save_memory(type='profile_tiered')` resolves caller server-side and writes to `profiles/<userId>/`. The L1 safety net (#54) + per-user mutex protect the writes.
+
+  Failure isolation: fire-and-forget — the orchestrator does NOT await Claude's turn. Each user iteration has its own try/catch so one user's failure doesn't stop others. Cooldown is marked on DISPATCH (not on success), so failed turns don't retry-storm into the next flush.
+
+### Implementation
+
+- New exported `triggerProfileDistillation(chatId, messages, deps, opts)` in `src/memory/distiller.ts` — dependency-injected orchestrator. Production deps (memoryStore + identitySession + channel + L2 loader) wired in `src/index.ts` setFlushHandler.
+- New config keys (off by default):
+  - `LARK_PROFILE_DISTILL_ENABLED` (default `false`)
+  - `LARK_PROFILE_DISTILL_COOLDOWN_HOURS` (default `24`)
+  - `LARK_PROFILE_DISTILL_MIN_EPISODES` (default `5`)
+- New `scripts/profile-distill-stage2-smoke.ts` (9 tests, wired into `scripts/test.sh`):
+  - Part A — gating (4): cooldown skip + expire-and-redispatch, min-episodes skip, no-eligible-users empty outcome, `system`/`bot` sentinel filter
+  - Part B — dispatch shape (3): identity binding (`setCaller` with `userId` as `callerId`), prompt body contains `userId` + `currentProfile` + recent episodes + `l2Rules`, cooldown marked on DISPATCH even when injection rejects
+  - Part C — failure isolation (2): per-user `getProfile` failure doesn't stop others, `loadL2Rules` failure tolerated (continues with empty rules)
+
+### Operator notes
+- **Default is OFF.** Existing deployments see no behavior change unless they set `LARK_PROFILE_DISTILL_ENABLED=true`. Opt-in is intentional — Stage 2 adds ~1 extra Claude turn per active user per cooldown window, multiplicative for busy group chats. Operator should size cost vs. value for their deployment.
+- **Cooldown is per-user-globally** (not per-user-per-chat). The same user being active in two different chats won't get distilled twice — the second flush sees them in cooldown. Acceptable trade-off — profile is per-user, not per-chat.
+- **First post-restart flush may double-distill** one user at most (cooldown state is in-memory, restart resets). Worst case is one wasted turn per user across restarts.
+- **No persistence required.** The cooldown Map lives in process memory; lost on restart by design.
+- **Recommended tuning** for a busy multi-chat deployment: raise `LARK_PROFILE_DISTILL_COOLDOWN_HOURS` to 48 or 72 to halve/third the cost; raise `LARK_PROFILE_DISTILL_MIN_EPISODES` to 10 to limit Stage 2 to "well-known" users only.
+
+---
+
 ## [1.0.56] - 2026-05-26
 
 ### Fixed

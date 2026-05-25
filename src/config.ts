@@ -158,6 +158,26 @@ export const appConfig = {
   // episode budget in line with the system-prompt envelope.
   episodeWriteCapBytes: optionalNumber('LARK_EPISODE_WRITE_CAP_BYTES', 8 * 1024),
   episodeInjectCapBytes: optionalNumber('LARK_EPISODE_INJECT_CAP_BYTES', 2 * 1024),
+  // #113 — autonomous profile distillation (Stage 2: Episodes → Profile).
+  //
+  // OFF by default. Operator opts in by setting LARK_PROFILE_DISTILL_ENABLED=true.
+  // Adds a follow-up Claude turn per active user per Stage 1 flush — small
+  // for a quiet bot, multiplicative for busy group chats. See CHANGELOG
+  // v1.0.57 for the trade-off discussion.
+  //
+  // - profileDistillEnabled: master switch. False → behaves identically
+  //   to pre-#113 (profiles populated only by explicit save_memory).
+  // - profileDistillCooldownHours: per-user TTL. The same user across
+  //   any chat won't be re-distilled until cooldown expires. Defaults
+  //   to 24h — once-per-day per user feels about right for "bot
+  //   remembers you" without spamming token cost.
+  // - profileDistillMinEpisodes: skip users whose `listEpisodes(chat)`
+  //   length is below this floor. Avoids distilling sparse data into
+  //   spurious "facts." Default 5 — enough signal to be worth a Stage 2
+  //   turn.
+  profileDistillEnabled: (process.env.LARK_PROFILE_DISTILL_ENABLED ?? '').toLowerCase() === 'true',
+  profileDistillCooldownHours: optionalPositiveNumber('LARK_PROFILE_DISTILL_COOLDOWN_HOURS', 24),
+  profileDistillMinEpisodes: optionalPositiveNumber('LARK_PROFILE_DISTILL_MIN_EPISODES', 5),
   // #110 fix: hard cap on per-chat buffer entries. The inactivity
   // timer was the only pre-fix bound; a chat that produced events
   // faster than the timer could fire (or a cronjob that kept
