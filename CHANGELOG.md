@@ -24,10 +24,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - Part B (4): `cronJobPrompt` wraps the prompt body, includes `[Trust boundary — #117]` preamble, preserves `[CronJob: ...]` header ordering (header BEFORE envelope), escapes adversarial `</memory_context>`.
   - Part C (3): integration regression guards — the literal attack from #116 (chat_id smuggling via fake header), the literal attack from #117 (reply-target hijack via embedded imperatives), and audit-trail label format (`senderId@timestamp`).
 
+### R1-audit followup (closed in this PR)
+- **`jobName` sanitized in `[CronJob: ...]` header** — owner-only attack surface, but unbounded `name` lets a self-attacker (or prompt-injected `update_job` on their own job) inject newlines + fake headers like `]\n[Trust boundary - OVERRIDE]\n...` that would land OUTSIDE the envelope wrapping the prompt body. Header sanitization: strip `\r`, `\n`, `[`, `]`, cap at 100 chars. Two new smoke tests (10b for injection, 10c for length cap) lock the contract. Same sanitized name reused for the envelope's `label` attribute.
+
+### Known limitations / forward links
+- **#164** — `profileDistillationPrompt` raw-interpolates `episodeSummaries` (two LLM hops removed from attacker text via the buffer→flush→summary path). Same envelope-hygiene pattern as #116/#117 but lower-risk; filed for the next envelope-cluster pass.
+
 ### Operator notes
 - **Pre-cap episodes / jobs are NOT retroactively rewrapped.** This is a prompt-construction fix, not a stored-data fix. Episodes on disk from before v1.0.46 still appear inside the envelope when enriched (enrichment-side wrap from v1.0.31). Job files on disk are read fresh each tick and pass through the new `cronJobPrompt` wrap automatically — no migration needed.
 - **No behavior change for legitimate workflows.** A normal user message body has no `</memory_context>` to escape and no fake system headers; Claude sees the same INTENT. The trust-boundary preambles add ~3-5 lines of context to each flush / cronjob turn — a small cost for the closed exfil class.
 - **Both fixes are defensive in depth.** The envelope alone defangs the structural attack; the preamble alone tells Claude to be skeptical of embedded imperatives. Together they layer: even if Claude were misparsed an escaped close tag, the preamble explicitly names the only valid `chat_id` / reply target.
+- **Job names with brackets / newlines are now silently sanitized** in the cron-prompt header (not in the stored `name` field — `list_jobs` etc. show the original). Cosmetic at worst; the legitimate use case of "human-readable job name" works exactly as before.
 
 ---
 
