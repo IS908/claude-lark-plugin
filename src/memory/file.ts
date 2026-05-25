@@ -139,6 +139,23 @@ export interface Skill {
   description: string;
   content: string;
   score?: number;
+  /**
+   * #98 fix: true when this skill's sidecar carries `migrated: true`,
+   * meaning it was claimed by `migrateLegacySkills` (v1.0.14) rather
+   * than authored via `save_skill`. Pre-v1.0.14 anyone in any chat
+   * could write skills; v1.0.14 closed the write path but the
+   * content of those legacy skills was unchanged when claimed for
+   * the OWNER. Read-time surfacing of this flag lets the enrichment
+   * step prepend a trust-calibration marker so Claude treats migrated
+   * skills with appropriate skepticism (per the audit's stated
+   * acceptance criterion).
+   *
+   * Undefined for skills with no sidecar (also indicates lower
+   * provenance — but channel.ts treats undefined the same as
+   * `migrated: true` for safety: any non-OWNER-authored skill gets
+   * the marker).
+   */
+  migrated?: boolean;
 }
 
 /**
@@ -970,10 +987,33 @@ export class MemoryStore {
       }
 
       results.sort((a, b) => b.score - a.score);
-      return results.slice(0, appConfig.maxSearchResults).map(r => ({
-        ...r.skill,
-        score: r.score,
+      const top = results.slice(0, appConfig.maxSearchResults);
+      // #98 fix: attach `migrated` flag from sidecar for each surfaced
+      // skill. enrichWithMemory uses it to prepend a trust-calibration
+      // marker so Claude treats migrated (pre-v1.0.14) skills with
+      // appropriate skepticism. Reads happen ONLY for the top-N
+      // results (default 2) so the IO cost is bounded.
+      //
+      // Sidecar read returns null for legacy skills with no sidecar
+      // — those predate v1.0.14 too, treated as migrated for safety
+      // (see channel.ts's || true branch).
+      const withMeta = await Promise.all(top.map(async (r) => {
+        const slug = MemoryStore.sanitizeSkillSlug(r.skill.name);
+        let migrated: boolean | undefined;
+        try {
+          const meta = await this.readSkillMeta(slug);
+          migrated = meta?.migrated === true ? true : undefined;
+        } catch {
+          // readSkillMeta swallows its own errors but defensive
+          migrated = undefined;
+        }
+        return {
+          ...r.skill,
+          score: r.score,
+          ...(migrated ? { migrated: true } : {}),
+        };
       }));
+      return withMeta;
     } catch {
       return [];
     }
