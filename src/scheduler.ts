@@ -80,76 +80,18 @@ export function isMissedRunStale(
   return nowMs - nextRunAtMs > thresholdMs;
 }
 
-/** Network/transient error codes that warrant a retry. */
-const RETRYABLE_NETWORK_ERRORS = new Set([
-  'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED',
-  'ECONNABORTED', 'EAI_AGAIN', 'EPIPE',
-]);
-
-/** HTTP status codes that warrant a retry. */
-const RETRYABLE_HTTP_CODES = new Set([429, 500, 502, 503, 504]);
-
-/**
- * Feishu API error codes indicating a TARGET-CHAT is permanently
- * unreachable from the bot's POV: kicked from group, chat dissolved/
- * archived, no permission to send. These are NOT transient — retrying
- * on the next tick would just fail again forever, spamming logs and
- * burning tokens (#106).
- *
- * When a cronjob hits one of these, the scheduler auto-pauses the job
- * and DMs the owner so they can decide whether to re-target or delete.
- *
- * 99991672 — permission denied (also marked non-retryable in isRetryableError)
- * 230002 / 230020 — chat not found / no permission to message this chat
- * 9499     — receive_id format invalid / target deactivated
- * 190005   — chat archived/disabled
- */
-export const PERMANENT_TARGET_CODES = new Set<number>([
-  99991672,
-  230002,
-  230020,
-  9499,
-  190005,
-]);
-
-/** Extract a numeric Feishu API code from a thrown error, or null. */
-export function getFeishuApiCode(err: any): number | null {
-  const code = err?.response?.data?.code ?? err?.data?.code;
-  return typeof code === 'number' ? code : null;
-}
-
-/** Extract a human-readable Feishu API message from a thrown error. */
-export function getFeishuApiMsg(err: any): string {
-  return err?.response?.data?.msg ?? err?.data?.msg ?? (err?.message ?? String(err));
-}
-
-function isRetryableError(err: any): boolean {
-  // Network-level errors (Node.js syscall errors)
-  if (err?.code && RETRYABLE_NETWORK_ERRORS.has(err.code)) return true;
-  if (err?.cause?.code && RETRYABLE_NETWORK_ERRORS.has(err.cause.code)) return true;
-
-  // HTTP status from Feishu SDK (wrapped in response)
-  const status = err?.response?.status ?? err?.status;
-  if (status && RETRYABLE_HTTP_CODES.has(status)) return true;
-
-  // Feishu API error codes — permission/param errors are NOT retryable
-  const apiCode = err?.response?.data?.code ?? err?.data?.code;
-  if (apiCode) {
-    // Known non-retryable Feishu codes
-    // 99991672 = permission denied, 230001 = param error
-    if (apiCode === 99991672 || apiCode === 230001) return false;
-    // Other Feishu codes starting with 9999 are usually transient
-    if (apiCode >= 99990000 && apiCode < 100000000) return true;
-  }
-
-  // Error message heuristics
-  const msg = (err?.message ?? '').toLowerCase();
-  if (msg.includes('timeout') || msg.includes('enotfound') || msg.includes('econnreset')) {
-    return true;
-  }
-
-  return false;
-}
+// #112 fix: classification + helpers moved to src/feishu-retry.ts so
+// the hot-path call sites (reply, edit_message, react, ack-reaction)
+// share the same "retryable" definition. Re-export PERMANENT_TARGET_CODES
+// and the getter helpers for back-compat (tests + tools.ts already
+// import them from here).
+import {
+  PERMANENT_TARGET_CODES,
+  isRetryableError,
+  getFeishuApiCode,
+  getFeishuApiMsg,
+} from './feishu-retry.js';
+export { PERMANENT_TARGET_CODES, getFeishuApiCode, getFeishuApiMsg };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

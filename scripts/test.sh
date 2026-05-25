@@ -130,4 +130,8 @@ echo "=== Episode prune unit checks ==="
 npx tsx scripts/episode-prune-smoke.ts
 
 echo ""
+echo "=== Feishu retry helper unit checks ==="
+npx tsx scripts/feishu-retry-smoke.ts
+
+echo ""
 echo "All tests passed."

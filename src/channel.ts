@@ -8,6 +8,7 @@ import { MessageQueue } from './queue.js';
 import { LARK_ID_REGEX } from './tools.js';
 import { TTLCache } from './ttl-cache.js';
 import { appendWithRotationSync } from './log-rotation.js';
+import { withFeishuRetry } from './feishu-retry.js';
 import type { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
@@ -65,9 +66,21 @@ export function pruneStaleAcksImpl(
   for (const [messageId, entry] of ackReactions.entries()) {
     if (now - entry.addedAt > maxAgeMs) {
       ackReactions.delete(messageId);
-      client.im.v1.messageReaction.delete({
-        path: { message_id: messageId, reaction_id: entry.reactionId },
-      }).catch(() => {});
+      // #112 R2-followup: wrap in withFeishuRetry. Pre-followup a bare
+      // `.catch(() => {})` swallowed every error including rate-limits,
+      // so the orphaned MeMeMe could sit on the user's message
+      // forever under sustained QPS pressure (exactly the symptom
+      // #112 was filed against, just on the cleanup edge).
+      withFeishuRetry(
+        () => client.im.v1.messageReaction.delete({
+          path: { message_id: messageId, reaction_id: entry.reactionId },
+        }),
+        { label: 'ack.prune.delete' },
+      ).catch(() => {
+        // Final exhaustion — still swallow at the call-site level
+        // because this is best-effort cleanup. The retry already
+        // tried; nothing more to do.
+      });
       pruned++;
     }
   }
@@ -600,10 +613,26 @@ export class LarkChannel {
     // Fire-and-forget ack reaction (Typing for P2P, MeMeMe for group @bot)
     const ackEmoji = chatType === 'p2p' ? 'Typing' : appConfig.ackEmoji;
     if (ackEmoji) {
-      this.client.im.v1.messageReaction.create({
-        path: { message_id: messageId },
-        data: { reaction_type: { emoji_type: ackEmoji } },
-      }).then((resp: any) => {
+      // #112 fix: wrap in withFeishuRetry so a rate-limit (99991400 /
+      // 99991663) doesn't silently disappear. Pre-fix the bare
+      // `.catch(() => {})` swallowed every error including transient
+      // ones; users saw the bot "go dead" in a busy group when the
+      // per-bot reaction QPS limit kicked in. With retry, transient
+      // failures get up to 3 short backoff attempts (500ms / 1500ms
+      // / 5000ms); on final exhaustion we debugLog the reason for
+      // operator visibility rather than silently no-oping.
+      withFeishuRetry(
+        () => this.client.im.v1.messageReaction.create({
+          path: { message_id: messageId },
+          data: { reaction_type: { emoji_type: ackEmoji } },
+        }),
+        {
+          label: 'ack',
+          onRetry: (attempt, delayMs, err) => {
+            debugLog(`[channel] ack retry ${attempt} after ${delayMs}ms (${(err as any)?.message ?? err})`);
+          },
+        },
+      ).then((resp: any) => {
         const reactionId = resp?.data?.reaction_id;
         if (reactionId) {
           // addedAt timestamp powers the TTL backstop (#85): pruneStaleAcks
@@ -612,7 +641,12 @@ export class LarkChannel {
           // forever or leak Map memory.
           this.ackReactions.set(messageId, { reactionId, addedAt: Date.now() });
         }
-      }).catch(() => {});
+      }).catch((err) => {
+        // #112: at least log on final exhaustion so an operator can see
+        // why a user's MeMeMe never landed. Silent-swallow pre-fix made
+        // this invisible.
+        debugLog(`[channel] ack gave up for ${messageId}: ${(err as any)?.message ?? err}`);
+      });
     }
 
     // Parse mentions
