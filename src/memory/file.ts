@@ -167,12 +167,70 @@ export interface SkillMeta {
  */
 export class MemoryStore {
   private baseDir: string;
+  /**
+   * Per-user async mutex for profile-tier read-modify-write operations
+   * (#54 fix). `saveProfile` and `removeProfileLine` both do
+   * `read existing → merge → write back`; two concurrent calls for the
+   * same userId from different chats (e.g. a cronjob with `created_by =
+   * ou_user` firing while user is messaging in a group, or two group
+   * chats both seeing distillation results land at once) would race —
+   * both read snapshot S, both compute different merges, second write
+   * silently clobbers the first → one fact lost with no user-visible
+   * error.
+   *
+   * Per-chat `MessageQueue` already serializes traffic within a single
+   * chat, so this only fires for CROSS-chat same-user concurrency. Map
+   * keyed by userId; values are the promise tail of the in-flight chain
+   * for that user. Empty Map in the steady state — entries are cleaned
+   * up on completion to prevent unbounded growth.
+   */
+  private profileMutex = new Map<string, Promise<void>>();
 
   constructor(baseDir?: string) {
     this.baseDir = baseDir ?? appConfig.memoriesDir;
   }
 
   async healthCheck(): Promise<boolean> { return true; }
+
+  /**
+   * Run `fn` under the per-user profile mutex (#54). Subsequent calls
+   * for the same userId queue behind any in-flight one; calls for
+   * different userIds proceed in parallel.
+   *
+   * Failures in `fn` do NOT poison subsequent calls — the chain
+   * advances regardless of outcome (matches `MessageQueue` semantics in
+   * `src/queue.ts`). The caller of `withProfileMutex` sees fn's own
+   * rejection; the next queued call still gets its turn.
+   *
+   * NOTE on deadlock safety: callers of this method must NOT recurse
+   * back into a mutex-wrapped function on the same userId. Today only
+   * `saveProfile` and `removeProfileLine` are wrapped, neither calls
+   * the other, and they don't call themselves. A future addition that
+   * violates this would deadlock — gate via code review.
+   */
+  private withProfileMutex<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.profileMutex.get(userId) ?? Promise.resolve();
+    // Chain fn after prev SYNCHRONOUSLY (no await between get and set —
+    // else two callers reading the same `prev` would both register as
+    // its successor and run in parallel, defeating the mutex).
+    const next: Promise<T> = prev.then(
+      () => fn(),
+      () => fn(), // run even if a prior call rejected
+    );
+    const tail: Promise<void> = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.profileMutex.set(userId, tail);
+    // Cleanup: delete the entry when this call's tail resolves AND no
+    // later call has chained on top. Prevents unbounded Map growth.
+    tail.then(() => {
+      if (this.profileMutex.get(userId) === tail) {
+        this.profileMutex.delete(userId);
+      }
+    });
+    return next;
+  }
 
   // ── User Profile (tiered, v0.10.0+) ──
 
@@ -321,6 +379,24 @@ export class MemoryStore {
     tier: Tier,
     mode: 'append' | 'replace' = 'append',
   ): Promise<void> {
+    // #54 fix: serialize cross-chat concurrent writes for the same userId.
+    return this.withProfileMutex(userId, async () => {
+      await this._saveProfileLocked(userId, content, tier, mode);
+    });
+  }
+
+  /**
+   * Body of saveProfile, callable only under the per-user profile mutex.
+   * Split from the public method so the mutex wrapping lives at the
+   * boundary and the body stays readable (and future internal callers
+   * that ARE already under the mutex can skip the re-entry).
+   */
+  private async _saveProfileLocked(
+    userId: string,
+    content: string,
+    tier: Tier,
+    mode: 'append' | 'replace',
+  ): Promise<void> {
     await this.migrateIfNeeded(userId);
 
     // L1 safety net (#75). CLAUDE.md promises a 3-layer defense
@@ -460,18 +536,25 @@ export class MemoryStore {
     tier: Tier,
     hash: string,
   ): Promise<{ removed: number; sample: string | null; allTexts: string[] }> {
-    const lines = await this.listProfileLines(ownerId, tier);
-    const targets = lines.filter((l) => l.hash === hash);
-    if (targets.length === 0) return { removed: 0, sample: null, allTexts: [] };
-    const kept = lines.filter((l) => l.hash !== hash);
+    // #54 fix: same per-user mutex as saveProfile. removeProfileLine has
+    // the same read-modify-write shape (`listProfileLines → filter →
+    // writeFile`) and the same cross-chat race window: a forget_memory
+    // in chat A concurrent with a save_memory in chat B for the same
+    // user would lose the save's delta if forget's write landed last.
+    return this.withProfileMutex(ownerId, async () => {
+      const lines = await this.listProfileLines(ownerId, tier);
+      const targets = lines.filter((l) => l.hash === hash);
+      if (targets.length === 0) return { removed: 0, sample: null, allTexts: [] };
+      const kept = lines.filter((l) => l.hash !== hash);
 
-    const next = kept.map((l) => `- ${l.text}`).join('\n') + (kept.length > 0 ? '\n' : '');
-    await fs.writeFile(this.profileTierPath(ownerId, tier), next, 'utf-8');
-    return {
-      removed: targets.length,
-      sample: targets[0].text,
-      allTexts: targets.map((t) => t.text),
-    };
+      const next = kept.map((l) => `- ${l.text}`).join('\n') + (kept.length > 0 ? '\n' : '');
+      await fs.writeFile(this.profileTierPath(ownerId, tier), next, 'utf-8');
+      return {
+        removed: targets.length,
+        sample: targets[0].text,
+        allTexts: targets.map((t) => t.text),
+      };
+    });
   }
 
   // ── Episodes ──

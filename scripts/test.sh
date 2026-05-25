@@ -110,4 +110,8 @@ echo "=== Reaction event whitelist + identity unit checks ==="
 npx tsx scripts/reaction-event-smoke.ts
 
 echo ""
+echo "=== Profile TOCTOU mutex unit checks ==="
+npx tsx scripts/profile-toctou-smoke.ts
+
+echo ""
 echo "All tests passed."
