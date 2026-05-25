@@ -871,6 +871,14 @@ export function registerTools(
           // Use the same 500-char prefix + sanitize-on-record rule as
           // reply's recordReply for consistency (the buffer stores
           // what the user actually saw — sanitized, length-capped).
+          //
+          // Both format paths mirror `safeText` (R1-followup note):
+          // - format='text': safeText IS what the user sees, directly.
+          // - format='card_markdown': edit_message wraps via
+          //   `Lark.messageCard.defaultCard({title:'', content:safeText})`;
+          //   the card chrome adds no user-visible body content, so
+          //   `safeText` is still what the user reads. Mirroring the
+          //   raw input is accurate for both.
           conversationBuffer.replaceLastAssistant(
             chat_id,
             safeText.slice(0, 500),
