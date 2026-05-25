@@ -99,6 +99,28 @@ let testNum = 0;
   testNum++;
 }
 
+// 6b. #153 followup: sub-codepoint cap with multi-byte leading char
+//     returns '' (NOT a content-free '\n... [truncated]' tag).
+//     '人abc' starts with a 3-byte CJK char; cap=1 walks end back
+//     to 0 → body would be empty → skip tag, return ''.
+{
+  if (MemoryStore.capByBytes('人abc', 1) !== '') {
+    fail(`6b: sub-codepoint cap on CJK lead should return '', got: ${JSON.stringify(MemoryStore.capByBytes('人abc', 1))}`);
+  }
+  if (MemoryStore.capByBytes('人abc', 2) !== '') {
+    fail(`6b: cap=2 on 3-byte lead should still return '' (need 3 bytes for first char)`);
+  }
+  // cap=3 fits exactly the first CJK char with no tag (no truncation needed beyond it)
+  // Actually wait: '人abc' = 3+1+1+1 = 6 bytes. cap=3 → buf.length=6 > 3 → truncate.
+  // end=3 → walk back: buf[3] = 'a' = 0x61 = NOT continuation (high bits 01xx) → end stays 3.
+  // body = '人' (3 bytes) → return '人\n... [truncated]'.
+  const out3 = MemoryStore.capByBytes('人abc', 3);
+  if (!out3.startsWith('人') || !out3.endsWith('\n... [truncated]')) {
+    fail(`6b: cap=3 on 3-byte lead should return '人' + tag, got: ${JSON.stringify(out3)}`);
+  }
+  testNum++;
+}
+
 // ── Part B: saveEpisode round-trip enforces the (default) cap ──
 
 // 7. Write a pathologically large episode at the DEFAULT cap, read

@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.45] - 2026-05-25
+
+### Cleanup batch — LOW-severity followups
+
+Per-release housekeeping pass to drain accumulated audit-followup queue. All four items below were filed during prior R1/R2 audits of v1.0.42–v1.0.44; none affect production behavior at default settings. Batched into a single PR to keep individual fixes reviewable while closing real noise.
+
+- **#154 — `appConfig` lifecycle documented in `src/config.ts`**. Several prior audits flagged comments at use sites that implied `appConfig.<key>` reads were "live" (would pick up runtime `process.env` mutations). They are not — `appConfig` is built once at module load and effectively frozen. Added a top-of-file docstring spelling this out, plus testing-pattern guidance (set env BEFORE the first import, or subprocess) so future contributors don't trip on the same footgun.
+
+- **#153 — `MemoryStore.capByBytes` returns `''` for sub-codepoint caps instead of a content-free tag**. Pre-fix, `capByBytes('人abc', 1)` returned `'\n... [truncated]'` — 16 bytes of "this got cut" with zero payload. Now returns `''` so callers can detect "nothing fit" cleanly. Production caps (defaults 2KB / 8KB) never hit this branch; the change matters only for pathological / hand-tuned tiny caps. Smoke test 6b added to `scripts/episode-cap-smoke.ts`.
+
+- **#161 — channel-side `.then()` consume integration is now smoke-covered**. The race-resolution body (consume the pending-revoke mark + immediately delete the just-created reaction OR store with timestamp) was previously inlined in `handleMessageEvent`'s `.then()`. Refactored into a new `LarkChannel.onAckCreated(messageId, reactionId): void` method (one-line call from the `.then()`); two new smoke tests in `scripts/ack-reaction-batch-smoke.ts`:
+  - Test 11: late-revoke race path — pre-marks pending, fires `onAckCreated`, asserts delete fires with right `reaction_id` and ack entry is NOT stored.
+  - Test 11b control: normal storage path — no pending mark → ack entry stored with `addedAt`, no delete fires.
+
+  Without these, a refactor flipping the consume/store order, dropping the early return, or removing the consume branch would have passed all 10 of the prior tests.
+
+- **#157 — closed as documented-already**. The TOCTOU between `isRecycledJob` check and `writeJob` is already covered by v1.0.43's CHANGELOG operator note ("If you're scripting rapid delete_job + create_job cycles ... sleep ≥100ms between calls"). Requires sub-ms timing of two operator-level actions; can re-open if a real repro surfaces. No code change; issue closed with cross-reference.
+
+### Deferred to a future cleanup batch
+
+- **#156** — `recoverMissedJobs` boot-time recycle window. Needs a real code change (re-read before `executeJob` in the recovery loop) + test; pulled out of this batch to keep scope tight.
+- **#159 / #160** — race protection for `react` and `reply.reply_to` validation. Both need a shared `recentInboundIds: TTLCache<messageId, true>` on `LarkChannel`. Pairing them into one infrastructure PR.
+
+### Process note
+
+This batch is the first deliberate "drain the LOW queue" PR after recognizing that each main-loop PR was averaging ~1 audit-followup filed per issue closed (net zero on the queue depth). Going forward: every 3-4 main-loop PRs, run one of these cleanup batches; raise the file-followup bar in R1/R2 audits (file only what could plausibly affect a user within ~1 month). Issue count itself isn't the metric — severity-weighted real-risk is — but the deliberate drain keeps the followup list reflective of actual residual work.
+
+---
+
 ## [1.0.44] - 2026-05-25
 
 ### Fixed
