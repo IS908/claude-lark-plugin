@@ -13,6 +13,7 @@ import { buildFlushPrompt } from './memory/distiller.js';
 import { MemoryStore } from './memory/file.js';
 import { IdentitySession, SYSTEM_FLUSH_CALLER } from './identity-session.js';
 import { JobScheduler } from './scheduler.js';
+import { runInboxGcOnce } from './inbox-gc.js';
 import { mcpServerInstructions } from './prompts.js';
 
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
@@ -209,7 +210,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.34' },
+    { name: 'claude-lark-plugin', version: '1.0.35' },
     {
       capabilities: {
         logging: {},
@@ -404,6 +405,26 @@ async function main() {
     botMessageTracker: channel.getBotMessageTracker(),
   });
   await scheduler.start();
+
+  // 11. Inbox garbage collection (#89). Pre-v1.0.35 the inbox grew
+  //     unboundedly. Run once at startup to sweep accumulated files,
+  //     then install a periodic timer at LARK_INBOX_GC_INTERVAL_MIN
+  //     cadence. `.unref()` so the timer never holds an idle process
+  //     open. Opt out with LARK_INBOX_GC_DISABLED=true for forensic
+  //     deployments that want everything preserved.
+  if (!appConfig.inboxGcDisabled) {
+    // Fire-and-forget; runInboxGcOnce swallows its own errors.
+    void runInboxGcOnce();
+    const intervalMs = appConfig.inboxGcIntervalMin * 60 * 1000;
+    const timer = setInterval(() => { void runInboxGcOnce(); }, intervalMs);
+    timer.unref?.();
+    console.error(
+      `[index] Inbox GC enabled (maxAge=${appConfig.inboxMaxAgeDays}d, ` +
+      `maxSize=${appConfig.inboxMaxSizeMB}MB, interval=${appConfig.inboxGcIntervalMin}min)`,
+    );
+  } else {
+    console.error('[index] Inbox GC disabled via LARK_INBOX_GC_DISABLED');
+  }
 
   console.error('[index] claude-lark-plugin started successfully');
 }

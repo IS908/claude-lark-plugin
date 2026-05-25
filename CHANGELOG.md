@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.35] - 2026-05-25
+
+### Fixed
+- **Inbox directory grew unboundedly — no rotation / GC for downloaded images and attachments** (#89 — **MEDIUM production disk hygiene**). `~/.claude/channels/lark/inbox/` was the unified landing zone for `LarkChannel.downloadImage` (auto-downloaded images from inbound messages) and the `download_attachment` tool. Both paths called `fs.writeFile` and never `fs.unlink` — no startup sweep, no periodic GC, no size cap. A heavy-image deployment (group with screenshots / PDFs / memes) would silently fill the disk over weeks (4MB screenshot × 50/day/group × multiple groups × 30 days easily exceeds 6GB/month). Privacy residue too: users assumed sending an image in chat was the end of it; the file in fact persisted locally forever even after plugin uninstall.
+
+  Fix: new `src/inbox-gc.ts` module exporting `gcInbox(opts)` pure function + `runInboxGcOnce()` wrapper for the scheduler. Two complementary policies:
+  - **Age expiry**: files with `mtime < now - maxAgeMs` are unlinked. Default 7 days — comfortably exceeds any reasonable Claude turn (largest observed is single-digit minutes), so a mid-turn `Read` of `image_path` notification meta always finds its file. Strict `<` boundary so an entry exactly at the threshold is borderline-kept (matches `isMissedRunStale` convention in `src/scheduler.ts`).
+  - **Size cap (LRU)**: if total directory size exceeds `maxSizeBytes` AFTER the age pass, sort surviving entries by `mtime` ascending and unlink oldest-first until under cap. Default 500 MB.
+
+  `src/index.ts` runs `runInboxGcOnce()` at startup, then installs a `setInterval` at `LARK_INBOX_GC_INTERVAL_MIN` cadence (default 60 min). `.unref()` so the timer never holds an idle process open.
+
+  Subdirectories are NOT recursed (the inbox is flat by file path construction in both call sites; `path.join(inboxDir, filename)` lands files at top-level only). The `e.isFile()` check at scan time skips any operator-created subdirectory (e.g. manual archival via `mv old/* inbox/archive-2026-04/`).
+
+  Best-effort throughout: `unlink` failures (file vanished concurrently, EACCES) are swallowed so one bad file doesn't abort cleanup of the rest. `readdir` failure (dir missing during a race) is a no-op.
+
+### Added
+- New module `src/inbox-gc.ts` — `gcInbox(opts)` returns `{ removed, bytesFreed, finalSize, remaining }` for tests + operator logging. `runInboxGcOnce()` is the timer wrapper that logs at info-level only when something was actually removed (silent on most idle ticks).
+- New `scripts/inbox-gc-smoke.ts` (10 tests, wired into `scripts/test.sh`):
+  - 1: missing directory → all-zeros result, no throw
+  - 2: empty directory → all-zeros
+  - 3: age expiry — older-than-cutoff deleted, fresher kept
+  - 4: boundary — file at exactly `cutoff` is KEPT (strict `<`); file at `cutoff - 1ms` is removed
+  - 5: size cap LRU — 5 × 100MB files, cap 250MB → 3 oldest evicted, 2 newest survive
+  - 6: combined — age pass removes 2, size pass removes 2 more; final state asserted
+  - 7: subdirectories untouched
+  - 8: nothing-to-do happy path (all fresh, under cap)
+  - 9: size cap boundary (total === cap, no eviction — strict `>`)
+  - 10: mixed file types — PNG, PDF, BIN, no-extension all eligible
+- New env vars (in `src/config.ts`):
+  - `LARK_INBOX_MAX_AGE_DAYS` (default 7) — age threshold in days
+  - `LARK_INBOX_MAX_SIZE_MB` (default 500) — directory size cap in MB
+  - `LARK_INBOX_GC_INTERVAL_MIN` (default 60) — periodic GC cadence in minutes
+  - `LARK_INBOX_GC_DISABLED` (default false) — opt-out for forensic / archival deployments
+
+### Operator notes
+- Pre-#89 deployments: on first startup after upgrade, the GC will sweep accumulated files older than 7 days AND evict to the 500MB cap. A long-running deployment with GBs of accumulated images will see a large one-shot cleanup in the startup log (`[inbox-gc] removed N file(s), freed XYZ MB ...`). This is intentional. If you want to preserve everything for one-time archival, set `LARK_INBOX_GC_DISABLED=true` for the first run, move what you need out of the inbox, then re-enable.
+- The startup line `[index] Inbox GC enabled (maxAge=7d, maxSize=500MB, interval=60min)` is the operator's confirmation that the GC is active and visible into the configuration.
+- Mid-turn safety: the 7-day age threshold is intentionally far larger than any reasonable Claude turn. A turn that opens an `image_path` from inbox WILL find its file. If you have unusual long-running turns (research agents, large prompts), tune `LARK_INBOX_MAX_AGE_DAYS` UP, never down.
+- Future improvement filed as a scope-note: month-subdirectory rotation (`inbox/2026-05/`) would make manual archival easier; not in this PR (keeps the flat-directory invariant the call sites assume).
+
 ## [1.0.34] - 2026-05-25
 
 ### Fixed
