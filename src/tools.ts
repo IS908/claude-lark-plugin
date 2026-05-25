@@ -1079,15 +1079,21 @@ export function registerTools(
           ],
           isError: true,
         };
-      } finally {
-        // #137 batch: download_attachment is a valid "I responded to
-        // the user" tool per the Stop hook (a user sending a file
-        // gets the bot's MeMeMe ack on receipt; the download itself
-        // is the response). Revoke regardless of success/failure so
-        // the MeMeMe clears immediately rather than waiting for the
-        // ~6 min TTL backstop.
-        revokeAckFor(message_id, 'download_attachment');
       }
+      // R2-audit followup: download_attachment does NOT revoke the
+      // ack. The Stop hook (`hooks/enforce-lark-reply.mjs` REPLY_TOOLS)
+      // only accepts `reply` and `react` as satisfying an inbound —
+      // download_attachment alone WILL be force-blocked, and Claude
+      // will follow up with reply (or react) which handles the
+      // revoke. Adding revoke here would either be redundant (the
+      // common case) or harmful: in the rare race where
+      // download_attachment runs and the follow-up reply somehow
+      // fails before its finally fires, we'd have cleared the
+      // MeMeMe without delivering any response — worst-of-both
+      // (no emoji AND no reply). Let reply own the revoke.
+      // Original #137 reasoning assumed download could be a terminal
+      // response, which the hook policy contradicts. See #159 for
+      // a smarter race-protection design.
     }
   );
 

@@ -71,13 +71,17 @@ let passed = 0;
 
 // ── Part B: FIFO cap eviction ──
 
-// 4. Filling past PENDING_REVOKE_CAP (500) evicts oldest first.
+// 4. Filling past PENDING_REVOKE_CAP evicts oldest first.
+//    R2-followup: reference LarkChannel.PENDING_REVOKE_CAP directly
+//    instead of hard-coding 500 — future cap changes won't silently
+//    desync this test's eviction expectations.
 {
   const ch = new LarkChannel();
-  // Mark CAP + 5 entries
-  for (let i = 0; i < 505; i++) ch.markPendingAckRevoke(`msg_${i}`);
-  if (ch.getPendingAckRevokeSize() !== 500) {
-    fail(`4: size should be capped at 500, got ${ch.getPendingAckRevokeSize()}`);
+  const cap = LarkChannel.PENDING_REVOKE_CAP;
+  // Mark cap + 5 entries
+  for (let i = 0; i < cap + 5; i++) ch.markPendingAckRevoke(`msg_${i}`);
+  if (ch.getPendingAckRevokeSize() !== cap) {
+    fail(`4: size should be capped at ${cap}, got ${ch.getPendingAckRevokeSize()}`);
   }
   // The first 5 should have been evicted
   if (ch.consumePendingAckRevoke('msg_0')) fail(`4: oldest entry msg_0 should be evicted`);
@@ -85,7 +89,7 @@ let passed = 0;
   // msg_5 should still be present (boundary)
   if (!ch.consumePendingAckRevoke('msg_5')) fail(`4: msg_5 should NOT be evicted`);
   // Latest entry preserved
-  if (!ch.consumePendingAckRevoke('msg_504')) fail(`4: latest entry msg_504 should be present`);
+  if (!ch.consumePendingAckRevoke(`msg_${cap + 4}`)) fail(`4: latest entry msg_${cap + 4} should be present`);
   passed++;
 }
 
@@ -228,9 +232,16 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
   passed++;
 }
 
-// ── Part E: download_attachment revokes ack ──
+// ── Part E: download_attachment intentionally does NOT revoke ack ──
 
-// 8. download_attachment with matching ack → revoke fires.
+// 8. download_attachment with matching ack → ack SURVIVES (R2-audit
+//    followup). The Stop hook only accepts `reply` and `react` as
+//    satisfying an inbound; download_attachment alone will be force-
+//    blocked, and Claude follows up with reply which handles the
+//    revoke. Revoking from download_attachment risks "no MeMeMe AND
+//    no reply" in the rare race where reply's follow-up fails before
+//    its finally fires. The cleaner contract: download is silent on
+//    the ack lifecycle.
 {
   const { ackReactions, client } = setupHandlers();
   const download = handlers.get('download_attachment');
@@ -238,29 +249,27 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
 
   ackReactions.set('om_dl_target', { reactionId: 'rxn_dl', addedAt: Date.now() });
 
-  // download will fail (mock returns minimal data which writeSdkResource
-  // will reject) but the finally must still fire.
   await download({
     message_id: 'om_dl_target',
     file_key: 'file_test',
     file_name: 'test.txt',
   }).catch(() => {});
 
-  // Even if the download path errored, revoke must have fired
+  // No revoke call should have been made
   const deleteCall = client.calls.find(c => c.method === 'messageReaction.delete');
-  if (!deleteCall) fail(`8: download_attachment should revoke ack on completion (success OR failure)`);
-  if (deleteCall!.args.path.reaction_id !== 'rxn_dl') {
-    fail(`8: wrong reaction_id in revoke, got ${deleteCall!.args.path.reaction_id}`);
+  if (deleteCall) {
+    fail(`8: download_attachment must NOT revoke ack (reply owns the revoke). Got delete call: ${JSON.stringify(deleteCall.args)}`);
   }
-  if (ackReactions.has('om_dl_target')) {
-    fail(`8: ack entry should be removed after revoke`);
+  // Ack entry survives — reply (which always follows download per
+  // Stop hook policy) will revoke it.
+  if (!ackReactions.has('om_dl_target')) {
+    fail(`8: ack entry must SURVIVE download_attachment (so reply can revoke it)`);
   }
   passed++;
 }
 
-// 9. download_attachment with NO matching ack → must NOT mark pending
-//    (same R1-followup rationale as react above — message_id parameter
-//    isn't guaranteed to be inbound).
+// 9. download_attachment with NO matching ack → no mark, no log.
+//    Confirms the no-op contract holds in the empty-Map case too.
 {
   const { channel } = setupHandlers();
   const download = handlers.get('download_attachment');
@@ -274,6 +283,9 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
 
   if (channel.consumePendingAckRevoke('om_no_ack_dl')) {
     fail(`9: download_attachment with no matching ack must NOT mark pending-revoke`);
+  }
+  if (channel.getPendingAckRevokeSize() !== 0) {
+    fail(`9: pendingAckRevokes should remain empty, got size ${channel.getPendingAckRevokeSize()}`);
   }
   passed++;
 }

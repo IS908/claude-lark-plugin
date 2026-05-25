@@ -384,7 +384,13 @@ export class LarkChannel {
    * never had acks). 500 entries × ~25 bytes/id ≈ 12.5KB — bounded.
    */
   private pendingAckRevokes = new Set<string>();
-  private static readonly PENDING_REVOKE_CAP = 500;
+  /**
+   * Cap for `pendingAckRevokes`. Public-static so the smoke test
+   * can reference it without hard-coding 500 (R2-followup —
+   * future cap changes shouldn't silently desync the test's
+   * eviction expectation). Treat as `readonly` from external code.
+   */
+  static readonly PENDING_REVOKE_CAP = 500;
   private ackPruneTimer: NodeJS.Timeout | null = null;
   /** Guards `start()` against double-invocation (R1-followup on #85). */
   private started = false;
@@ -486,7 +492,11 @@ export class LarkChannel {
     return this.pendingAckRevokes.delete(messageId);
   }
 
-  /** Test-only: inspect the pending-revoke set size. */
+  /**
+   * Test-only: inspect the pending-revoke set size.
+   * @internal Not for production callers. Tool handlers should rely on
+   *   `markPendingAckRevoke` / `consumePendingAckRevoke` instead.
+   */
   getPendingAckRevokeSize(): number {
     return this.pendingAckRevokes.size;
   }
