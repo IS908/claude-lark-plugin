@@ -5,7 +5,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyL1, loadL2Rules, addL2Rule, extractL2PrivatePhrases } from '../src/privacy-rules.js';
+import { applyL1, matchesKeyword, loadL2Rules, addL2Rule, extractL2PrivatePhrases } from '../src/privacy-rules.js';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -62,17 +62,52 @@ const l1Cases: [string, 'private' | 'public' | 'gray'][] = [
   // have flagged sk-ant-<English> as private. After tightening
   // (digit-or-underscore required in token-like body; sk-ant-
   // requires role+digits prefix), these stay gray.
-  // Note on input choice: avoid words containing "go" (e.g. algorithm,
-  // category, golang) because the pre-existing L1 whitelist keyword
-  // `Go` (the language) substring-matches them as `public`, masking
-  // the actual `token-like` decision we want to assert. Worth a
-  // separate cleanup PR — the whitelist substring matcher is too
-  // greedy on the short keyword `Go`. Filed for triage.
+  //
+  // #129 fix (v1.0.52): pre-fix the L1 WHITELIST substring-matched
+  // short keywords like `Go`, `PM`, `TL` against any word containing
+  // those characters — `algorithm` (al**go**rithm), `amp` (a**mp**),
+  // `title` (**tl**, kind of). Mask: the test cases below ORIGINALLY
+  // had to avoid "go"-words to assert their token-like behavior
+  // cleanly (see commit history of this file for the old workaround
+  // comment). Post-#129 the cases can use "go"-words freely.
   ['See the api-documentation-string for details', 'gray'],
   ['the token-bucket-rate-limit-pattern', 'gray'],
   ['read the secret-management-best-practices', 'gray'],
   ['sk-ant-cipated-future-events-here', 'gray'],          // English -ipated suffix
   ['sk-ant-arctic-temperature-anomaly', 'gray'],          // English geography phrase
+
+  // ── #129 direct regression guards — words containing whitelisted
+  // short keywords as substrings MUST stay `gray` (not auto-public).
+  // Pre-fix all returned `public` via aggressive substring match.
+  ['the token-bucket-rate-limit-algorithm', 'gray'],      // al**go**rithm — pre-fix matched "Go"
+  ['the category of bugs', 'gray'],                       // cate**go**ry — pre-fix matched "Go"
+  ['ago we discussed this', 'gray'],                      // a**go** — pre-fix matched "Go"
+  ['the amp circuit', 'gray'],                            // a**mp** — pre-fix matched "PM"
+  ['settle the title dispute', 'gray'],                   // title / settle — pre-fix matched "TL"
+  // Behavior change worth noting: "golang" (single word) no longer
+  // matches Go (word boundary required). Pre-fix matched via substring.
+  // Operators wanting golang-as-public can add 'golang' to L1_WHITELIST_KEYWORDS.
+  ['golang code review', 'gray'],
+
+  // ── #129 positive controls — short keywords MUST still match when
+  // they appear as standalone words (the fix didn't over-block).
+  ['I use Go daily', 'public'],                           // "Go" standalone
+  ['team lead PM here', 'public'],                        // "PM" standalone
+  ['as a TL on the project', 'public'],                   // "TL" standalone
+  ['CEO discussion', 'public'],                           // "CEO"
+  ['C++ programmer', 'public'],                           // "C++" — custom non-word boundary
+  ['I write Java for living', 'public'],                  // "Java" standalone
+
+  // ── #129 prefix-collision guards — "Java" must not match inside
+  // "JavaScript". Pre-fix substring would match "Java" in
+  // "JavaScript" too (harmless since both are whitelisted, but
+  // worth pinning the contract). Post-fix: "JavaScript" matches
+  // its own keyword via \b, no Java-collision.
+  ['JavaScript is fun', 'public'],                        // matches "JavaScript" directly
+  // `\bJavaScript\b` against "JavaScripts" (plural with `s` suffix):
+  // after "JavaScript", next char is `s` (\w), so `\b` doesn't match
+  // → gray. Same trade-off as "golang" above.
+  ['only JavaScripts allowed here', 'gray'],
 ];
 
 let l1Passed = 0;
@@ -175,4 +210,46 @@ extractPassed++;
 if (extractL2PrivatePhrases('## Always public\n- x\n').length !== 0) fail('extract.6');
 extractPassed++;
 
-console.log(`privacy-rules smoke: L1 ${l1Passed}/${l1Cases.length}, L2 ${l2Passed}/5, extract ${extractPassed}/6 — PASS`);
+// ── #129 direct unit tests on `matchesKeyword` (without round-tripping
+// through applyL1). Pins each branch of the three-way kind dispatch
+// explicitly so a future refactor can't drop one of them silently.
+let mkPassed = 0;
+const mkCases: [string, string, boolean][] = [
+  // ── Branch 1: non-ASCII keyword → substring (CJK has no \b semantics)
+  ['我有家庭矛盾要解决', '家庭矛盾', true],
+  ['这只是一个家庭故事', '家庭矛盾', false],     // CJK substring: "家庭故事" ≠ "家庭矛盾"
+  ['公司有矛盾', '矛盾', true],                  // single CJK char as substring
+  ['我喜欢这首歌', '矛盾', false],
+
+  // ── Branch 2: ASCII with non-word char (e.g. C++)
+  ['I write C++ code', 'C++', true],
+  ['I write C+ code', 'C++', false],
+  ['incrementing c++var', 'C++', false],        // "c++" inside "c++var" — c++ NOT followed by [^A-Za-z0-9_]
+  ['It is C++.', 'C++', true],                  // followed by punctuation
+  ['C++ at start', 'C++', true],
+  ['ends with C++', 'C++', true],
+
+  // ── Branch 3: pure-word ASCII → standard \b...\b
+  ['I use Go daily', 'Go', true],
+  ['the algorithm overview', 'Go', false],      // al**go**rithm — substring must NOT fire
+  ['ago we discussed', 'Go', false],            // a**go** — substring must NOT fire
+  ['team lead PM', 'PM', true],
+  ['amp circuit', 'PM', false],
+  ['as a TL on the project', 'TL', true],
+  ['settle the title', 'TL', false],
+  ['I use Java daily', 'Java', true],
+  ['JavaScript is fun', 'Java', false],         // Java inside JavaScript — \b prevents match
+
+  // ── Edge cases
+  ['', 'Go', false],                            // empty text
+  ['anything', '', false],                      // empty keyword (defense-in-depth)
+];
+for (const [text, kw, expected] of mkCases) {
+  const got = matchesKeyword(text, kw);
+  if (got !== expected) {
+    fail(`matchesKeyword(${JSON.stringify(text)}, ${JSON.stringify(kw)}) expected ${expected} got ${got}`);
+  }
+  mkPassed++;
+}
+
+console.log(`privacy-rules smoke: L1 ${l1Passed}/${l1Cases.length}, L2 ${l2Passed}/5, extract ${extractPassed}/6, matchesKeyword ${mkPassed}/${mkCases.length} — PASS`);

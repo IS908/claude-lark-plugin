@@ -106,17 +106,53 @@ export const L1_WHITELIST_KEYWORDS: string[] = [
 
 export type TierDecision = 'private' | 'public' | 'gray';
 
+/**
+ * #129 fix: keyword-boundary match. Pre-fix `lower.includes(kw)` would
+ * substring-match short ASCII keywords like `Go` (matches `algorithm` —
+ * al**go**rithm), `PM` (matches `amp`, `imp`, `pump`), `TL` (matches
+ * `title`, `settle`), aggressively misclassifying unrelated fact lines.
+ *
+ * Three branches by keyword shape:
+ *   1. Non-ASCII (CJK etc.) → substring (pre-fix behavior). `\b` is
+ *      ASCII-defined and would never fire for Chinese — every char
+ *      position is or isn't a boundary based on neighbor's script,
+ *      producing surprising semantics.
+ *   2. ASCII with non-word chars (e.g. `C++`) → custom boundary check
+ *      using `(?:^|[^A-Za-z0-9_])` + lookahead. `\b...\b` doesn't work
+ *      here because the trailing `+` is a non-word char and `\W→\W`
+ *      doesn't trigger a boundary.
+ *   3. Pure-word ASCII (KPI, PM, TL, CEO, Go, etc.) → standard
+ *      `\b...\b` regex with `i` flag for case-insensitivity.
+ *
+ * Exported for unit-test access — the test pins the contract directly
+ * rather than going through `applyL1`'s full classification logic.
+ */
+export function matchesKeyword(text: string, kw: string): boolean {
+  if (!kw) return false; // defense-in-depth (caller filters but exported API hardened)
+  // 1. Non-ASCII → substring fallback
+  // eslint-disable-next-line no-control-regex
+  if (!/^[\x20-\x7e]+$/.test(kw)) {
+    return text.toLowerCase().includes(kw.toLowerCase());
+  }
+  const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // 2. ASCII with non-word char (e.g. `C++`) → custom boundary
+  if (!/^\w+$/.test(kw)) {
+    return new RegExp(`(?:^|[^A-Za-z0-9_])${escaped}(?=$|[^A-Za-z0-9_])`, 'i').test(text);
+  }
+  // 3. Pure-word ASCII → standard \b...\b
+  return new RegExp(`\\b${escaped}\\b`, 'i').test(text);
+}
+
 /** Apply L1 only. Returns a decision or `gray` when L1 gives no signal. */
 export function applyL1(fact: string): TierDecision {
   for (const { regex } of L1_BLACKLIST_REGEX) {
     if (regex.test(fact)) return 'private';
   }
-  const lower = fact.toLowerCase();
   for (const kw of L1_BLACKLIST_KEYWORDS) {
-    if (lower.includes(kw.toLowerCase())) return 'private';
+    if (matchesKeyword(fact, kw)) return 'private';
   }
   for (const kw of L1_WHITELIST_KEYWORDS) {
-    if (lower.includes(kw.toLowerCase())) return 'public';
+    if (matchesKeyword(fact, kw)) return 'public';
   }
   return 'gray';
 }

@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.52] - 2026-05-25
+
+### Fixed
+- **L1 privacy keyword classifier substring-matched aggressively on short ASCII keywords** (#129). Pre-fix, `applyL1` used `lower.includes(kw.toLowerCase())` for both blacklist and whitelist keyword loops. Short keywords like `Go` (the language), `PM`, `TL`, `CEO` would substring-match any word containing those characters: `algorithm` (al**go**rithm) matched `Go`, `amp` (a**mp**) matched `PM`, `title` and `settle` matched `TL`. Result: distillation classifier silently marked any fact line containing those substrings as `public`, regardless of actual content. Real privacy exposure: a private fact containing the word "algorithm" or "category" got auto-classified as public via the misfired `Go` match.
+
+  This is the mirror-image of the #90 problem (over-broad PRIVATE rule via substring) but on the PUBLIC side — and it was pre-existing, just surfaced by PR #128's R1 audit. The smoke file even had a workaround comment noting the bug ("avoid words containing 'go'...") for tests that needed to assert `gray` cleanly.
+
+  Fix shape — new `matchesKeyword(text, kw): boolean` helper with three branches by keyword shape:
+  1. **Non-ASCII (CJK etc.)** → substring fallback (pre-fix behavior). `\b` is ASCII-defined and would never fire correctly for Chinese.
+  2. **ASCII with non-word chars (e.g. `C++`)** → custom boundary `(?:^|[^A-Za-z0-9_])${kw}(?=$|[^A-Za-z0-9_])`. Standard `\b...\b` doesn't work for symbol-suffix keywords because `\W→\W` doesn't trigger a boundary at the trailing `+`.
+  3. **Pure-word ASCII** → standard `\b...\b` regex with `i` flag.
+
+  Both L1_BLACKLIST_KEYWORDS and L1_WHITELIST_KEYWORDS loops now go through `matchesKeyword`. `applyL1`'s public contract is unchanged.
+
+### Added
+- New `matchesKeyword(text, kw): boolean` exported from `src/privacy-rules.ts`. Pure helper, exported for direct unit testing of each branch without round-tripping through `applyL1`'s full classification.
+- Privacy smoke now 79 cases total (was 44): +13 new L1 cases (#129 regression guards for `algorithm` / `ago` / `amp` / `title` / `settle` / `golang`, plus positive controls for `Go` / `PM` / `TL` / `CEO` / `C++` / `Java` standalone) + 21 `matchesKeyword` direct cases (three branches × edge cases).
+- The smoke's pre-existing workaround comment that noted the bug ("avoid words containing 'go'") is now an explicit regression guard with a #129 cross-reference.
+
+### Behavior changes worth flagging
+- **`golang` (single word) no longer auto-matches `Go` as public.** Pre-fix substring matched `Go` inside `golang`. Post-fix word-boundary requires `Go` as a standalone token. Affected fact lines fall through to `gray` (then L2/L3 classifies). Operators wanting `golang`-as-public can add `'golang'` to `L1_WHITELIST_KEYWORDS`.
+- **`JavaScripts` (plural with `s` suffix) no longer matches `JavaScript`.** Same trade-off as `golang`. The base singular `JavaScript` still matches as before.
+- **`Java` inside `JavaScript` doesn't match `Java`.** Pre-fix this was incidentally harmless (both whitelisted to `public`); post-fix the contract is cleaner — each keyword matches independently.
+
+### Operator notes
+- **No data-format or storage changes.** Existing profile tier files are unchanged. Only `applyL1`'s decision logic changes.
+- **No retroactive re-classification.** Facts already on disk under their pre-#129 classification stay there. Only NEW saves go through the corrected classifier.
+- **L2/L3 still catch anything that falls through to gray.** L1 was always advisory; L2 (user-edited `privacy-rules.md`) and L3 (LLM judgment) remain the final classifiers. The fix narrows L1's over-broad public auto-promotions.
+
+---
+
 ## [1.0.51] - 2026-05-25
 
 ### Fixed
