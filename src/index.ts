@@ -7,7 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
 import { LarkChannel } from './channel.js';
-import { registerTools } from './tools.js';
+import { registerTools, setCronjobOutcomeHandler } from './tools.js';
 import { ConversationBuffer } from './memory/buffer.js';
 import { buildFlushPrompt } from './memory/distiller.js';
 import { MemoryStore } from './memory/file.js';
@@ -210,7 +210,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.49' },
+    { name: 'claude-lark-plugin', version: '1.0.50' },
     {
       capabilities: {
         logging: {},
@@ -405,6 +405,16 @@ async function main() {
     botMessageTracker: channel.getBotMessageTracker(),
   });
   await scheduler.start();
+
+  // #121: wire the prompt-cronjob outcome handler so the reply tool's
+  // permanent-target-error / success paths can report back to the
+  // scheduler. Without this, prompt-type cronjobs targeting an
+  // unreachable chat fire a fresh Claude turn on every tick — the
+  // reply tool returns LARK_DEFER each time but the job never auto-
+  // pauses, burning tokens until an operator notices.
+  setCronjobOutcomeHandler((jobId, kind, ctx) => {
+    void scheduler.notePromptJobOutcome(jobId, kind, ctx);
+  });
 
   // 11. Inbox garbage collection (#89). Pre-v1.0.35 the inbox grew
   //     unboundedly. Run once at startup to sweep accumulated files,

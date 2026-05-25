@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.50] - 2026-05-25
+
+### Fixed
+- **Prompt-type cronjobs targeting unreachable chats never auto-paused** (#121, the prompt-type equivalent of #106's message-type auto-pause). Pre-fix, the message-type `executeMessageJob` path called Feishu's IM API directly and surfaced permanent error codes inline → `executeJob`'s failure handler classified + auto-paused after one strike. Prompt-type `executePromptJob` took a different route — emit a `notifications/claude/channel` notification with the prompt body, then Claude's own `reply` tool sends the user-facing message — so the scheduler NEVER saw the failure. Each tick fired a fresh Claude turn for a broken job; the reply tool correctly returned `[LARK_DEFER]` but the job stayed `active` → next tick, fresh turn, same defer, infinite token burn.
+
+  Fix shape (Option 1 from the issue — counter-based auto-pause, no per-tick API probe):
+  - **New `runtime.consecutive_target_failures?: number`** field on `JobFile.runtime` (optional, back-compat — legacy job files read as 0). Persisted so the count survives daemon restarts.
+  - **New `scheduler.notePromptJobOutcome(jobId, kind, ctx?)`** public method:
+    - `kind='permanent_failure'`: increment counter on disk. At `MAX_CONSECUTIVE_PROMPT_TARGET_FAILURES=3`, auto-pause the job + DM owner via the existing `notifyOwnerOnTargetFail` helper (same shape as the message-type auto-pause).
+    - `kind='success'`: reset counter to 0 (no-op if already 0 — saves a writeJob).
+  - **New `setCronjobOutcomeHandler` setter** in `src/tools.ts` lets the scheduler wire its callback after construction (scheduler is created after `registerTools`, so we use a setter rather than constructor injection).
+  - **`reply` tool calls the handler** on two paths: (1) `handlePermanentTargetError` now takes `thread_id`, parses out the job_id via the new `parseJobIdFromThread` helper, signals `'permanent_failure'`; (2) at the end of the success path, signals `'success'` to reset the counter.
+  - **`parseJobIdFromThread`** extracts the original `jobId` from synthetic thread_ids of shape `${JOB_THREAD_PREFIX}${jobId}-${timestamp}` — robust against jobIds containing hyphens or trailing digits (e.g. `cron-2026` → `cron-2026`, not `cron`).
+  - **Three strikes vs one strike**: the message-type path auto-pauses on one strike because the failure signal is the inline Feishu API response (zero misclassification risk). Prompt-type's signal comes from Claude's reply tool — confused by injection, sloppy reply paths, or one-off transients — so three consecutive is the right floor before pausing.
+
+### Added
+- New `MAX_CONSECUTIVE_PROMPT_TARGET_FAILURES = 3` constant in `src/scheduler.ts`.
+- New `scripts/prompt-job-auto-pause-smoke.ts` (10 tests, wired into `scripts/test.sh`):
+  - Part A (3): `parseJobIdFromThread` — standard shape, hyphen-+-digit jobIds, null on non-cronjob threads.
+  - Part B (3): `notePromptJobOutcome('permanent_failure')` increments at 1, 2; AUTO-PAUSES at 3 with owner DM.
+  - Part C (1): `notePromptJobOutcome('success')` resets a non-zero counter to 0; status stays active.
+  - Part D (1): recycle protection — `notePromptJobOutcome` preserves the NEW job's `created_at` (read-modify-write pattern).
+  - Part E (2): `setCronjobOutcomeHandler` wiring end-to-end; deleted job is a no-op (no resurrection).
+
+### Operator notes
+- **Behavior change for broken prompt-cronjobs**: post-fix, a prompt-type cronjob targeting a kicked / archived chat auto-pauses after 3 consecutive replies report permanent target errors. Owner gets a DM (same message shape as message-type auto-pause). Resume with `update_job(status='active')` after re-inviting the bot / changing the target.
+- **Counter resets on success**: an intermittent target outage that recovers (e.g. bot was briefly kicked, then re-invited) does NOT carry stale failures across the recovery. The first successful reply zeros the counter.
+- **`consecutive_target_failures` is optional** on disk for back-compat. Legacy jobs without the field read as 0 → first failure persists `1` and continues normally. No migration required.
+- **The 3-strike threshold matches the retry-attempt count used elsewhere** in the codebase. Tunable by editing the `MAX_CONSECUTIVE_PROMPT_TARGET_FAILURES` constant if a deployment has different tolerance.
+
+---
+
 ## [1.0.49] - 2026-05-25
 
 ### Cleanup batch #2 — drain audit-followup queue
