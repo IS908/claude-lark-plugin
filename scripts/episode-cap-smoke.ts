@@ -207,6 +207,30 @@ let testNum = 0;
     if (results4.length !== 0) {
       fail(`8: "thanks 👍" must yield 0; got ${results4.length}`);
     }
+
+    // R2-followup: flag emoji (Regional Indicator pair). Pre-R2-fix,
+    // `Extended_Pictographic` did NOT strip flag base letters, so
+    // "🇨🇳" survived as a length-4 non-ASCII token and the per-file
+    // gate became the only defense — it'd fail open on any episode
+    // containing the same flag (common in China-region Lark groups).
+    const results5 = await store.searchEpisodes('🇨🇳', { chatId: 'oc_cjk' });
+    if (results5.length !== 0) {
+      fail(`8: flag emoji "🇨🇳" must yield 0; got ${results5.length}`);
+    }
+
+    // R2-followup: skin-tone modifier. Pre-R2-fix stripped 👍 but
+    // left 🏽 as a length-2 non-ASCII residue token.
+    const results6 = await store.searchEpisodes('👍🏽', { chatId: 'oc_cjk' });
+    if (results6.length !== 0) {
+      fail(`8: skin-tone "👍🏽" must yield 0; got ${results6.length}`);
+    }
+
+    // R2-followup: keycap composite. Pre-R2-fix the keycap glyph
+    // U+20E3 survived even after the base digit was filtered.
+    const results7 = await store.searchEpisodes('1️⃣', { chatId: 'oc_cjk' });
+    if (results7.length !== 0) {
+      fail(`8: keycap "1️⃣" must yield 0; got ${results7.length}`);
+    }
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
   }

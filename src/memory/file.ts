@@ -1398,14 +1398,26 @@ export class MemoryStore {
       '是的', '没事', '谢谢', '感谢', '可以', '行的',
     ]);
 
-    // #100 R1-followup: strip emoji before splitting. Emoji surrogate
-    // pairs have `.length === 2` in JS UTF-16, so a single 👍 passes
-    // the `length > 1` filter as `"👍"`. The non-ASCII substring path
-    // would then match any episode that quoted the same emoji — same
-    // pollution mode as the Chinese-ack case.
-    // \p{Extended_Pictographic} covers the Unicode emoji set; the
-    // `u` flag enables property escapes.
-    const stripped = query.replace(/\p{Extended_Pictographic}/gu, ' ');
+    // #100 R1-followup + R2-followup: strip emoji and emoji-adjacent
+    // glyphs before splitting. Emoji surrogate pairs have `.length === 2`
+    // in JS UTF-16, so a single 👍 passes the `length > 1` filter as
+    // `"👍"`. The non-ASCII substring path would then match any episode
+    // that quoted the same emoji — same pollution mode as the Chinese-
+    // ack case.
+    //
+    // R2 expanded the strip to four Unicode classes — `Extended_Pictographic`
+    // alone misses common Lark/CN-region symbols that flow through chat:
+    //   - `Regional_Indicator` (U+1F1E6–U+1F1FF): flag base letters.
+    //     A flag like 🇨🇳 is two regional-indicator code points (4
+    //     UTF-16 units); without the strip it survives as a non-ASCII
+    //     "token" and re-opens the recall pollution that #100 closed.
+    //   - `Emoji_Modifier` (U+1F3FB–U+1F3FF): skin-tone modifiers.
+    //     Removing only the base glyph 👍 from 👍🏽 leaves "🏽" as a
+    //     length-2 token. Stripping the modifier too is the only way
+    //     to leave nothing behind.
+    //   - `⃣` (COMBINING ENCLOSING KEYCAP): used in keycap
+    //     composites like 1️⃣. Same residue argument as skin tones.
+    const stripped = query.replace(/[\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}⃣]/gu, ' ');
 
     return stripped
       .toLowerCase()
