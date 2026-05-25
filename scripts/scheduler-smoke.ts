@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isMissedRunStale, JobScheduler } from '../src/scheduler.js';
 import { IdentitySession } from '../src/identity-session.js';
+import { BotMessageTracker } from '../src/channel.js';
 import { appConfig } from '../src/config.js';
 import {
   mostRecentMissedSlot,
@@ -141,11 +142,12 @@ function makeJob(id: string, nextRunAt: string, createdBy = 'ou_owner'): JobFile
   };
 }
 
-function makeScheduler(client: any): JobScheduler {
+function makeScheduler(client: any, botMessageTracker?: any): JobScheduler {
   return new JobScheduler({
     server: mockServer as any,
     client,
     identitySession: new IdentitySession(() => null),
+    botMessageTracker,
   });
 }
 
@@ -988,9 +990,134 @@ try {
     }
     passed++;
   }
+  // ── Part H: cronjob outbound tracking (v1.0.33, #81) ────────────
+  //   Pre-fix the scheduler sent message-type cronjobs and stale-skip
+  //   / auto-pause notices directly via client.im.v1.message.create
+  //   without informing BotMessageTracker. A user reacting to those
+  //   messages hit handleReactionEvent → tracker.get(id) → undefined →
+  //   silently dropped. v1.0.33 plumbs the optional tracker through
+  //   SchedulerOptions and adds the sent id + chatId at every cronjob
+  //   send point. These tests pin each call site.
+
+  // Helper: build a tracker that records {id, chatId, threadId} for assertion
+  function makeTracker() {
+    const calls: { id: string; chatId: string; threadId?: string }[] = [];
+    const tracker = new BotMessageTracker(50);
+    const origAdd = tracker.add.bind(tracker);
+    tracker.add = (id: string, chatId: string, threadId?: string) => {
+      calls.push({ id, chatId, threadId });
+      origAdd(id, chatId, threadId);
+    };
+    return { tracker, calls };
+  }
+
+  // 30. executeMessageJob tracks the sent message under target_chat_id.
+  {
+    const sent: SentMessage[] = [];
+    const { tracker, calls } = makeTracker();
+    const scheduler = makeScheduler(mockClient(sent), tracker);
+    const job = makeJob('track-msg-job', new Date(Date.now() + HOUR).toISOString());
+    job.meta.content = 'morning briefing';
+    await (scheduler as any).executeMessageJob(job);
+
+    if (sent.length !== 1) fail(`30: expected 1 send, got ${sent.length}`);
+    if (calls.length !== 1) fail(`30: tracker.add must fire once, got ${calls.length}`);
+    if (calls[0].id !== 'mock') fail(`30: wrong id tracked: ${calls[0].id}`);
+    if (calls[0].chatId !== 'oc_track-msg-job') {
+      fail(`30: wrong chatId tracked: ${calls[0].chatId} (expected target_chat_id)`);
+    }
+    if (calls[0].threadId !== undefined) {
+      fail(`30: cronjob messages have no thread; threadId should be undefined`);
+    }
+    if (!tracker.has('mock')) fail(`30: tracker.has must return true post-track`);
+    passed++;
+  }
+
+  // 31. executeMessageJob WITHOUT a tracker (backward-compat) — no
+  //     throw, just degrades to pre-#81 untracked behavior.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent)); // no tracker
+    const job = makeJob('untracked-job', new Date(Date.now() + HOUR).toISOString());
+    job.meta.content = 'reminder';
+    let threw = false;
+    try {
+      await (scheduler as any).executeMessageJob(job);
+    } catch {
+      threw = true;
+    }
+    if (threw) fail(`31: missing tracker must not throw`);
+    if (sent.length !== 1) fail(`31: send still happens without tracker`);
+    passed++;
+  }
+
+  // 32. notifyStaleSkip Tier 1 (target chat reachable) tracks the
+  //     stale-notice message under target_chat_id.
+  {
+    const sent: SentMessage[] = [];
+    const { tracker, calls } = makeTracker();
+    const scheduler = makeScheduler(mockClient(sent), tracker);
+    const staleJob = makeJob('track-stale-tier1', new Date(Date.now() - 3 * 24 * HOUR).toISOString());
+    await (scheduler as any).recoverMissedJobs([staleJob]);
+
+    // notifyStaleSkip should track exactly the one Tier-1 send.
+    const stalecalls = calls.filter((c) => c.chatId === 'oc_track-stale-tier1');
+    if (stalecalls.length !== 1) {
+      fail(`32: expected 1 tracked stale-skip notice, got ${stalecalls.length}`);
+    }
+    passed++;
+  }
+
+  // 33. notifyStaleSkip Tier 2 (target chat fails → owner DM) tracks
+  //     the DM message under created_by (open_id key — DMs in Feishu
+  //     are addressed via the recipient's open_id, which IdentitySession
+  //     treats as the chat-key for that 1:1 conversation).
+  {
+    const sent: SentMessage[] = [];
+    const { tracker, calls } = makeTracker();
+    // chat_id sends throw; open_id sends record
+    const scheduler = makeScheduler(mockClient(sent, (t) => t === 'chat_id'), tracker);
+    const staleJob = makeJob('track-stale-tier2', new Date(Date.now() - 3 * 24 * HOUR).toISOString());
+    await (scheduler as any).recoverMissedJobs([staleJob]);
+
+    // The Tier-1 send threw → tracker.add NOT called for chat_id (the
+    // resp never arrives because the throw is before trackOutbound).
+    // The Tier-2 DM succeeded → tracker.add called for the open_id.
+    if (calls.length !== 1) {
+      fail(`33: expected exactly 1 tracker.add (Tier-2 DM only), got ${calls.length}`);
+    }
+    if (calls[0].chatId !== 'ou_owner') {
+      fail(`33: Tier-2 should track under created_by (open_id), got ${calls[0].chatId}`);
+    }
+    passed++;
+  }
+
+  // 34. notifyOwnerOnTargetFail (permanent target error → owner DM)
+  //     tracks the auto-pause notice DM under created_by.
+  {
+    const sent: SentMessage[] = [];
+    const { tracker, calls } = makeTracker();
+    const scheduler = makeScheduler(permanentTargetMock(sent, 230002), tracker);
+    const job = makeJob('track-autopause', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+    await (scheduler as any).executeJob(job);
+
+    // permanentTargetMock: chat_id throws (230002), open_id (DM) records.
+    // executeJob → failure path → notifyOwnerOnTargetFail → DM via open_id.
+    if (calls.length !== 1) {
+      fail(`34: expected exactly 1 tracker.add (owner DM only), got ${calls.length}`);
+    }
+    if (calls[0].chatId !== 'ou_owner') {
+      fail(`34: DM should track under created_by (open_id), got ${calls[0].chatId}`);
+    }
+    if (!tracker.has(calls[0].id)) {
+      fail(`34: tracker should report has() true post-track`);
+    }
+    passed++;
+  }
 } finally {
   (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }
 
-console.log(`scheduler smoke: ${passed}/33 PASS`);
+console.log(`scheduler smoke: ${passed}/38 PASS`);

@@ -209,7 +209,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.32' },
+    { name: 'claude-lark-plugin', version: '1.0.33' },
     {
       capabilities: {
         logging: {},
@@ -397,6 +397,11 @@ async function main() {
     server: server.server,
     client: channel.getClient(),
     identitySession,
+    // #81: pass the same tracker the reply tool uses so cronjob-sent
+    // messages (message-type jobs + scheduler notices) also land in
+    // the tracker — without this, reactions on them silently drop in
+    // handleReactionEvent.
+    botMessageTracker: channel.getBotMessageTracker(),
   });
   await scheduler.start();
 

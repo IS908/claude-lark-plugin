@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.33] - 2026-05-25
+
+### Fixed
+- **Cronjob outbound messages bypassed `BotMessageTracker`** (#81 — **MEDIUM reactions on cronjob messages silently dropped**). Pre-fix only the `reply` tool's success paths called `botMessageTracker.add`; the scheduler's three direct `client.im.v1.message.create` call sites (`executeMessageJob`, `notifyStaleSkip` Tier 1/2, `notifyOwnerOnTargetFail`) sent messages WITHOUT informing the tracker. A user reacting to a cronjob-delivered message (daily briefing, stale-skip notice, auto-pause alert) hit `handleReactionEvent` → `botMessageTracker.get(messageId)` → `undefined` → silently dropped. The intended UX of "react to a cronjob with a thumbs-up to acknowledge" was completely non-functional.
+
+  Fix: new private helper `JobScheduler.trackOutbound(resp, chatId)` calls `botMessageTracker.add(id, chatId)` after each successful cronjob send. Wired through:
+  - `executeMessageJob` — tracks under `job.meta.target_chat_id`
+  - `notifyStaleSkip` Tier 1 (target chat) — tracks under `target_chat_id`
+  - `notifyStaleSkip` Tier 2 (owner DM fallback) — tracks under `created_by` (open_id; DMs in Feishu are addressed via the recipient's open_id, which `IdentitySession` treats as the chat-key for that 1:1 conversation)
+  - `notifyOwnerOnTargetFail` (auto-pause notice DM, #106) — tracks under `created_by`
+
+  `SchedulerOptions.botMessageTracker` is optional (legacy callers and tests that don't pass one continue to work, with absence degrading silently to pre-fix behavior). `src/index.ts` wires `channel.getBotMessageTracker()` through to the scheduler so production uses the same shared tracker the `reply` tool populates.
+
+  Threading: cronjob outbound has no `thread_id` (message-type jobs and scheduler notices are fresh single sends, not replies into an existing thread). Reactions to cronjob messages bind at the chat level, which is correct — a reaction belongs to whoever reacted, not to the cronjob owner.
+
+### Added
+- 5 new scheduler-smoke assertions (Part H, tests 30–34):
+  - **30**: `executeMessageJob` with tracker present → `tracker.add` fires exactly once with `(sentId, target_chat_id, undefined)`.
+  - **31**: `executeMessageJob` WITHOUT tracker → no throw (backward compat).
+  - **32**: `notifyStaleSkip` Tier 1 success → exactly one tracker entry under `target_chat_id`.
+  - **33**: `notifyStaleSkip` Tier 1 fails → Tier 2 (owner DM) succeeds → exactly one tracker entry under `created_by` (open_id).
+  - **34**: `notifyOwnerOnTargetFail` (#106 auto-pause path) → exactly one tracker entry under `created_by`.
+
+### Scope notes
+- **`edit_message` intentionally NOT updated**: Feishu's `im.v1.message.patch` edits in-place (same `message_id`, no new id returned). The original `reply` already tracked that id — if it's been FIFO-evicted by the time the user reacts to the edited content, the eviction is the actual cause, not the lack of an `edit_message` re-add. Adding `edit_message` to the tracking surface would require either an extra `message.get` round-trip (to recover `chat_id`) or a new optional `chat_id` parameter on the tool. Deferred unless a real user-reported case surfaces.
+- **`react` tool intentionally NOT updated**: the `react` tool adds an emoji reaction to a user's message — it doesn't produce a NEW message, so there's nothing to track.
+
+### Operator notes
+- No data-format or config changes. The shared tracker is in-process only and bounded at `LARK_BOT_MESSAGE_TRACKER_SIZE` (default 500); cronjob messages now share that budget with reply tool messages. In high-traffic deployments (many concurrent cronjobs + active chat), raise the env if reactions to older cronjob cards aren't landing.
+- Pre-#81 reactions on cronjob messages were silently dropped (or logged via the dedupe breadcrumb added in #80 R2-followup). Post-#81 they route normally through `handleReactionEvent` → identity binding → Claude notification.
+
 ## [1.0.32] - 2026-05-25
 
 ### Fixed
