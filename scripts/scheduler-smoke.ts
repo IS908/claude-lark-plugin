@@ -1115,9 +1115,129 @@ try {
     }
     passed++;
   }
+  // 35. R2-followup: direct unit test of trackOutbound's silent-drop
+  //     contract. Pre-followup the helper just did `if (id && chatId)`
+  //     with no breadcrumb on miss — a future refactor that broke the
+  //     contract (e.g. an assertion throw) would silently pass the
+  //     existing call-site tests. This pins the behavior:
+  //     - no tracker → silent return (used by tests like test 31)
+  //     - missing message_id → no tracker.add + stderr breadcrumb
+  //     - empty chatId → same
+  //     - valid id + chatId → exactly one tracker.add
+  {
+    // Sub-case (a): no tracker → silent return, no throw
+    const sched_a = makeScheduler(mockClient([])); // no tracker
+    let threw = false;
+    try {
+      (sched_a as any).trackOutbound({ data: { message_id: 'm' } }, 'oc_x');
+    } catch {
+      threw = true;
+    }
+    if (threw) fail(`35a: missing tracker must not throw`);
+
+    // Sub-case (b): tracker + missing message_id → breadcrumb, no add
+    const { tracker: t_b, calls: c_b } = makeTracker();
+    const sched_b = makeScheduler(mockClient([]), t_b);
+    const errors_b: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors_b.push(args.map(String).join(' ')); };
+    try {
+      (sched_b as any).trackOutbound({ data: {} }, 'oc_x'); // no message_id
+    } finally {
+      console.error = origError;
+    }
+    if (c_b.length !== 0) fail(`35b: no add when message_id missing (got ${c_b.length})`);
+    if (!errors_b.some((e) => /trackOutbound/.test(e) && /not tracked/.test(e))) {
+      fail(`35b: missing message_id must emit breadcrumb; got: ${errors_b.join(' | ')}`);
+    }
+
+    // Sub-case (c): tracker + empty chatId → breadcrumb, no add
+    const { tracker: t_c, calls: c_c } = makeTracker();
+    const sched_c = makeScheduler(mockClient([]), t_c);
+    const errors_c: string[] = [];
+    console.error = (...args: unknown[]) => { errors_c.push(args.map(String).join(' ')); };
+    try {
+      (sched_c as any).trackOutbound({ data: { message_id: 'm' } }, '');
+    } finally {
+      console.error = origError;
+    }
+    if (c_c.length !== 0) fail(`35c: no add when chatId empty (got ${c_c.length})`);
+    if (!errors_c.some((e) => /trackOutbound/.test(e))) {
+      fail(`35c: empty chatId must emit breadcrumb`);
+    }
+
+    // Sub-case (d): valid id + chatId → exactly one add, no breadcrumb
+    const { tracker: t_d, calls: c_d } = makeTracker();
+    const sched_d = makeScheduler(mockClient([]), t_d);
+    const errors_d: string[] = [];
+    console.error = (...args: unknown[]) => { errors_d.push(args.map(String).join(' ')); };
+    try {
+      (sched_d as any).trackOutbound({ data: { message_id: 'm_ok' } }, 'oc_ok');
+    } finally {
+      console.error = origError;
+    }
+    if (c_d.length !== 1 || c_d[0].id !== 'm_ok' || c_d[0].chatId !== 'oc_ok') {
+      fail(`35d: valid input must add exactly once with (id, chatId); got ${JSON.stringify(c_d)}`);
+    }
+    if (errors_d.some((e) => /trackOutbound/.test(e))) {
+      fail(`35d: happy path must NOT emit breadcrumb; got: ${errors_d.join(' | ')}`);
+    }
+    passed++;
+  }
+
+  // 36. R2-followup: end-to-end coverage of recoverMissedJobs threading
+  //     a tracker through to executeMessageJob. Test 19c covers the
+  //     recovery flow but doesn't pass a tracker — the most realistic
+  //     production scenario (missed message-type cronjob recovered at
+  //     startup) was uncovered.
+  {
+    const sent: SentMessage[] = [];
+    const { tracker, calls } = makeTracker();
+    const scheduler = makeScheduler(mockClient(sent), tracker);
+    const HOURS_LATE = 2;
+    const lateNextRun = new Date(Date.now() - HOURS_LATE * HOUR).toISOString();
+    const job: JobFile = {
+      meta: {
+        id: 'recover-with-tracker',
+        name: 'recover-with-tracker',
+        type: 'message',
+        schedule: '0 * * * *',
+        schedule_human: '0 * * * *',
+        target_chat_id: 'oc_recover_track',
+        origin_chat_id: 'oc_recover_track',
+        status: 'active',
+        created_by: 'ou_owner',
+        created_at: '2026-01-01T00:00:00Z',
+        content: 'hourly briefing',
+        msg_type: 'text',
+      } as JobFile['meta'],
+      runtime: {
+        last_run_at: null,
+        next_run_at: lateNextRun,
+        run_count: 0,
+        last_error: null,
+      },
+    };
+    await writeJob(job);
+    await (scheduler as any).recoverMissedJobs([job]);
+
+    if (sent.length !== 1) fail(`36: expected 1 recovery send, got ${sent.length}`);
+    // Tracker should record the recovered run's outbound message.
+    const recoveryAdds = calls.filter((c) => c.chatId === 'oc_recover_track');
+    if (recoveryAdds.length !== 1) {
+      fail(`36: recovery must call tracker.add for the recovered send; got ${recoveryAdds.length}`);
+    }
+    if (recoveryAdds[0].threadId !== undefined) {
+      fail(`36: cronjob recovery has no thread; threadId should be undefined`);
+    }
+    if (!tracker.has(recoveryAdds[0].id)) {
+      fail(`36: tracker.has must return true after recovery-path track`);
+    }
+    passed++;
+  }
 } finally {
   (appConfig as { jobsDir: string }).jobsDir = originalJobsDir;
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }
 
-console.log(`scheduler smoke: ${passed}/38 PASS`);
+console.log(`scheduler smoke: ${passed}/40 PASS`);

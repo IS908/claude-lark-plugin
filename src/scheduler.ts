@@ -210,7 +210,19 @@ export class JobScheduler {
     const id = resp?.data?.message_id;
     if (id && chatId) {
       this.botMessageTracker.add(id, chatId);
+      return;
     }
+    // R2-audit followup: a successful send that lacks message_id in
+    // the response (malformed Feishu response, future SDK shape drift)
+    // would silently fail to track. Without a breadcrumb the symptom
+    // — "reactions on cronjob messages still don't land post-#81" —
+    // would be indistinguishable from the original bug. Log once per
+    // call so the operator can grep for the regression.
+    console.error(
+      `[scheduler] trackOutbound: no message_id in response or empty chatId ` +
+      `(id=${id ? 'set' : 'missing'} chatId=${chatId ? 'set' : 'empty'}); ` +
+      `cronjob message not tracked, reactions on it will not route`,
+    );
   }
 
   /**
