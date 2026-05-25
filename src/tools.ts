@@ -331,6 +331,87 @@ export function registerTools(
     }
     return { caller };
   }
+
+  /**
+   * Shared helper: revoke the ack reaction for a specific inbound
+   * message_id. Lifted out of `reply`'s inner scope (#137 fix) so
+   * `react` and `download_attachment` — both valid "I responded to
+   * the user" tools per the Stop hook — can also clear the MeMeMe
+   * before the TTL backstop sweeps it (~6 min worst case).
+   *
+   * #85 invariant preserved: silent no-op on no-exact-match with a
+   * stderr breadcrumb (NOT bulk-wipe; that was the original #85 bug).
+   *
+   * #136 fix: when no entry is found AND `markIfMissing` is true,
+   * `markPendingAckRevoke` on the channel so the deferred ack-create
+   * `.then()` handler — if still in flight — deletes the reaction
+   * immediately instead of recording it. Closes the set-vs-revoke
+   * race for fast bots whose reply turn outpaces the ack-create HTTP
+   * round-trip.
+   *
+   * `markIfMissing` is FALSE by default and is opted into ONLY by
+   * `reply` (where `reply_to` is guaranteed to be the inbound user
+   * message id — race protection is correctly targeted). React and
+   * download_attachment leave it OFF: their `message_id` parameter
+   * can legitimately point at a BOT message (Claude reacting to its
+   * own previous card) or any other id, and marking those pending
+   * would leak entries into the FIFO-capped Set — under sustained
+   * react-to-bot workload the legit reply-side marks would get
+   * evicted before their ack-create `.then()` lands, re-opening
+   * the original #136 stuck-MeMeMe symptom. R1-followup tracked in
+   * #159 for a smarter inbound-id-aware variant.
+   */
+  function revokeAckFor(
+    messageId: string,
+    callerLabel: string = 'reply',
+    markIfMissing: boolean = false,
+  ): void {
+    if (!ackReactions) return;
+    if (!messageId) {
+      // No id to target. Pre-#136 this was an early return when the
+      // Map was empty. Post-#136 we still early-return — without a
+      // messageId there's nothing to mark as pending either.
+      if (ackReactions.size > 0) {
+        console.error(
+          `[${callerLabel}] revokeAckFor: no message_id to revoke against ` +
+          `(${ackReactions.size} ack(s) remain pending, TTL backstop will clean up)`,
+        );
+      }
+      return;
+    }
+    const entry = ackReactions.get(messageId);
+    if (!entry) {
+      if (markIfMissing) {
+        // #136: mark as pending so a deferred ack lands → delete, not store.
+        // Only fires when caller has high confidence that `messageId` IS
+        // the inbound user message id (currently: reply only).
+        channel.markPendingAckRevoke(messageId);
+        console.error(
+          `[${callerLabel}] revokeAckFor: no ack for message_id=${messageId} yet ` +
+          `(marked pending-revoke; ${ackReactions.size} other ack(s) left intact)`,
+        );
+      } else {
+        // Quiet: react/download_attachment may legitimately pass a
+        // non-inbound id (Claude reacting to a bot message; download
+        // for a file in some prior message). No mark, no log.
+      }
+      return;
+    }
+    ackReactions.delete(messageId);
+    // #112 R2-followup: wrap in withFeishuRetry. Bare swallow
+    // pre-followup meant a rate-limited ack-revoke left the
+    // MeMeMe emoji on the user's message until the TTL backstop
+    // swept it (6 min worst case). With retry, transient
+    // failures get up to 3 attempts; the outer .catch only
+    // catches final exhaustion (still swallowed — best-effort).
+    withFeishuRetry(
+      () => client.im.v1.messageReaction.delete({
+        path: { message_id: messageId, reaction_id: entry.reactionId },
+      }),
+      { label: `${callerLabel}.ack.revoke` },
+    ).catch(() => {});
+  }
+
   // ── 1. reply ──
   server.registerTool(
     'reply',
@@ -489,50 +570,9 @@ export function registerTools(
         });
       }
 
-      // Helper: revoke the ack reaction for a specific inbound message_id.
-      // Called from `finally` so it ALWAYS runs (success or failure) — pre-#85
-      // the revoke only fired on full success, so any thrown card-send / text-
-      // chunk / attachment error would leave the ack emoji on the user's
-      // message forever AND leak the Map entry.
-      //
-      // Bulk-wipe fix (#85): pre-fix the no-exact-match branch wiped the
-      // ENTIRE Map (cross-chat, cross-user). One reply with a wrong/missing
-      // reply_to could erase every other user's pending "I'm working on it"
-      // ack. Post-fix: silent no-op with a stderr breadcrumb — the TTL
-      // backstop in channel.pruneStaleAcks handles orphans.
-      function revokeAckFor(messageId: string) {
-        if (!ackReactions || ackReactions.size === 0) return;
-        if (!messageId) {
-          console.error(
-            `[reply] revokeAckFor: no message_id to revoke against ` +
-            `(reply called without reply_to; ${ackReactions.size} ack(s) ` +
-            `remain pending, TTL backstop will clean up)`,
-          );
-          return;
-        }
-        const entry = ackReactions.get(messageId);
-        if (!entry) {
-          console.error(
-            `[reply] revokeAckFor: no ack for message_id=${messageId} ` +
-            `(may have been pruned by TTL or never set; ${ackReactions.size} ` +
-            `other ack(s) left intact)`,
-          );
-          return;
-        }
-        ackReactions.delete(messageId);
-        // #112 R2-followup: wrap in withFeishuRetry. Bare swallow
-        // pre-followup meant a rate-limited ack-revoke left the
-        // MeMeMe emoji on the user's message until the TTL backstop
-        // swept it (6 min worst case). With retry, transient
-        // failures get up to 3 attempts; the outer .catch only
-        // catches final exhaustion (still swallowed — best-effort).
-        withFeishuRetry(
-          () => client.im.v1.messageReaction.delete({
-            path: { message_id: messageId, reaction_id: entry.reactionId },
-          }),
-          { label: 'reply.ack.revoke' },
-        ).catch(() => {});
-      }
+      // `revokeAckFor` is now a shared registerTools-scope helper (#137
+      // batch-fix). The reply tool just calls it; lifecycle is the same
+      // as pre-#137 (try/finally so it always runs).
 
       // #85 fix: try/finally wraps the entire send body so revokeAckFor
       // runs whether we exit via success-return, early-return on input
@@ -764,7 +804,11 @@ export function registerTools(
         // (reply called without reply_to); revokeAckFor logs and
         // no-ops in that case, deferring orphan cleanup to the TTL
         // backstop in channel.pruneStaleAcks.
-        revokeAckFor(effectiveReplyTo || '');
+        // `markIfMissing=true`: reply.reply_to IS the inbound user
+        // message id, so pending-revoke marking is correctly targeted
+        // (closes #136 race). react/download default to false because
+        // their `message_id` parameter is not guaranteed to be inbound.
+        revokeAckFor(effectiveReplyTo || '', 'reply', true);
       }
     }
   );
@@ -903,21 +947,30 @@ export function registerTools(
       }),
     },
     async ({ message_id, emoji }) => {
-      // #112: retry-wrap — same rate-limit exposure as the ack-reaction
-      // path in channel.ts.
-      await withFeishuRetry(
-        () => client.im.v1.messageReaction.create({
-          path: { message_id },
-          data: {
-            reaction_type: { emoji_type: emoji },
-          },
-        }),
-        { label: 'react' },
-      );
+      // #137 batch: try/finally so the ack-revoke fires whether the
+      // reaction send succeeds or throws. Symmetric with reply's
+      // lifecycle — the Stop hook accepts `react` as a valid response
+      // to an inbound message, so a react-only reply needs to clear
+      // the MeMeMe just like a text reply does.
+      try {
+        // #112: retry-wrap — same rate-limit exposure as the ack-reaction
+        // path in channel.ts.
+        await withFeishuRetry(
+          () => client.im.v1.messageReaction.create({
+            path: { message_id },
+            data: {
+              reaction_type: { emoji_type: emoji },
+            },
+          }),
+          { label: 'react' },
+        );
 
-      return {
-        content: [{ type: 'text' as const, text: `Added ${emoji} reaction to ${message_id}` }],
-      };
+        return {
+          content: [{ type: 'text' as const, text: `Added ${emoji} reaction to ${message_id}` }],
+        };
+      } finally {
+        revokeAckFor(message_id, 'react');
+      }
     }
   );
 
@@ -1027,6 +1080,20 @@ export function registerTools(
           isError: true,
         };
       }
+      // R2-audit followup: download_attachment does NOT revoke the
+      // ack. The Stop hook (`hooks/enforce-lark-reply.mjs` REPLY_TOOLS)
+      // only accepts `reply` and `react` as satisfying an inbound —
+      // download_attachment alone WILL be force-blocked, and Claude
+      // will follow up with reply (or react) which handles the
+      // revoke. Adding revoke here would either be redundant (the
+      // common case) or harmful: in the rare race where
+      // download_attachment runs and the follow-up reply somehow
+      // fails before its finally fires, we'd have cleared the
+      // MeMeMe without delivering any response — worst-of-both
+      // (no emoji AND no reply). Let reply own the revoke.
+      // Original #137 reasoning assumed download could be a terminal
+      // response, which the hook policy contradicts. See #159 for
+      // a smarter race-protection design.
     }
   );
 

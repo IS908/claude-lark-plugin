@@ -100,7 +100,12 @@ async function setup() {
   const identitySession = new IdentitySession(() => null);
   identitySession.setCaller('chat_grp', 'thread_abc', 'ou_caller');
   identitySession.setCaller('chat_p2p', undefined, 'ou_caller');
-  const fakeChannel = { isPrivateChat: () => true } as unknown as LarkChannel;
+  // v1.0.44 #136: stub new ack-pending methods (no-op for these tests)
+  const fakeChannel = {
+    isPrivateChat: () => true,
+    markPendingAckRevoke: (_: string) => {},
+    consumePendingAckRevoke: (_: string) => false,
+  } as unknown as LarkChannel;
 
   registerTools(
     fakeServer as any,

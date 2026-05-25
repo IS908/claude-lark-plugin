@@ -361,6 +361,36 @@ export class LarkChannel {
    *    sit on the user's message forever or leak Map memory.
    */
   private ackReactions = new Map<string, { reactionId: string; addedAt: number }>();
+  /**
+   * #136 fix: set-vs-revoke race protection.
+   *
+   * The ack reaction is fired in `handleMessageEvent` but the
+   * `messageReaction.create` response lands asynchronously via `.then()`.
+   * If a fast bot (cached identity + small prompt + fast model)
+   * completes the reply BEFORE the ack-create round-trip returns,
+   * `reply`'s `revokeAckFor` sees an empty Map → no-ops. The
+   * `.then()` then lands and stores an entry that nobody will
+   * revoke until the TTL backstop sweeps it (up to 6 min).
+   *
+   * Fix: `revokeAckFor` marks the messageId in this Set when it
+   * finds no Map entry; the `.then()` handler checks the Set first
+   * and, on match, immediately deletes the reaction instead of
+   * storing in `ackReactions`. The Set entry is consumed on use
+   * (consume = `Set.delete(id)` returns true if present).
+   *
+   * Insertion order is preserved by JS Set, so FIFO eviction at a
+   * 500-entry cap defends against unbounded growth from pathological
+   * mismatched message_ids (a flood of revokes for messages that
+   * never had acks). 500 entries × ~25 bytes/id ≈ 12.5KB — bounded.
+   */
+  private pendingAckRevokes = new Set<string>();
+  /**
+   * Cap for `pendingAckRevokes`. Public-static so the smoke test
+   * can reference it without hard-coding 500 (R2-followup —
+   * future cap changes shouldn't silently desync the test's
+   * eviction expectation). Treat as `readonly` from external code.
+   */
+  static readonly PENDING_REVOKE_CAP = 500;
   private ackPruneTimer: NodeJS.Timeout | null = null;
   /** Guards `start()` against double-invocation (R1-followup on #85). */
   private started = false;
@@ -424,6 +454,51 @@ export class LarkChannel {
 
   getAckReactions(): Map<string, { reactionId: string; addedAt: number }> {
     return this.ackReactions;
+  }
+
+  /**
+   * #136: mark a messageId as "revoke requested before the ack was
+   * recorded." Called from `revokeAckFor` (src/tools.ts) when the
+   * Map has no entry for the inbound id. When the deferred ack-
+   * create finally lands, its `.then()` consumes the mark and
+   * immediately deletes the reaction rather than recording it.
+   *
+   * Cap+FIFO eviction so a flood of bogus revoke requests can't
+   * grow the Set indefinitely. Insertion order is preserved by JS
+   * Set; the iterator yields the oldest entry first.
+   */
+  markPendingAckRevoke(messageId: string): void {
+    if (!messageId) return;
+    // Re-mark moves to back of insertion order. JS Set's .add() on
+    // an existing key is a no-op for order, so explicitly delete
+    // first to bump the entry's position to "most recently marked"
+    // — matters under churn where the OLDEST entries should evict
+    // first (LRU-ish), but we want re-marks to stay alive.
+    this.pendingAckRevokes.delete(messageId);
+    this.pendingAckRevokes.add(messageId);
+    if (this.pendingAckRevokes.size > LarkChannel.PENDING_REVOKE_CAP) {
+      // Evict oldest (first iterator value).
+      const oldest = this.pendingAckRevokes.values().next().value;
+      if (oldest !== undefined) this.pendingAckRevokes.delete(oldest);
+    }
+  }
+
+  /**
+   * #136: consume a pending revoke mark. Returns true and clears
+   * the mark if present; false otherwise. Called from the deferred
+   * ack-create `.then()` handler in `handleMessageEvent`.
+   */
+  consumePendingAckRevoke(messageId: string): boolean {
+    return this.pendingAckRevokes.delete(messageId);
+  }
+
+  /**
+   * Test-only: inspect the pending-revoke set size.
+   * @internal Not for production callers. Tool handlers should rely on
+   *   `markPendingAckRevoke` / `consumePendingAckRevoke` instead.
+   */
+  getPendingAckRevokeSize(): number {
+    return this.pendingAckRevokes.size;
   }
 
   getBotMessageTracker(): BotMessageTracker {
@@ -635,6 +710,25 @@ export class LarkChannel {
       ).then((resp: any) => {
         const reactionId = resp?.data?.reaction_id;
         if (reactionId) {
+          // #136 fix: check the pending-revoke Set FIRST. If
+          // `revokeAckFor` already ran (fast bot reply outraced the
+          // ack-create round-trip), the messageId is marked here —
+          // immediately delete the reaction we just created instead
+          // of storing in the Map (where it would sit until the TTL
+          // backstop swept it up to 6 min later, leaving the MeMeMe
+          // emoji visibly stuck on the user's message).
+          if (this.consumePendingAckRevoke(messageId)) {
+            debugLog(`[channel] ack for ${messageId} landed after revoke was requested; deleting immediately`);
+            withFeishuRetry(
+              () => this.client.im.v1.messageReaction.delete({
+                path: { message_id: messageId, reaction_id: reactionId },
+              }),
+              { label: 'ack.late-revoke' },
+            ).catch((err: any) => {
+              debugLog(`[channel] late-revoke gave up for ${messageId}: ${err?.message ?? err}`);
+            });
+            return;
+          }
           // addedAt timestamp powers the TTL backstop (#85): pruneStaleAcks
           // sweeps entries older than ACK_TTL_MS so anything that escaped
           // the normal revoke path doesn't sit on the user's message

@@ -142,7 +142,15 @@ async function run() {
   const identitySession = new IdentitySession(() => null);
   // Bind a fake caller so resolveCaller-gated tools can be exercised.
   identitySession.setCaller('chat_001', undefined, 'ou_reply_smoke');
-  const fakeChannel = { isPrivateChat: () => true } as unknown as LarkChannel;
+  // v1.0.44 #136: revokeAckFor now calls channel.markPendingAckRevoke
+  // when the Map has no entry — stub it as a no-op for these tests
+  // (they're not testing the pending-revoke set-vs-revoke race; that
+  // lives in scripts/ack-reaction-batch-smoke.ts).
+  const fakeChannel = {
+    isPrivateChat: () => true,
+    markPendingAckRevoke: (_: string) => {},
+    consumePendingAckRevoke: (_: string) => false,
+  } as unknown as LarkChannel;
 
   registerTools(
     fakeServer as any,
