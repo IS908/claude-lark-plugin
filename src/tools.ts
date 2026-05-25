@@ -159,9 +159,44 @@ export const LARK_ID_REGEX = /^[A-Za-z0-9_:-]{1,128}$/;
  *
  * Returns `null` for non-permanent errors so the caller can rethrow.
  */
+/**
+ * #121 fix: callback registered by `src/index.ts` after the
+ * JobScheduler is constructed. Tools that detect a cronjob context
+ * (`thread_id.startsWith(JOB_THREAD_PREFIX)`) invoke this with a
+ * parsed `jobId` to let the scheduler track consecutive permanent
+ * failures + auto-pause after the threshold. Null when no scheduler
+ * is wired (test contexts, --dry-run, etc.) — call sites null-guard.
+ */
+let cronjobOutcomeHandler:
+  | ((jobId: string, kind: 'permanent_failure' | 'success', ctx?: { code: number; reason: string }) => void)
+  | null = null;
+
+export function setCronjobOutcomeHandler(
+  handler: (jobId: string, kind: 'permanent_failure' | 'success', ctx?: { code: number; reason: string }) => void,
+): void {
+  cronjobOutcomeHandler = handler;
+}
+
+/**
+ * #121: extract `jobId` from a cronjob synthetic `thread_id`. Returns
+ * null if `thread_id` doesn't have the expected `${JOB_THREAD_PREFIX}${jobId}-${timestamp}`
+ * shape. `jobId` is what `sanitizeJobId` produces (`[a-z0-9-]+`), so
+ * stripping the prefix and the trailing `-<digits>` (timestamp) leaves
+ * the original id even when it contains hyphens / trailing digits
+ * (e.g. `cron-2026-1748189428000` → `cron-2026`).
+ *
+ * Exported for unit testing.
+ */
+export function parseJobIdFromThread(threadId: string | undefined): string | null {
+  if (!threadId || !threadId.startsWith(JOB_THREAD_PREFIX)) return null;
+  const afterPrefix = threadId.slice(JOB_THREAD_PREFIX.length);
+  const stripped = afterPrefix.replace(/-\d+$/, '');
+  return stripped.length > 0 && stripped !== afterPrefix ? stripped : null;
+}
+
 export function handlePermanentTargetError(
   err: unknown,
-  context: { tool: 'reply' | 'edit_message'; chat_id?: string; message_id?: string },
+  context: { tool: 'reply' | 'edit_message'; chat_id?: string; message_id?: string; thread_id?: string },
 ): { isError: true; content: { type: 'text'; text: string }[] } | null {
   const code = getFeishuApiCode(err);
   if (code === null || !PERMANENT_TARGET_CODES.has(code)) return null;
@@ -170,6 +205,21 @@ export function handlePermanentTargetError(
   console.error(
     `[tools] ${context.tool} hit permanent target error [${code}] on ${target}: ${reason}`,
   );
+  // #121: if this reply was from a cronjob context (synthetic thread_id),
+  // signal the scheduler so it can count consecutive failures and
+  // auto-pause the prompt-type job after the threshold (3). Pre-fix,
+  // a broken prompt-cronjob fired a full Claude turn on every tick
+  // — token waste with no convergence path.
+  const jobId = parseJobIdFromThread(context.thread_id);
+  if (jobId && cronjobOutcomeHandler) {
+    try {
+      cronjobOutcomeHandler(jobId, 'permanent_failure', { code, reason });
+    } catch (handlerErr) {
+      // Best-effort signal — never let the counter update break the
+      // reply's defer return.
+      console.error(`[tools] cronjobOutcomeHandler(${jobId}) failed: ${(handlerErr as any)?.message ?? handlerErr}`);
+    }
+  }
   return {
     isError: true,
     content: [
@@ -621,7 +671,7 @@ export function registerTools(
           const sentId = resp?.data?.message_id;
           if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
         } catch (err: any) {
-          const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
+          const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id, thread_id });
           if (defer) return defer;
           const apiError = err?.response?.data ?? err?.data;
           if (apiError?.code && apiError?.msg) {
@@ -664,7 +714,7 @@ export function registerTools(
             const sentId = resp?.data?.message_id;
             if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
           } catch (err: any) {
-            const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
+            const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id, thread_id });
             if (defer) return defer;
             const apiError = err?.response?.data ?? err?.data;
             if (apiError?.code && apiError?.msg) {
@@ -712,7 +762,7 @@ export function registerTools(
             const sentId = resp?.data?.message_id;
             if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
           } catch (err: any) {
-            const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
+            const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id, thread_id });
             if (defer) return defer;
             const apiError = err?.response?.data ?? err?.data;
             if (apiError?.code && apiError?.msg) {
@@ -794,6 +844,21 @@ export function registerTools(
       }
 
       recordReply(text);
+
+      // #121: success-reset signal for cronjob context. If this reply
+      // landed in the target chat without hitting permanent target
+      // error, the prompt-cronjob's `consecutive_target_failures`
+      // counter should reset — the chat is reachable again. No-op
+      // when `cronjobOutcomeHandler` is unset (test contexts) or
+      // when `thread_id` isn't a cronjob synthetic id.
+      const successJobId = parseJobIdFromThread(thread_id);
+      if (successJobId && cronjobOutcomeHandler) {
+        try {
+          cronjobOutcomeHandler(successJobId, 'success');
+        } catch (handlerErr) {
+          console.error(`[tools] cronjobOutcomeHandler(${successJobId}, success) failed: ${(handlerErr as any)?.message ?? handlerErr}`);
+        }
+      }
 
       return {
         content: [{ type: 'text' as const, text: `Sent ${sentCount} message(s)` }],
@@ -885,7 +950,7 @@ export function registerTools(
           { label: 'edit_message' },
         );
       } catch (err: any) {
-        const defer = handlePermanentTargetError(err, { tool: 'edit_message', message_id });
+        const defer = handlePermanentTargetError(err, { tool: 'edit_message', message_id, thread_id });
         if (defer) return defer;
         const apiError = err?.response?.data ?? err?.data;
         if (apiError?.code && apiError?.msg) {

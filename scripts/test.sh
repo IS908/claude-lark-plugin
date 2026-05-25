@@ -175,4 +175,8 @@ echo "=== Envelope cluster (flush + cronjob prompt wrapping) unit checks ==="
 npx tsx scripts/envelope-cluster-smoke.ts
 
 echo ""
+echo "=== Prompt-job auto-pause unit checks ==="
+npx tsx scripts/prompt-job-auto-pause-smoke.ts
+
+echo ""
 echo "All tests passed."

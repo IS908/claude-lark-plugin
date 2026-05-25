@@ -50,6 +50,25 @@ export interface SchedulerOptions {
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [30_000, 60_000, 120_000]; // 30s, 60s, 120s
 
+/**
+ * #121: how many consecutive permanent target-chat failures from
+ * Claude's `reply` tool before a prompt-type cronjob auto-pauses.
+ * Chosen at 3 to match the retry-attempt count elsewhere — a clean
+ * "three strikes" semantics. Symmetric with the message-type
+ * auto-pause from #106 (which fires on a single permanent error
+ * because the message-job code path is synchronous w.r.t. Feishu
+ * — no retry loop wrapping it, so no chance for a transient
+ * misclassification to compound).
+ *
+ * Prompt jobs can't use the single-strike semantics directly: the
+ * "failure" signal is whatever Claude's reply tool reports back,
+ * which can be confused by injection, sloppy code paths, or a
+ * one-off Feishu transient that misclassifies. Three consecutive
+ * keeps false-positive auto-pauses to roughly never while still
+ * catching the legitimate "bot was kicked" case within minutes.
+ */
+const MAX_CONSECUTIVE_PROMPT_TARGET_FAILURES = 3;
+
 // ─── Crash-recovery staleness ───────────────────────────────
 
 /**
@@ -719,6 +738,98 @@ export class JobScheduler {
     // write. Throws are swallowed — recovery must not abort.
     if (isPermanentTarget) {
       await this.notifyOwnerOnTargetFail(freshFail, apiCode!, getFeishuApiMsg(lastErr));
+    }
+  }
+
+  /**
+   * #121 fix: signal from Claude's `reply` tool that a prompt-type
+   * cronjob hit (or recovered from) a permanent target-chat failure.
+   * Wired via `setCronjobOutcomeHandler` in src/tools.ts — the reply
+   * tool detects cronjob context via `thread_id.startsWith(JOB_THREAD_PREFIX)`
+   * and parses out the `jobId`, then calls this method.
+   *
+   * - `kind='permanent_failure'`: increment `consecutive_target_failures`
+   *   on disk. If it reaches MAX_CONSECUTIVE_PROMPT_TARGET_FAILURES,
+   *   AUTO-PAUSE the job + DM the owner (same shape as message-type
+   *   auto-pause from #106).
+   * - `kind='success'`: reset `consecutive_target_failures` to 0
+   *   (if non-zero). A real reply landed in the target chat → the
+   *   chat is no longer unreachable → counter should not carry
+   *   stale failures across recoveries.
+   *
+   * Reads/writes the job file via the same fresh-read pattern as
+   * `executeJob` to interleave safely with concurrent user updates.
+   * Recycle-safe: a delete+create lands a new job with new
+   * `created_at` → `isRecycledJob` skip prevents the OLD failure
+   * from leaking into the NEW job's counter.
+   *
+   * Best-effort throughout: every fs/Feishu failure is logged and
+   * swallowed. A failed counter update doesn't break the reply that
+   * triggered it.
+   */
+  async notePromptJobOutcome(
+    jobId: string,
+    kind: 'permanent_failure' | 'success',
+    failureContext?: { code: number; reason: string },
+  ): Promise<void> {
+    let snapshot: JobFile | null;
+    try {
+      snapshot = await readJob(jobId);
+    } catch (err: any) {
+      console.error(`[scheduler] notePromptJobOutcome(${jobId}): readJob failed: ${err?.message ?? err}`);
+      return;
+    }
+    if (!snapshot) {
+      // Job was deleted between dispatch and this signal; nothing to update.
+      return;
+    }
+
+    if (kind === 'success') {
+      const current = snapshot.runtime.consecutive_target_failures ?? 0;
+      if (current === 0) return; // nothing to clear, save a writeJob
+      snapshot.runtime.consecutive_target_failures = 0;
+      try {
+        await writeJob(snapshot);
+      } catch (err: any) {
+        console.error(`[scheduler] notePromptJobOutcome(${jobId}, success): writeJob failed: ${err?.message ?? err}`);
+      }
+      return;
+    }
+
+    // kind === 'permanent_failure'
+    const next = (snapshot.runtime.consecutive_target_failures ?? 0) + 1;
+    snapshot.runtime.consecutive_target_failures = next;
+
+    if (next >= MAX_CONSECUTIVE_PROMPT_TARGET_FAILURES) {
+      snapshot.meta.status = 'paused';
+      console.error(
+        `[scheduler] Prompt job ${jobId} AUTO-PAUSED after ${next} consecutive permanent target failures ` +
+        `(target chat ${snapshot.meta.target_chat_id}` +
+        (failureContext ? `, last error Feishu code ${failureContext.code}: ${failureContext.reason}` : '') +
+        `). Owner ${snapshot.meta.created_by} notified via DM (best-effort).`,
+      );
+      try {
+        await writeJob(snapshot);
+      } catch (err: any) {
+        console.error(`[scheduler] notePromptJobOutcome(${jobId}, auto-pause): writeJob failed: ${err?.message ?? err}`);
+        return;
+      }
+      // Notify owner — same shape as message-type auto-pause for consistency.
+      if (failureContext) {
+        await this.notifyOwnerOnTargetFail(snapshot, failureContext.code, failureContext.reason);
+      }
+      return;
+    }
+
+    // Below threshold — just persist the incremented counter.
+    console.error(
+      `[scheduler] Prompt job ${jobId}: consecutive permanent target failure ${next}/${MAX_CONSECUTIVE_PROMPT_TARGET_FAILURES}` +
+      (failureContext ? ` (Feishu code ${failureContext.code}: ${failureContext.reason})` : ''),
+    );
+    try {
+      await writeJob(snapshot);
+    } catch (err: any) {
+      console.error(`[scheduler] notePromptJobOutcome(${jobId}, increment): writeJob failed: ${err?.message ?? err}`);
     }
   }
 

@@ -37,6 +37,20 @@ export interface JobRuntime {
   next_run_at: string;
   run_count: number;
   last_error: string | null;
+  /**
+   * #121: rolling count of consecutive permanent target-chat failures
+   * reported by Claude's `reply` tool during prompt-type cronjob turns.
+   * Resets to 0 on any successful reply from the same cronjob context.
+   * When it reaches `MAX_CONSECUTIVE_PROMPT_TARGET_FAILURES` (3 in
+   * scheduler.ts), the prompt job is AUTO-PAUSED and the owner is
+   * DM'd — symmetric with the message-type auto-pause from #106.
+   *
+   * Optional + back-compat: legacy job files without this field are
+   * treated as 0 on read; the first failure increments to 1 and is
+   * persisted. Production never reads-undefined and writes a value
+   * that isn't a number.
+   */
+  consecutive_target_failures?: number;
 }
 
 export interface JobFile {
