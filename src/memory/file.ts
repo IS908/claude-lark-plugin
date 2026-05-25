@@ -1327,13 +1327,27 @@ export class MemoryStore {
   }
 
   /**
-   * Truncate a UTF-8 string to at most `maxBytes` bytes, preserving
-   * multi-byte character boundaries. Appends `\n... [truncated]` (in
-   * ASCII, so the appended suffix never re-violates the cap by much).
+   * Truncate a UTF-8 string so the BODY is at most `maxBytes` bytes,
+   * preserving multi-byte character boundaries. When truncation
+   * occurs, appends `\n... [truncated]` (16 ASCII bytes) AFTER the
+   * body — so the returned string can be up to `maxBytes + 16` bytes.
+   * Callers that need a hard upper bound on the returned size should
+   * subtract `TRUNCATION_TAG_BYTES` from their cap before calling.
    *
    * Pure helper used by #100 fix (saveEpisode write cap + channel
    * inject cap). Exported `static` so the smoke test can pin the
    * truncation contract without going through fs.
+   *
+   * Returns `''` for `maxBytes <= 0` (treated as "disable; nothing
+   * fits"). Returns the original string for any input whose UTF-8
+   * byte length is already within the cap (including empty string).
+   *
+   * Edge note: with `maxBytes` smaller than the first character's
+   * UTF-8 length (e.g. `maxBytes=1` and a 3-byte CJK lead), the body
+   * truncates to empty and the result is just the truncation tag.
+   * Production caps (defaults 2KB / 8KB) never hit this corner; if a
+   * future caller sets a sub-codepoint cap they get the tag only —
+   * accept that as the intended "cap was unreasonably small" signal.
    *
    * Implementation note: UTF-8 continuation bytes are `10xxxxxx`
    * (`0x80–0xBF`). After a candidate cutoff, walk backward past any
@@ -1362,11 +1376,38 @@ export class MemoryStore {
       'on', 'with', 'at', 'by', 'from', 'as', 'into', 'about', 'it', 'its',
       'this', 'that', 'these', 'those', 'i', 'me', 'my', 'we', 'our', 'you',
       'your', 'he', 'she', 'they', 'them', 'and', 'or', 'but', 'not', 'no',
+      // #100 R1-followup: common English acknowledgements. Pre-followup
+      // these passed the `length > 1` filter, so a "thanks" or "ok" reply
+      // would surface any past episode that happened to contain the
+      // same token in distilled prose (substring match via matchKeyword
+      // on the ASCII path with `kw.length ≤ 3` is both-sides boundary,
+      // so `ok` only matches the word `ok` — still injects too eagerly
+      // for a content-free ack).
+      'ok', 'okay', 'yes', 'yep', 'yeah', 'sure', 'fine', 'cool', 'nice',
+      'thanks', 'thx', 'thank', 'great', 'good', 'got', 'gotcha', 'roger',
+      // Existing CJK function-word stopwords
       '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一',
       '上', '也', '他', '她', '们', '这', '那', '你', '吗', '什么', '怎么',
+      // #100 R1-followup: common Chinese acknowledgements. Pre-followup
+      // "好的" / "嗯嗯" / "收到" cleared the `length > 1` filter (2-char
+      // CJK = length 2 in UTF-16) and reached the non-ASCII substring
+      // matcher (`haystack.includes('好的')`), which fires on any past
+      // episode whose distilled prose happens to contain "好的" — common
+      // in casual chat. These acks carry no retrieval signal; drop them.
+      '好的', '好', '嗯', '嗯嗯', '嗯哼', '收到', '明白', '知道', '对的',
+      '是的', '没事', '谢谢', '感谢', '可以', '行的',
     ]);
 
-    return query
+    // #100 R1-followup: strip emoji before splitting. Emoji surrogate
+    // pairs have `.length === 2` in JS UTF-16, so a single 👍 passes
+    // the `length > 1` filter as `"👍"`. The non-ASCII substring path
+    // would then match any episode that quoted the same emoji — same
+    // pollution mode as the Chinese-ack case.
+    // \p{Extended_Pictographic} covers the Unicode emoji set; the
+    // `u` flag enables property escapes.
+    const stripped = query.replace(/\p{Extended_Pictographic}/gu, ' ');
+
+    return stripped
       .toLowerCase()
       .split(/[\s,;.!?，。！？、；：]+/)
       .filter(w => w.length > 1 && !stopWords.has(w));
