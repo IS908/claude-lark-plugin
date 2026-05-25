@@ -86,9 +86,9 @@ Return the JSON object inline (no code fence). Then call save_memory once with t
 
   save_memory(type="profile_tiered", content=<the JSON string>, reason=<why>, chat_id=<current>)
 
-The server parses the JSON, applies the L1 privacy safety net (anything classified public that matches a regex/keyword rule like phone numbers, IDs, credentials, salary keywords is forced into private), and writes the two tier files via sequential saveProfile calls. The writes are NOT a single atomic transaction — a concurrent getProfile in the window between them sees public-new + private-old — but each individual write IS atomic, and per-chat queueing serializes any other save_memory call on the same user.
+The server parses the JSON, applies the L1 privacy safety net (anything classified public that matches a regex/keyword rule like phone numbers, IDs, credentials, salary keywords is forced into private), and writes BOTH tier files atomically under a per-user lock (v1.0.34, #54). No other save_memory call for the same user can interleave between the two tier writes. (A concurrent getProfile read mid-pair can still see public-new + private-old for a sub-ms window — acceptable for an enrichment read.)
 
-Do NOT make two separate save_memory(type="profile") calls. The pre-v1.0.17 dual-call pattern (public-replace then private-replace) races with the L1 safety net inside saveProfile: the first call's L1 redirect appends sensitive lines to private.md, then the second call's replace silently wipes them (#97).
+Do NOT make two separate save_memory(type="profile") calls for one logical update. The pre-v1.0.17 dual-call pattern (public-replace then private-replace) was racy with the L1 safety net (#97); use the single type="profile_tiered" call instead.
 
 If the call returns isError (malformed JSON / non-array shape), fix the JSON and retry once. Both arrays empty is a NO-OP (existing tiers preserved) — emit at least one array element if you want to commit a real update.`;
 }

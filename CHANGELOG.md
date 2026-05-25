@@ -35,6 +35,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Test 4/5 timer dependency removed** — replaced `setTimeout(10)` with `await Promise.resolve()` ×2 to drain the cleanup microtask without a wall-clock dependency. R1 noted 10ms is theoretically flaky on loaded CI; this removes the timing dependency entirely.
 - **Invariant comments propagated** — the "must NOT recurse back into mutex-wrapped function on same userId" deadlock guard was only documented on the helper. Added explicit comments to `saveProfile` and `removeProfileLine` bodies too so a future contributor adding internal recursion can't miss it.
 
+### R2-audit followups (closed in this PR)
+- **`src/prompts.ts` distiller prompt updated** — R2 caught that lines 89/91 still told Claude the tiered path is non-atomic and that "the writes are NOT a single atomic transaction", which is exactly the failure mode the R1 followup eliminated. The system prompt is sent on every initialize handshake; leaving the stale doc in would have taught every fresh session an inaccurate mental model of the storage layer. Rewrote the paragraph to describe the new per-user-lock atomic-pair semantic; the residual read-side window (mid-pair `getProfile`) is still mentioned but pinned to its correct cause.
+
 ### R1-audit findings filed as followups
 - **#143 — `migrateIfNeeded` race**: concurrent same-user `saveProfile` (mutex-wrapped) + `getProfile` / `listProfileLines` (unwrapped) on a legacy pre-v0.10 user's first touch can race during migration. The save's tier writes can be clobbered by the concurrent migration's tier writes. Narrow exposure — only on first-touch of legacy users — but worth a separate focused fix.
 
