@@ -22,7 +22,13 @@ import { join } from 'node:path';
 import { isMissedRunStale, JobScheduler } from '../src/scheduler.js';
 import { IdentitySession } from '../src/identity-session.js';
 import { appConfig } from '../src/config.js';
-import { mostRecentMissedSlot } from '../src/job-store.js';
+import {
+  mostRecentMissedSlot,
+  writeJob,
+  readJob,
+  deleteJob,
+  computeNextRun,
+} from '../src/job-store.js';
 import type { JobFile } from '../src/job-store.js';
 
 function fail(msg: string): never {
@@ -314,6 +320,10 @@ try {
     const sent: SentMessage[] = [];
     const scheduler = makeScheduler(permanentTargetMock(sent, 230002));
     const job = makeJob('permanent-fail-job', new Date(Date.now() - 60_000).toISOString());
+    // v1.0.29 (#78): executeJob now reads fresh-from-disk before writing
+    // so callers must persist the job first. In production this is
+    // always true (executeJob is only called on jobs from listAllJobs).
+    await writeJob(job);
     await (scheduler as any).executeJob(job);
     if (job.meta.status !== 'paused') {
       fail(`16: job must be auto-paused on permanent error, got status=${job.meta.status}`);
@@ -336,6 +346,7 @@ try {
       const sent: SentMessage[] = [];
       const scheduler = makeScheduler(permanentTargetMock(sent, code));
       const job = makeJob(`code-${code}-job`, new Date(Date.now() - 60_000).toISOString());
+      await writeJob(job);
       await (scheduler as any).executeJob(job);
       if (job.meta.status !== 'paused') {
         fail(`17: code ${code} must trigger auto-pause, got ${job.meta.status}`);
@@ -347,11 +358,22 @@ try {
 
   // 18. Empty created_by → auto-paused, NO DM attempted (no owner),
   //     no throw. Mirrors test 13's stale-skip behavior.
+  //     v1.0.29 (#78) note: backfillJob (run on every readJob) now
+  //     resurrects created_by from LARK_OWNER_OPEN_ID. To exercise
+  //     the "truly orphan" path (no owner anywhere — file empty AND
+  //     env unset) we temporarily clear ownerOpenId for this test.
   {
     const sent: SentMessage[] = [];
     const scheduler = makeScheduler(permanentTargetMock(sent));
     const job = makeJob('no-owner-permanent', new Date(Date.now() - 60_000).toISOString(), '');
-    await (scheduler as any).executeJob(job);
+    await writeJob(job);
+    const originalOwner = appConfig.ownerOpenId;
+    (appConfig as { ownerOpenId: string }).ownerOpenId = '';
+    try {
+      await (scheduler as any).executeJob(job);
+    } finally {
+      (appConfig as { ownerOpenId: string }).ownerOpenId = originalOwner;
+    }
     if (job.meta.status !== 'paused') fail(`18: empty-owner job must still auto-pause`);
     if (sent.length !== 0) fail(`18: no DM should be sent when created_by is empty`);
     passed++;
@@ -504,6 +526,9 @@ try {
         last_error: null,
       },
     };
+    // v1.0.29 (#78): recoverMissedJobs calls executeJob which now
+    // requires the file to exist on disk for its fresh-read merge.
+    await writeJob(job);
     const errors: string[] = [];
     const origError = console.error;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
@@ -559,10 +584,408 @@ try {
     };
     const scheduler = makeScheduler(client);
     const job = makeJob('non-permanent-fail-job', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
     await (scheduler as any).executeJob(job);
     if (job.meta.status === 'paused') fail(`19: code 230001 must NOT auto-pause (not in PERMANENT_TARGET_CODES)`);
     if (job.runtime.last_error == null) fail(`19: non-retryable error must record last_error`);
     if (sent.length !== 0) fail(`19: non-permanent error must NOT DM owner`);
+    passed++;
+  }
+
+  // ── Part F: tick re-entrancy guard (v1.0.29, #77) ──────────────
+  //   Pre-fix, `setInterval(tick, 60s)` had no per-job re-entrancy
+  //   protection. A job in the 30+60+120s retry loop would be re-
+  //   launched on each subsequent tick — re-introducing the
+  //   duplicate-execution symptom #62 already tried to eliminate.
+
+  // 20. Pre-populated inFlight: tick skips that job entirely.
+  //     Most direct test of the guard — no parallelism to coordinate.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent));
+    const job = makeJob('reentrancy-prepop', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+    // Simulate "a prior tick is still executing this job"
+    (scheduler as any).inFlight.add(job.meta.id);
+
+    await (scheduler as any).tick();
+    // tick uses fire-and-forget; nothing to await for the skipped job,
+    // but give any other code paths a microtask to settle.
+    await new Promise((r) => setTimeout(r, 20));
+
+    if (sent.length !== 0) {
+      fail(`20: tick must skip re-entrant job, got ${sent.length} sends`);
+    }
+    // Guard must NOT auto-clear — only .finally() of a real executeJob does
+    if (!(scheduler as any).inFlight.has(job.meta.id)) {
+      fail(`20: tick must not erase pre-existing inFlight entry`);
+    }
+    // Cleanup: this job was never run, so its next_run_at is still in
+    // the past — subsequent tick-based tests (21, 22, 23) would see it
+    // as due and execute it, contaminating their assertions.
+    await deleteJob(job.meta.id);
+    passed++;
+  }
+
+  // 21. Two due jobs with different ids both fire in the same tick.
+  //     Confirms the .finally cleanup doesn't accidentally gate
+  //     unrelated jobs against each other (per-job key, not global).
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent));
+    const jobA = makeJob('parallel-a', new Date(Date.now() - 60_000).toISOString());
+    const jobB = makeJob('parallel-b', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(jobA);
+    await writeJob(jobB);
+
+    await (scheduler as any).tick();
+    // Wait for fire-and-forget executeJob promises to settle.
+    await new Promise((r) => setTimeout(r, 100));
+
+    if (sent.length !== 2) {
+      fail(`21: two due jobs must both execute in one tick, got ${sent.length}`);
+    }
+    const ids = sent.map((s) => s.receive_id).sort();
+    if (ids[0] !== 'oc_parallel-a' || ids[1] !== 'oc_parallel-b') {
+      fail(`21: wrong jobs executed: ${ids.join(',')}`);
+    }
+    passed++;
+  }
+
+  // 22. inFlight is cleared in .finally after executeJob success →
+  //     the same job becomes eligible for a future tick once its
+  //     next_run_at comes around again.
+  {
+    const sent: SentMessage[] = [];
+    const scheduler = makeScheduler(mockClient(sent));
+    const job = makeJob('inflight-clear-success', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    await (scheduler as any).tick();
+    // Let fire-and-forget settle.
+    await new Promise((r) => setTimeout(r, 100));
+
+    if ((scheduler as any).inFlight.has(job.meta.id)) {
+      fail(`22: inFlight must be cleared via .finally after successful executeJob`);
+    }
+    passed++;
+  }
+
+  // 23. inFlight is cleared in .finally even when executeJob throws
+  //     (e.g. unexpected non-retry error). Without .finally, a single
+  //     synchronous throw inside executeJob would permanently lock the
+  //     job out of future ticks.
+  {
+    const throwClient = {
+      im: { v1: { message: { create: async () => {
+        const err: any = new Error('synthetic non-retryable failure');
+        err.response = { data: { code: 230001, msg: 'synthetic' } };
+        throw err;
+      } } } },
+    };
+    const scheduler = makeScheduler(throwClient);
+    const job = makeJob('inflight-clear-fail', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    await (scheduler as any).tick();
+    await new Promise((r) => setTimeout(r, 100));
+
+    if ((scheduler as any).inFlight.has(job.meta.id)) {
+      fail(`23: inFlight must be cleared via .finally even after executeJob failure`);
+    }
+    passed++;
+  }
+
+  // ── Part G: read-modify-write race fix (v1.0.29, #78) ─────────────
+  //   Pre-fix, executeJob held a stale in-memory snapshot of the job
+  //   and blindly wrote it back after the retry loop. User updates
+  //   (update_job / delete_job) issued during the 0-210s execution
+  //   window were silently clobbered — including deletions, which
+  //   the writeJob would resurrect.
+
+  // 24. Success path: file deleted during execution → no writeJob
+  //     resurrects it. Stderr logs the deliberate drop.
+  {
+    const sent: SentMessage[] = [];
+    let raceFired = false;
+    const racyClient = {
+      im: { v1: { message: { create: async (args: any) => {
+        if (!raceFired) {
+          await deleteJob('race-delete-success');
+          raceFired = true;
+        }
+        const parsed = JSON.parse(args?.data?.content ?? '{}');
+        sent.push({
+          receive_id_type: args?.params?.receive_id_type,
+          receive_id: args?.data?.receive_id,
+          text: parsed.text ?? '',
+        });
+        return { data: { message_id: 'mock' } };
+      } } } },
+    };
+    const scheduler = makeScheduler(racyClient);
+    const job = makeJob('race-delete-success', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await (scheduler as any).executeJob(job);
+    } finally {
+      console.error = origError;
+    }
+
+    if (sent.length !== 1) fail(`24: the send happened before delete, got ${sent.length}`);
+    const onDisk = await readJob('race-delete-success');
+    if (onDisk !== null) fail(`24: file must NOT be resurrected after mid-exec delete (success path)`);
+    if (!errors.some((e) => /race-delete-success/.test(e) && /deleted during execution/.test(e) && /not resurrecting/.test(e))) {
+      fail(`24: success path must log the not-resurrecting decision; got: ${errors.join(' | ')}`);
+    }
+    passed++;
+  }
+
+  // 25. Failure path: file deleted during execution → failure
+  //     details logged to stderr only, no writeJob resurrects.
+  {
+    let raceFired = false;
+    const racyClient = {
+      im: { v1: { message: { create: async () => {
+        if (!raceFired) {
+          await deleteJob('race-delete-fail');
+          raceFired = true;
+        }
+        const err: any = new Error('Feishu API [230002]: chat not found');
+        err.response = { data: { code: 230002, msg: 'chat not found' } };
+        throw err;
+      } } } },
+    };
+    const scheduler = makeScheduler(racyClient);
+    const job = makeJob('race-delete-fail', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await (scheduler as any).executeJob(job);
+    } finally {
+      console.error = origError;
+    }
+
+    const onDisk = await readJob('race-delete-fail');
+    if (onDisk !== null) fail(`25: file must NOT be resurrected via failure path`);
+    if (!errors.some((e) => /race-delete-fail/.test(e) && /deleted during execution/.test(e) && /failure/.test(e))) {
+      fail(`25: failure path must log the not-resurrecting decision; got: ${errors.join(' | ')}`);
+    }
+    passed++;
+  }
+
+  // 26. Success path: user mid-flight `update_job(status='paused')`
+  //     (simulated by direct disk mutation) → fresh status wins on
+  //     the post-execution write; the run is still recorded.
+  //     Without #78, the stale in-memory `status='active'` would
+  //     stomp the user's pause.
+  {
+    let raceFired = false;
+    const racyClient = {
+      im: { v1: { message: { create: async (args: any) => {
+        if (!raceFired) {
+          const disk = await readJob('race-user-pause');
+          if (!disk) fail(`26: precondition: job should exist on disk pre-race`);
+          disk!.meta.status = 'paused';
+          await writeJob(disk!);
+          raceFired = true;
+        }
+        return { data: { message_id: 'mock' } };
+      } } } },
+    };
+    const scheduler = makeScheduler(racyClient);
+    const job = makeJob('race-user-pause', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    await (scheduler as any).executeJob(job);
+
+    const onDisk = await readJob('race-user-pause');
+    if (!onDisk) fail(`26: file should still exist`);
+    if (onDisk!.meta.status !== 'paused') {
+      fail(`26: user mid-flight pause must survive on disk; got status=${onDisk!.meta.status}`);
+    }
+    if (onDisk!.runtime.run_count !== 1) {
+      fail(`26: runtime fields must still apply (run_count=1); got ${onDisk!.runtime.run_count}`);
+    }
+    if (onDisk!.runtime.last_run_at == null) {
+      fail(`26: runtime.last_run_at must be set on successful run`);
+    }
+    // Back-copy: input job ref reflects post-write disk state.
+    if (job.meta.status !== 'paused') {
+      fail(`26: input job reference must reflect post-write status=paused`);
+    }
+    passed++;
+  }
+
+  // 27. Success path: user mid-flight `update_job(schedule=<new>)` →
+  //     next_run_at is computed from the NEW schedule on disk, not
+  //     the stale schedule from the in-memory snapshot.
+  {
+    let raceFired = false;
+    const NEW_SCHEDULE = '0 0 * * *'; // daily midnight; very different from makeJob's '10 21 * * 1-5'
+    const racyClient = {
+      im: { v1: { message: { create: async () => {
+        if (!raceFired) {
+          const disk = await readJob('race-schedule-change');
+          if (!disk) fail(`27: precondition: job should exist on disk pre-race`);
+          disk!.meta.schedule = NEW_SCHEDULE;
+          await writeJob(disk!);
+          raceFired = true;
+        }
+        return { data: { message_id: 'mock' } };
+      } } } },
+    };
+    const scheduler = makeScheduler(racyClient);
+    const job = makeJob('race-schedule-change', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+    // executeJob will run, race mid-flight, then computeNextRun against
+    // NEW_SCHEDULE for the next_run_at value.
+    await (scheduler as any).executeJob(job);
+
+    const onDisk = await readJob('race-schedule-change');
+    if (!onDisk) fail(`27: file should still exist`);
+    if (onDisk!.meta.schedule !== NEW_SCHEDULE) {
+      fail(`27: user mid-flight schedule change must survive; got ${onDisk!.meta.schedule}`);
+    }
+    // Re-derive expected next_run_at from the new schedule and confirm
+    // disk value matches (day-precision tolerates the few-ms gap between
+    // executeJob's computeNextRun call and ours).
+    const expectedNext = computeNextRun(NEW_SCHEDULE);
+    if (onDisk!.runtime.next_run_at.slice(0, 10) !== expectedNext.slice(0, 10)) {
+      fail(
+        `27: next_run_at must derive from NEW schedule; expected day ` +
+        `${expectedNext.slice(0, 10)}, got ${onDisk!.runtime.next_run_at} (` +
+        `would be ${computeNextRun('10 21 * * 1-5')} for the stale schedule)`,
+      );
+    }
+    passed++;
+  }
+
+  // 28. R1-audit followup on this PR: a poisoned on-disk schedule
+  //     (anything that bypasses update_job's Zod gate — manual edit,
+  //     restore-from-backup, future bypass path) must NOT cause an
+  //     infinite re-fire loop. Pre-fix, executeMessageJob would send
+  //     the chat message, then computeNextRun would throw, writeJob
+  //     would be skipped, and the next tick (60s later) would see
+  //     the same next_run_at <= now → re-send forever until the
+  //     operator noticed the stderr spam.
+  //
+  //     Post-fix: computeNextRun is wrapped in try/catch on both
+  //     paths. On throw, next_run_at is set to '' (empty string —
+  //     tick and recoverMissedJobs both gate on `if (!next_run_at)`)
+  //     and last_error explains the resume path.
+  {
+    let raceFired = false;
+    const racyClient = {
+      im: { v1: { message: { create: async (args: any) => {
+        if (!raceFired) {
+          const disk = await readJob('race-bad-schedule');
+          if (!disk) fail(`28: precondition: job should exist on disk pre-race`);
+          // Poison the schedule mid-flight — simulates an out-of-band
+          // edit that landed between tick's listAllJobs read and
+          // executeJob's post-execute fresh-read.
+          disk!.meta.schedule = 'not a cron expression at all';
+          await writeJob(disk!);
+          raceFired = true;
+        }
+        return { data: { message_id: 'mock' } };
+      } } } },
+    };
+    const scheduler = makeScheduler(racyClient);
+    const job = makeJob('race-bad-schedule', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    let threw = false;
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await (scheduler as any).executeJob(job);
+    } catch {
+      threw = true;
+    } finally {
+      console.error = origError;
+    }
+
+    if (threw) fail(`28: executeJob must NOT throw on bad on-disk schedule (would re-fire on next tick)`);
+
+    const onDisk = await readJob('race-bad-schedule');
+    if (!onDisk) fail(`28: file should still exist (dead-letter, not delete)`);
+    if (onDisk!.runtime.next_run_at !== '') {
+      fail(`28: poisoned schedule must dead-letter via next_run_at=''; got ${JSON.stringify(onDisk!.runtime.next_run_at)}`);
+    }
+    if (!onDisk!.runtime.last_error || !/invalid schedule/.test(onDisk!.runtime.last_error)) {
+      fail(`28: last_error must explain the dead-letter; got ${onDisk!.runtime.last_error}`);
+    }
+    if (!errors.some((e) => /DEAD-LETTERED/.test(e) && /race-bad-schedule/.test(e))) {
+      fail(`28: dead-letter must log to stderr; got: ${errors.join(' | ')}`);
+    }
+    // Run count was still incremented (the run DID happen — message sent).
+    if (onDisk!.runtime.run_count !== 1) {
+      fail(`28: run_count should be 1 (the run completed before schedule poison); got ${onDisk!.runtime.run_count}`);
+    }
+    passed++;
+  }
+
+  // 29. Same dead-letter defense on the FAILURE path: if executeJob's
+  //     send fails AND the schedule is also bad, computeNextRun's throw
+  //     must not propagate (same re-fire loop concern as test 28).
+  {
+    let raceFired = false;
+    const racyClient = {
+      im: { v1: { message: { create: async () => {
+        if (!raceFired) {
+          const disk = await readJob('race-bad-schedule-fail');
+          if (!disk) fail(`29: precondition`);
+          disk!.meta.schedule = 'still not a cron';
+          await writeJob(disk!);
+          raceFired = true;
+        }
+        // Now throw a non-retryable execution error.
+        const err: any = new Error('Feishu API [230001]: param error');
+        err.response = { data: { code: 230001, msg: 'param error' } };
+        throw err;
+      } } } },
+    };
+    const scheduler = makeScheduler(racyClient);
+    const job = makeJob('race-bad-schedule-fail', new Date(Date.now() - 60_000).toISOString());
+    await writeJob(job);
+
+    let threw = false;
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await (scheduler as any).executeJob(job);
+    } catch {
+      threw = true;
+    } finally {
+      console.error = origError;
+    }
+
+    if (threw) fail(`29: failure-path executeJob must NOT throw on bad on-disk schedule`);
+
+    const onDisk = await readJob('race-bad-schedule-fail');
+    if (!onDisk) fail(`29: file should still exist`);
+    if (onDisk!.runtime.next_run_at !== '') {
+      fail(`29: failure-path bad-schedule must also dead-letter; got ${JSON.stringify(onDisk!.runtime.next_run_at)}`);
+    }
+    // On the failure path, last_error reflects the EXECUTION error
+    // (more actionable than the cron error); the dead-letter is
+    // logged via stderr only.
+    if (!onDisk!.runtime.last_error || !/230001|param error/.test(onDisk!.runtime.last_error)) {
+      fail(`29: failure-path last_error should carry the execution error; got ${onDisk!.runtime.last_error}`);
+    }
+    if (!errors.some((e) => /DEAD-LETTERED/.test(e) && /race-bad-schedule-fail/.test(e))) {
+      fail(`29: failure-path dead-letter must log to stderr; got: ${errors.join(' | ')}`);
+    }
     passed++;
   }
 } finally {
@@ -570,4 +993,4 @@ try {
   rmSync(tmpJobsDir, { recursive: true, force: true });
 }
 
-console.log(`scheduler smoke: ${passed}/23 PASS`);
+console.log(`scheduler smoke: ${passed}/33 PASS`);
