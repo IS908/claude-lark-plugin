@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.42] - 2026-05-25
+
+### Fixed
+- **`searchEpisodes` injected unrelated episodes by recency alone, and pre-cap episodes inflated context** (#100 — **HIGH context pollution, silent token waste**). Two amplifying bugs:
+
+  1. **Empty-keyword + recency-only injection.** `extractKeywords` filters stopwords and tokens of length ≤ 1, so common Feishu replies like `好的`, `嗯嗯`, `thanks 👍`, emoji-only messages collapsed to `[]`. With `keywords = []`, `keywordScore = 0` for every file, but `recencyScore = max(0, 1 - ageDays/30)` still hit 0.7+ for anything from the last week. `totalScore = 0 + recencyScore` cleared the consumer-side floor `LARK_MIN_SEARCH_SCORE=0.3` — so every "好的" reply injected the most recent unrelated episode into Claude's system prompt. `searchSkills` had the right guard (`if (score > 0)`); `searchEpisodes` didn't.
+
+  2. **No per-episode size cap.** `saveEpisode` called `fs.writeFile(content)` with no length check. `enrichWithMemory` injected `${ep.content}` whole. A single pathological buffer-flush (50KB+ from a noisy chat) would re-inflate every future enrichment that matched, silently exhausting Claude's context budget.
+
+  Fix:
+  - **Fix A (search side)**: `searchEpisodes` now matches `searchSkills` — early-return `[]` when `extractKeywords` yields nothing, AND skips per-file when `keywordScore === 0`. Recency stays as a tie-breaker among RELEVANT episodes, not as a relevance signal on its own.
+  - **Fix B (write side)**: `saveEpisode` truncates content to `LARK_EPISODE_WRITE_CAP_BYTES` (default 8KB) before writing. Disk + future-injection cost are bounded at write time.
+  - **Fix B (inject side)**: `enrichWithMemory` truncates each `ep.content` to `LARK_EPISODE_INJECT_CAP_BYTES` (default 2KB) before wrapping. Belt-and-suspenders against pre-cap episodes already on disk OR a future operator who raises the write cap without rebuilding.
+
+  UTF-8 safety: both caps use a new `MemoryStore.capByBytes(s, maxBytes)` static helper that walks back from a candidate cutoff to the nearest UTF-8 lead-byte boundary, so CJK chars are never bisected into U+FFFD replacement chars. Appends `\n... [truncated]` so Claude (and operators reading episode files) can tell.
+
+### Added
+- New `MemoryStore.capByBytes(s, maxBytes): string` static helper — UTF-8-safe byte truncation. Exported for direct unit testing.
+- Two new config keys (both default to a reasonable value; set to `0` to disable that side):
+  - `LARK_EPISODE_WRITE_CAP_BYTES` (default `8192`) — cap inside `saveEpisode`.
+  - `LARK_EPISODE_INJECT_CAP_BYTES` (default `2048`) — cap inside `enrichWithMemory` per episode.
+- New `scripts/episode-cap-smoke.ts` (10 tests, wired into `scripts/test.sh`):
+  - Part A (6): `capByBytes` contract — under-cap pass-through, at-cap pass-through, over-cap ASCII truncation, UTF-8 boundary preservation on CJK, zero-cap returns `''`, negative-cap returns `''`.
+  - Part B (1): `saveEpisode` round-trip — 10KB write read back is bounded and bears the truncation tag.
+  - Part C (3): `searchEpisodes` empty-keyword short-circuit (emoji-only / Chinese-stopword queries), zero-match short-circuit (keywords exist but no episode contains them), and a positive control (genuine keyword match returns the episode).
+
+### R2-audit followups (closed in this PR)
+- **Emoji strip was incomplete for flags, skin tones, and keycaps** — `\p{Extended_Pictographic}` alone did NOT cover Regional Indicators (`🇨🇳`, `🇺🇸`), Emoji Modifiers (skin-tone characters in `👍🏽` etc.), or the COMBINING ENCLOSING KEYCAP `U+20E3` (in `1️⃣`, `5️⃣`). All three survived the strip as non-ASCII residue tokens of length ≥ 2, fell through to the `haystack.includes(kw)` substring matcher, and re-opened the recall pollution that #100 closed — particularly visible in China-region Lark deployments where flags and skin-tone reactions are common. Strip expanded to a Unicode-class union: `[\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}⃣]`. Test 8 grew three subtests pinning flag / skin-tone / keycap inputs against a same-language episode.
+
+### R1-audit followups (closed in this PR)
+- **Empty-keyword guard didn't actually cover "好的" / "ok" / "👍"** — `extractKeywords` filtered only `length > 1` against a stopword list that lacked common acknowledgements. So `"好的"` (length 2 in UTF-16) passed through as a real keyword, fell into the non-ASCII substring matcher, and surface-matched any episode whose distilled prose contained "好的" — common in casual chat. The empty-keyword short-circuit at the top of `searchEpisodes` never fired. Fixed by extending the stopword set with English acks (`ok`, `okay`, `yes`, `yep`, `yeah`, `sure`, `fine`, `cool`, `nice`, `thanks`, `thx`, `thank`, `great`, `good`, `got`, `gotcha`, `roger`) and Chinese acks (`好的`, `好`, `嗯`, `嗯嗯`, `嗯哼`, `收到`, `明白`, `知道`, `对的`, `是的`, `没事`, `谢谢`, `感谢`, `可以`, `行的`), AND stripping `\p{Extended_Pictographic}` (emoji) before split so a single `👍` doesn't pass the length filter as a surrogate pair. Test 8 reseeded to actually exercise this — a Chinese episode that literally contains `好的` is no longer recalled by a `好的` query.
+- **Smoke test 7 was vacuous** — set `process.env.LARK_EPISODE_WRITE_CAP_BYTES` AFTER `appConfig` had already been frozen at module load, so the env mutation did nothing and the assertion silently validated only the default 8KB cap. Rewritten to honestly test the default cap end-to-end via `saveEpisode`, and a new test 7b pins the configurability contract at the helper level via direct `capByBytes(_, 256)`.
+- **`capByBytes` docstring clarified** — the function returns up to `maxBytes + 16` bytes when truncation fires (the `\n... [truncated]` suffix is appended AFTER the body cap). Callers needing a hard upper bound subtract `TRUNCATION_TAG_BYTES`. Also documents the empty-string and sub-codepoint-cap behaviors.
+
+### Operator notes
+- **Existing on-disk episodes are NOT retroactively rescanned or truncated.** Episodes written before v1.0.42 keep their full content on disk. The inject-side cap defends Claude's prompt budget regardless; if you want to reclaim disk, re-run `pruneEpisodes` (existing path, no change) or manually delete old episode files. The retention prune from v1.0.20 (`LARK_EPISODE_RETENTION_DAYS`) already bounds disk growth at the directory level.
+- **Behavior change for short replies**: post-fix, an "嗯" / "好的" / "👍" / "ok" / "thanks" reply no longer triggers episode recall at all (the new stopword set + emoji strip ensures `extractKeywords` returns `[]`). If you were relying on this (e.g., expecting Claude to recall "the thing we were just talking about" from emoji-only acknowledgements), the in-buffer context (which carries recent turns regardless of episode search) does that job instead.
+- **Cap defaults are intentionally generous on the write side and conservative on the inject side.** Write cap (8KB) is bigger than any single normal flush; inject cap (2KB) is sized to fit comfortably alongside profile + skills in the enrichment envelope. Tune via env if your distillation prompt produces longer episodes or you want tighter injection. `0` (or any non-positive value) disables that side.
+- **Stopword additions are conservative.** Only universal acknowledgements were added; topical or domain words (e.g. "deploy", "config", "issue") remain real keywords. The smoke includes a positive-control test (8b) confirming a real CJK keyword "部署" still matches.
+- No data-format changes. The cache/storage shape and enrichment envelope shape are identical. Only sizes change.
+
+---
+
 ## [1.0.41] - 2026-05-25
 
 ### Fixed

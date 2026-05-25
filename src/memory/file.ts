@@ -667,6 +667,18 @@ export class MemoryStore {
 
       // Read all episodes and score by keyword overlap + recency
       const keywords = this.extractKeywords(query);
+
+      // #100 fix (Fix A): empty-keyword short-circuit. searchSkills
+      // gates on `if (score > 0)` but searchEpisodes pre-fix pushed
+      // every file with `keywordScore + recencyScore`, where recency
+      // alone is 0-1. Combined with the consumer-side floor of
+      // `minSearchScore=0.3`, any episode <21 days old still passed —
+      // so emoji-only / single-token / Chinese-stopword inputs (which
+      // `extractKeywords` filters to []) injected the most recent
+      // unrelated episode on every reply. Match searchSkills:
+      // no keywords ⇒ no relevance ⇒ no episodes.
+      if (keywords.length === 0) return [];
+
       const scored: Array<{ episode: Episode; score: number }> = [];
 
       for (const file of mdFiles) {
@@ -690,6 +702,12 @@ export class MemoryStore {
             keywordScore++;
           }
         }
+
+        // #100 fix (Fix A continued): per-file gate — if this
+        // episode matched zero keywords, don't push it. Recency is
+        // a tie-breaker among RELEVANT episodes, not a relevance
+        // signal of its own.
+        if (keywordScore === 0) continue;
 
         // Recency boost: newer files score higher (0-1 scale, decays over 30 days)
         const ageMs = Date.now() - stat.mtimeMs;
@@ -739,7 +757,17 @@ export class MemoryStore {
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const fileName = `${timestamp}.md`;
-    await fs.writeFile(path.join(dir, fileName), content, 'utf-8');
+    // #100 fix (Fix B write side): cap episode write size. Pre-fix
+    // `enrichWithMemory` injected `${ep.content}` whole, so a single
+    // pathological flush (50KB+ buffered text) would inflate every
+    // future enrichment that matched. Cap defends both this and
+    // disk-quota erosion. Default 8KB ≈ one to several screens of
+    // distilled text per episode — comfortably more than a normal
+    // flush produces. Configurable via LARK_EPISODE_WRITE_CAP_BYTES;
+    // 0 disables. See also enrichWithMemory's inject-cap (channel.ts).
+    const writeCap = appConfig.episodeWriteCapBytes;
+    const capped = writeCap > 0 ? MemoryStore.capByBytes(content, writeCap) : content;
+    await fs.writeFile(path.join(dir, fileName), capped, 'utf-8');
   }
 
   /**
@@ -1298,6 +1326,48 @@ export class MemoryStore {
     return haystack.includes(kw);
   }
 
+  /**
+   * Truncate a UTF-8 string so the BODY is at most `maxBytes` bytes,
+   * preserving multi-byte character boundaries. When truncation
+   * occurs, appends `\n... [truncated]` (16 ASCII bytes) AFTER the
+   * body — so the returned string can be up to `maxBytes + 16` bytes.
+   * Callers that need a hard upper bound on the returned size should
+   * subtract `TRUNCATION_TAG_BYTES` from their cap before calling.
+   *
+   * Pure helper used by #100 fix (saveEpisode write cap + channel
+   * inject cap). Exported `static` so the smoke test can pin the
+   * truncation contract without going through fs.
+   *
+   * Returns `''` for `maxBytes <= 0` (treated as "disable; nothing
+   * fits"). Returns the original string for any input whose UTF-8
+   * byte length is already within the cap (including empty string).
+   *
+   * Edge note: with `maxBytes` smaller than the first character's
+   * UTF-8 length (e.g. `maxBytes=1` and a 3-byte CJK lead), the body
+   * truncates to empty and the result is just the truncation tag.
+   * Production caps (defaults 2KB / 8KB) never hit this corner; if a
+   * future caller sets a sub-codepoint cap they get the tag only —
+   * accept that as the intended "cap was unreasonably small" signal.
+   *
+   * Implementation note: UTF-8 continuation bytes are `10xxxxxx`
+   * (`0x80–0xBF`). After a candidate cutoff, walk backward past any
+   * continuation bytes so we land on a lead byte boundary — otherwise
+   * `Buffer.toString('utf-8')` would render the partial sequence as
+   * `U+FFFD` (replacement character) which is uglier than truncating
+   * a few bytes earlier.
+   */
+  static capByBytes(s: string, maxBytes: number): string {
+    if (maxBytes <= 0) return '';
+    const buf = Buffer.from(s, 'utf-8');
+    if (buf.length <= maxBytes) return s;
+    let end = maxBytes;
+    // Walk back past UTF-8 continuation bytes (10xxxxxx) so we don't
+    // bisect a multi-byte codepoint. Bounded by 4 iterations max
+    // (UTF-8 chars are at most 4 bytes).
+    while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+    return buf.subarray(0, end).toString('utf-8') + '\n... [truncated]';
+  }
+
   private extractKeywords(query: string): string[] {
     const stopWords = new Set([
       'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
@@ -1306,11 +1376,50 @@ export class MemoryStore {
       'on', 'with', 'at', 'by', 'from', 'as', 'into', 'about', 'it', 'its',
       'this', 'that', 'these', 'those', 'i', 'me', 'my', 'we', 'our', 'you',
       'your', 'he', 'she', 'they', 'them', 'and', 'or', 'but', 'not', 'no',
+      // #100 R1-followup: common English acknowledgements. Pre-followup
+      // these passed the `length > 1` filter, so a "thanks" or "ok" reply
+      // would surface any past episode that happened to contain the
+      // same token in distilled prose (substring match via matchKeyword
+      // on the ASCII path with `kw.length ≤ 3` is both-sides boundary,
+      // so `ok` only matches the word `ok` — still injects too eagerly
+      // for a content-free ack).
+      'ok', 'okay', 'yes', 'yep', 'yeah', 'sure', 'fine', 'cool', 'nice',
+      'thanks', 'thx', 'thank', 'great', 'good', 'got', 'gotcha', 'roger',
+      // Existing CJK function-word stopwords
       '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一',
       '上', '也', '他', '她', '们', '这', '那', '你', '吗', '什么', '怎么',
+      // #100 R1-followup: common Chinese acknowledgements. Pre-followup
+      // "好的" / "嗯嗯" / "收到" cleared the `length > 1` filter (2-char
+      // CJK = length 2 in UTF-16) and reached the non-ASCII substring
+      // matcher (`haystack.includes('好的')`), which fires on any past
+      // episode whose distilled prose happens to contain "好的" — common
+      // in casual chat. These acks carry no retrieval signal; drop them.
+      '好的', '好', '嗯', '嗯嗯', '嗯哼', '收到', '明白', '知道', '对的',
+      '是的', '没事', '谢谢', '感谢', '可以', '行的',
     ]);
 
-    return query
+    // #100 R1-followup + R2-followup: strip emoji and emoji-adjacent
+    // glyphs before splitting. Emoji surrogate pairs have `.length === 2`
+    // in JS UTF-16, so a single 👍 passes the `length > 1` filter as
+    // `"👍"`. The non-ASCII substring path would then match any episode
+    // that quoted the same emoji — same pollution mode as the Chinese-
+    // ack case.
+    //
+    // R2 expanded the strip to four Unicode classes — `Extended_Pictographic`
+    // alone misses common Lark/CN-region symbols that flow through chat:
+    //   - `Regional_Indicator` (U+1F1E6–U+1F1FF): flag base letters.
+    //     A flag like 🇨🇳 is two regional-indicator code points (4
+    //     UTF-16 units); without the strip it survives as a non-ASCII
+    //     "token" and re-opens the recall pollution that #100 closed.
+    //   - `Emoji_Modifier` (U+1F3FB–U+1F3FF): skin-tone modifiers.
+    //     Removing only the base glyph 👍 from 👍🏽 leaves "🏽" as a
+    //     length-2 token. Stripping the modifier too is the only way
+    //     to leave nothing behind.
+    //   - `⃣` (COMBINING ENCLOSING KEYCAP): used in keycap
+    //     composites like 1️⃣. Same residue argument as skin tones.
+    const stripped = query.replace(/[\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}⃣]/gu, ' ');
+
+    return stripped
       .toLowerCase()
       .split(/[\s,;.!?，。！？、；：]+/)
       .filter(w => w.length > 1 && !stopWords.has(w));
