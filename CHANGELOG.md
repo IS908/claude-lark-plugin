@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.34] - 2026-05-25
+
+### Fixed
+- **`saveProfile` TOCTOU race on concurrent same-user writes across chats** (#54 — **HIGH silent-data-loss when triggered**). `saveProfile` and (same shape) `removeProfileLine` both do `read existing → merge → write back` on the profile tier file. Two concurrent calls for the SAME `userId` from different chats — a cronjob with `created_by = ou_user` firing while user is messaging in a group, or two chats both seeing distillation results land at once for the same speaker — race on the read-then-write sequence: both read snapshot S, both compute different merges (S ∪ deltaA vs S ∪ deltaB), the second write silently clobbers the first → one fact lost with no user-visible error.
+
+  Per-chat `MessageQueue` already serializes traffic within a single chat, so the race only fires for CROSS-chat same-user concurrency — narrow but reachable in any deployment with cronjobs targeting a user who's also actively chatting elsewhere.
+
+  Fix: per-user async mutex on `MemoryStore` (`profileMutex: Map<userId, Promise<void>>`). `saveProfile` and `removeProfileLine` both wrap their bodies in `withProfileMutex(userId, async () => { ... })`. Subsequent calls for the same `userId` queue behind any in-flight one; calls for different `userId`s proceed in parallel (per-user keying preserves cross-user throughput). Failures in one queued call do NOT poison the chain — the chain advances regardless (matches `MessageQueue` semantics in `src/queue.ts`). Mutex Map entries are cleaned up on completion when no later call has chained on top, so the Map stays empty in steady state.
+
+  Scope decision: also applied to `removeProfileLine` since it has the same RMW shape and the same exposure (a `forget_memory` in chat A racing with `save_memory` in chat B for the same user would lose the save's delta if forget's write landed last). The issue mentioned `saveProfile` explicitly; covering both with the same mutex avoids a follow-up PR for the symmetric path.
+
+  Cross-process note: this is a single-process construct. A second MCP process writing the same profile would still race, but the file lock at `src/lock.ts` (v1.0.23) blocks two processes from running concurrently — so cross-process exposure is structurally prevented.
+
+### Added
+- New `scripts/profile-toctou-smoke.ts` (9 tests, wired into `scripts/test.sh`):
+  - **1**: sequential baseline (test-harness sanity check)
+  - **2** (the bug): 20 concurrent same-user `saveProfile` calls — pre-fix would have lost most deltas, post-fix all 20 survive
+  - **3**: cross-user writes run in parallel (loose timing bound) — confirms the per-user keying doesn't degenerate into a global mutex
+  - **4**: Map cleanup — entry removed after a save completes when no chain follows
+  - **5**: Map keeps entries while a chain is active (no premature cleanup)
+  - **6**: one call throwing does NOT poison the chain — A→B(throw)→C all observed in order, A and C fulfill, B rejects
+  - **7**: `saveProfile` + `removeProfileLine` concurrent on same user → both outcomes survive (remove targets only its line, save's delta is preserved)
+  - **8 (R1-followup)**: `saveProfileTiered` atomicity — tiered-replace + private-append concurrent on same user → result is one of two well-defined orderings, NEVER the pre-followup "mid-pair clobber" outcome
+  - **9 (R1-followup)**: 10 concurrent `saveProfileTiered` calls serialize → last writer wins exactly (REPLACE semantic preserved, no in-flight clobber)
+
+### R1-audit followups (closed in this PR)
+- **`saveProfileTiered` (new method)** — R1 caught a MEDIUM gap: the `profile_tiered` flow at `src/tools.ts:1100` issued two separate `saveProfile(...,'replace')` calls. Each grabbed the per-user mutex independently → a cross-chat save could land BETWEEN the public-replace and private-replace and have its private-tier delta clobbered by the private-replace. The pair was NOT atomic from a same-user-cross-chat concurrency perspective even with the #54 fix. New `MemoryStore.saveProfileTiered(userId, {public, private})` performs both writes inside ONE `withProfileMutex` invocation so the pair is observable as atomic to any other concurrent same-user save / remove. The L1 safety net is re-applied on the public tier (defense-in-depth — even though `parseTieredProfile` already classified, a future caller bypassing it still gets the protection). Updated both the production call site (`src/tools.ts:save_memory(type='profile_tiered')`) and the test harness (`scripts/profile-tiered-smoke.ts`'s `applyTieredProfile`).
+- **Cleanup belt-and-suspenders** — added explicit `.catch` handler on the `tail.then(cleanup)` chain so a future refactor that swaps `tail` for `next` (which can reject) doesn't silently produce unhandled rejections.
+- **Test 4/5 timer dependency removed** — replaced `setTimeout(10)` with `await Promise.resolve()` ×2 to drain the cleanup microtask without a wall-clock dependency. R1 noted 10ms is theoretically flaky on loaded CI; this removes the timing dependency entirely.
+- **Invariant comments propagated** — the "must NOT recurse back into mutex-wrapped function on same userId" deadlock guard was only documented on the helper. Added explicit comments to `saveProfile` and `removeProfileLine` bodies too so a future contributor adding internal recursion can't miss it.
+
+### R2-audit followups (closed in this PR)
+- **`src/prompts.ts` distiller prompt updated** — R2 caught that lines 89/91 still told Claude the tiered path is non-atomic and that "the writes are NOT a single atomic transaction", which is exactly the failure mode the R1 followup eliminated. The system prompt is sent on every initialize handshake; leaving the stale doc in would have taught every fresh session an inaccurate mental model of the storage layer. Rewrote the paragraph to describe the new per-user-lock atomic-pair semantic; the residual read-side window (mid-pair `getProfile`) is still mentioned but pinned to its correct cause.
+
+### R1-audit findings filed as followups
+- **#143 — `migrateIfNeeded` race**: concurrent same-user `saveProfile` (mutex-wrapped) + `getProfile` / `listProfileLines` (unwrapped) on a legacy pre-v0.10 user's first touch can race during migration. The save's tier writes can be clobbered by the concurrent migration's tier writes. Narrow exposure — only on first-touch of legacy users — but worth a separate focused fix.
+
+### Operator notes
+- No data-format or config changes. Existing profile files are read/written in the same shape as v1.0.33; nothing to migrate.
+- Pre-#54 data already lost to the race cannot be recovered — the race produced no on-disk evidence (the losing write just doesn't reach disk). Going forward writes serialize correctly.
+- The mutex Map is bounded by concurrent-active-users (empty in steady state). No tunable; growth is naturally bounded by Feishu's per-user activity.
+
 ## [1.0.33] - 2026-05-25
 
 ### Fixed

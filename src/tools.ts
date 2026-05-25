@@ -1088,17 +1088,24 @@ export function registerTools(
             .map((line) => (line.startsWith('-') ? line : `- ${line}`))
             .join('\n') +
           (arr.some((s) => oneLine(s).length > 0) ? '\n' : '');
-        // The two writes are sequential, NOT a single atomic transaction.
-        // A concurrent getProfile call in the window between them would
-        // see public-new + private-old (sub-ms window on a healthy
-        // filesystem). Per-chat queueing (src/queue.ts) serializes any
-        // other save_memory on the same user, so no save can race here,
-        // but read paths (memory enrichment in src/channel.ts) are
-        // unqueued. Tracked alongside the saveProfile TOCTOU at #54;
-        // a true atomic-pair write would need a per-user lock or a
-        // temp-dir-and-rename of profiles/<userId>/.
-        await memoryStore.saveProfile(caller, fmt(tiered.public), 'public', 'replace');
-        await memoryStore.saveProfile(caller, fmt(tiered.private), 'private', 'replace');
+        // v1.0.34 (R1-followup on #54): single atomic-pair write under
+        // the per-user profile mutex. Pre-fix two sequential saveProfile
+        // calls each grabbed the mutex independently — a cross-chat
+        // save landing AFTER public-replace but BEFORE private-replace
+        // would have its private-tier delta clobbered. The new
+        // saveProfileTiered method serializes the pair under ONE mutex
+        // acquisition so the public+private write is observable as
+        // atomic to any other concurrent same-user save / remove.
+        //
+        // Residual: read paths (memory enrichment in src/channel.ts) are
+        // still unqueued — a concurrent getProfile mid-pair sees
+        // public-new + private-old for a sub-ms window. Acceptable for
+        // an enrichment read (which is best-effort context); not for
+        // the WRITE path where a lost delta is data loss.
+        await memoryStore.saveProfileTiered(caller, {
+          public: fmt(tiered.public),
+          private: fmt(tiered.private),
+        });
         void audit('save_memory', caller, auditArgs, 'ok');
         return {
           content: [
