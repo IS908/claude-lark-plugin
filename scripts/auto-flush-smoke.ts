@@ -67,6 +67,8 @@ const fakeChannel = {
   isPrivateChat: () => false,
   markPendingAckRevoke: (_: string) => {},
   consumePendingAckRevoke: (_: string) => false,
+  // v1.0.53 #159/#160: stub (not exercised by auto-flush tests)
+  isRecentInbound: (_: string) => false,
 } as unknown as LarkChannel;
 
 // Minimal mock Lark client — save_memory doesn't actually use it but

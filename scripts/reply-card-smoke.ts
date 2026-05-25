@@ -150,6 +150,11 @@ async function run() {
     isPrivateChat: () => true,
     markPendingAckRevoke: (_: string) => {},
     consumePendingAckRevoke: (_: string) => false,
+    // v1.0.53 #159/#160: revokeAckFor's markIfMissing path now also
+    // calls channel.isRecentInbound. Stub true so reply tool tests
+    // that exercise the mark path keep working (they test reply's
+    // ack-revoke contract, not the inbound-id gate).
+    isRecentInbound: (_: string) => true,
   } as unknown as LarkChannel;
 
   registerTools(

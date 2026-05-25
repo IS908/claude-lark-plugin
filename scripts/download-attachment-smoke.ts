@@ -149,6 +149,9 @@ const fakeChannel = {
   isPrivateChat: () => true,
   markPendingAckRevoke: (_: string) => {},
   consumePendingAckRevoke: (_: string) => false,
+  // v1.0.53 #159/#160: stub (download doesn't use markIfMissing but
+  // the function reference must exist on the channel object)
+  isRecentInbound: (_: string) => false,
 } as unknown as LarkChannel;
 const handlers = new Map<string, (args: any) => Promise<any>>();
 const fakeServer = {

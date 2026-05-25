@@ -105,6 +105,8 @@ async function setup() {
     isPrivateChat: () => true,
     markPendingAckRevoke: (_: string) => {},
     consumePendingAckRevoke: (_: string) => false,
+    // v1.0.53 #159/#160: stub true so reply mark-pending path fires
+    isRecentInbound: (_: string) => true,
   } as unknown as LarkChannel;
 
   registerTools(

@@ -163,16 +163,21 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
 
 // ── Part C: revokeAckFor marks pending when Map empty ──
 
-// 5. Reply tool with reply_to to a message that has NO ack yet (race
-//    scenario): revokeAckFor logs and marks pending. Subsequent
+// 5. Reply tool with reply_to to a RECORDED inbound message that has
+//    NO ack yet (race scenario): revokeAckFor's markIfMissing gate
+//    (#159/#160) checks isRecentInbound — true here because we
+//    explicitly record before reply — and marks pending. Subsequent
 //    consume returns true.
 {
   const { channel } = setupHandlers();
   const reply = handlers.get('reply');
   if (!reply) fail(`5: reply handler missing`);
 
-  // Send a reply with reply_to but no pre-existing ack — should mark
-  // pending (consume returns true after) instead of silently no-op.
+  // v1.0.53 #159/#160: register the message as a recent inbound first.
+  // Pre-fix, reply would have marked unconditionally — now it gates
+  // on isRecentInbound.
+  channel.recordInboundId('om_no_ack_yet');
+
   await reply({
     chat_id: 'chat_test',
     text: 'hi',
@@ -180,7 +185,31 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
   });
 
   if (!channel.consumePendingAckRevoke('om_no_ack_yet')) {
-    fail(`5: revokeAckFor should have marked 'om_no_ack_yet' as pending-revoke`);
+    fail(`5: revokeAckFor should have marked 'om_no_ack_yet' as pending-revoke (recent-inbound path)`);
+  }
+  passed++;
+}
+
+// 5b. #159/#160 fix: reply with reply_to to a NON-INBOUND id (e.g.
+//     Claude quoting a bot card or stale message) must NOT mark
+//     pending. The gate fails closed → no Set leak.
+{
+  const { channel } = setupHandlers();
+  const reply = handlers.get('reply');
+  if (!reply) fail(`5b: reply handler missing`);
+
+  // Do NOT recordInboundId. The id isn't a known inbound.
+  await reply({
+    chat_id: 'chat_test',
+    text: 'hi',
+    reply_to: 'om_stale_bot_msg',
+  });
+
+  if (channel.consumePendingAckRevoke('om_stale_bot_msg')) {
+    fail(`5b: non-inbound reply_to MUST NOT mark pending (closes #160 leak)`);
+  }
+  if (channel.getPendingAckRevokeSize() !== 0) {
+    fail(`5b: pendingAckRevokes should stay empty, got size ${channel.getPendingAckRevokeSize()}`);
   }
   passed++;
 }
@@ -290,12 +319,17 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
   passed++;
 }
 
-// 10. Positive control: reply DOES mark pending (race protection
-//     correctly opted in via markIfMissing=true).
+// 10. Positive control: reply DOES mark pending when the reply_to
+//     IS a recently-recorded inbound (race protection correctly
+//     opted in via markIfMissing=true + isRecentInbound=true).
 {
   const { channel } = setupHandlers();
   const reply = handlers.get('reply');
   if (!reply) fail(`10: reply handler missing`);
+
+  // v1.0.53 #159/#160: register the inbound first so the
+  // isRecentInbound gate fires true.
+  channel.recordInboundId('om_race_target');
 
   await reply({
     chat_id: 'chat_test',
@@ -304,7 +338,7 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
   });
 
   if (!channel.consumePendingAckRevoke('om_race_target')) {
-    fail(`10: reply with no matching ack MUST mark pending-revoke (race protection)`);
+    fail(`10: reply with recorded inbound MUST mark pending-revoke (race protection)`);
   }
   passed++;
 }
@@ -395,6 +429,52 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
   }
   if (typeof entry!.addedAt !== 'number') {
     fail(`11b-control: addedAt must be set (powers TTL backstop)`);
+  }
+  passed++;
+}
+
+// ── Part F: #159 + #160 — recentInboundIds TTL cache + isRecentInbound ──
+
+// 12. recordInboundId + isRecentInbound contract: roundtrip true.
+{
+  const ch = new LarkChannel();
+  ch.recordInboundId('om_inbound_1');
+  if (!ch.isRecentInbound('om_inbound_1')) {
+    fail(`12: recorded id MUST be recent`);
+  }
+  if (ch.isRecentInbound('om_never_recorded')) {
+    fail(`12: unrecorded id MUST NOT be recent`);
+  }
+  // Empty id defensively rejected
+  if (ch.isRecentInbound('')) fail(`12: empty id must be rejected`);
+  passed++;
+}
+
+// 13. #159 fix end-to-end: react with markIfMissing=true (hypothetical
+//     future caller — current react still uses default false). But the
+//     gate's contract is testable directly: if a tool DID pass
+//     markIfMissing=true with a non-inbound id, the gate fails closed.
+//     Simulate by calling revokeAckFor's contract via reply with a
+//     non-inbound reply_to (test 5b above also covers this).
+//
+//     Here we directly verify the channel.isRecentInbound branch
+//     against a known non-inbound id and a known inbound id, end-to-end
+//     through the gate path.
+{
+  const { channel } = setupHandlers();
+  const reply = handlers.get('reply');
+
+  // Recorded inbound — marks pending
+  channel.recordInboundId('om_inbound_e2e');
+  await reply!({ chat_id: 'chat_test', text: 'x', reply_to: 'om_inbound_e2e' });
+  if (!channel.consumePendingAckRevoke('om_inbound_e2e')) {
+    fail(`13: recorded inbound MUST mark pending`);
+  }
+
+  // Not recorded — does NOT mark
+  await reply!({ chat_id: 'chat_test', text: 'y', reply_to: 'om_unknown' });
+  if (channel.consumePendingAckRevoke('om_unknown')) {
+    fail(`13: unrecorded id MUST NOT mark pending`);
   }
   passed++;
 }
