@@ -373,8 +373,35 @@ const SENTINEL_LINE_REGEXES = DEFER_SENTINELS.map(
   (s) => new RegExp(`^\\s*${s.replace(/[\[\]]/g, '\\$&')}\\s*$`, 'm')
 );
 
+// #82 fix: strip markdown code content BEFORE the sentinel regex check.
+// Pre-fix, `^...$` with the `m` flag matched ANY line — including lines
+// inside a fenced code block. So a Claude response that *demonstrated*
+// the sentinel (e.g. "to defer, write [LARK_DEFER] on its own line"
+// formatted as a fenced code sample) would accidentally defer a real
+// unanswered message.
+//
+// Strips, in order:
+//   - ```...``` fenced blocks (any language hint, multiline)
+//   - ~~~...~~~ fenced blocks (alt fence)
+//   - `...` inline backtick spans (single-line)
+//
+// Unclosed fences are NOT stripped — they survive to the sentinel
+// check. Over-blocking on a malformed/unclosed code block is a worse
+// failure mode (Claude forced to retry a turn it correctly deferred)
+// than under-blocking (one rare malformed input slips through). For
+// the realistic Claude-output shape, fences are always closed.
+//
+// Non-greedy `*?` so adjacent fences don't collapse into one strip.
+function stripCodeContent(text) {
+  let t = text.replace(/```[\s\S]*?```/g, '');
+  t = t.replace(/~~~[\s\S]*?~~~/g, '');
+  t = t.replace(/`[^`\n]*`/g, '');
+  return t;
+}
+
 function hasDeferSentinel(text) {
-  return SENTINEL_LINE_REGEXES.some((re) => re.test(text));
+  const clean = stripCodeContent(text);
+  return SENTINEL_LINE_REGEXES.some((re) => re.test(clean));
 }
 
 // Determine whether each pending message has been answered.

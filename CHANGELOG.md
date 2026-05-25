@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.31] - 2026-05-25
+
+### Fixed
+- **Stop hook: defer sentinel inside fenced code block silently bypasses block** (#82 — **MEDIUM hook-bypass via legitimate Claude documentation**). `hooks/enforce-lark-reply.mjs:376` (`hasDeferSentinel`) used a multiline-anchored regex `^\s*\[LARK_DEFER\]\s*$` to detect the defer sentinel on its own line — but the `m` flag matches ANY line, including lines inside a markdown fenced code block. So a Claude response that *documented* the sentinel — e.g. a user asking "how does [LARK_DEFER] work?" and Claude replying with a fenced demo — silently deferred the un-answered turn. The user's real message was treated as deferred-pending-async even though Claude had not actually called `reply`.
+
+  Test 22 covered the inline-echo attack (`the token is [LARK_DEFER] as you asked`) and test 23 covered the legitimate own-line sentinel — but the in-between "own line inside a code block" case was uncovered.
+
+  Same exposure in **thinking blocks** (`block.type === 'thinking'`): Claude's thinking trace often quotes the sentinel inside fences when reasoning about its own behavior. `collectAssistantText` includes thinking text in the scanned `combined` string, so any fenced sentinel in thinking would have hit the same false-defer path.
+
+  Fix: new `stripCodeContent(text)` step before the sentinel regex. Removes — in order — ```...``` fenced blocks (any language hint), ~~~...~~~ alt-fence blocks, and `` `...` `` inline backtick spans. Non-greedy matching so adjacent fences don't collapse into one strip. Unclosed fences are NOT stripped (rare in realistic Claude output; over-blocking on a malformed code block is a worse failure mode than under-blocking the rare unclosed case).
+
+### Added
+- 5 new hook-test assertions (tests 30–34) covering:
+  - **Test 30**: ```...[LARK_DEFER]...``` fenced sentinel → must NOT defer.
+  - **Test 31**: ~~~...[LARK_DEFER]...~~~ alt-fence sentinel → must NOT defer.
+  - **Test 32**: `` `[LARK_DEFER]` `` inline backtick → must NOT defer.
+  - **Test 33**: fenced sentinel inside a `thinking` block → must NOT defer (extends test 15's thinking-block coverage to the fenced case).
+  - **Test 34**: real standalone `[LARK_DEFER]` alongside a fenced demo in the same turn → still defers correctly (strip-only-code regression guard).
+
+### Operator notes
+- No data-format changes; no migration. Pre-fix transcripts that triggered a false-defer cannot be retroactively re-evaluated — the audit log shows `status=deferred reason=defer-sentinel` for any past occurrence. Post-fix, the same shape transcript will block, surfacing the genuine pending message via `process.stderr`.
+
 ## [1.0.30] - 2026-05-25
 
 ### Fixed
