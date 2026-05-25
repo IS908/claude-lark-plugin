@@ -307,6 +307,81 @@ try {
     }
     testNum++;
   }
+  // ── 10. #143 migrateIfNeeded race (legacy-first-touch concurrency) ──
+  //   Pre-fix `getProfile` / `listProfileLines` called `migrateIfNeeded`
+  //   without the mutex. On a legacy user's first concurrent touch,
+  //   getProfile and saveProfile could BOTH pass the legacy-exists
+  //   check before either had mkdir'd the new layout, both write L1-
+  //   split content to public.md, and the unmutexed read's L1-split
+  //   could clobber the save's NEW content. Post-fix, getProfile +
+  //   listProfileLines wrap the migrate call in withProfileMutex; the
+  //   save's mutex acquisition serializes against it.
+  //
+  //   Deterministic reproduction: seed a legacy file, kick off
+  //   getProfile + saveProfile concurrently, verify the save's NEW
+  //   line survives in public.md (instead of being clobbered by an
+  //   unmutexed legacy-split write).
+  {
+    const fsAsync = await import('node:fs/promises');
+    const user = 'ou_migrate_race';
+    const legacyPath = join(tmp, 'profiles', `${user}.md`);
+    await fsAsync.mkdir(join(tmp, 'profiles'), { recursive: true });
+    // Seed legacy file with mundane content (L1 will classify as public)
+    await fsAsync.writeFile(legacyPath, '- legacy fact one\n- legacy fact two\n', 'utf-8');
+
+    // Concurrent: a save AND a read on the legacy user
+    const [, profile] = await Promise.all([
+      store.saveProfile(user, 'BRAND NEW saved fact', 'public', 'append'),
+      store.getProfile(user, 'someone-else'),
+    ]);
+
+    // After both complete, the save's NEW content must be present.
+    // Pre-fix bug: the unmutexed read's migrate would clobber public.md
+    // with just the L1-split legacy (no "BRAND NEW saved fact").
+    const finalPub = tierLines(user, 'public');
+    if (!finalPub.includes('BRAND NEW saved fact')) {
+      fail(`10: save's NEW content must survive concurrent migrate, got ${JSON.stringify(finalPub)}`);
+    }
+    // Legacy lines should also be present (migrated by either path)
+    if (!finalPub.includes('legacy fact one')) {
+      fail(`10: legacy content must survive migration, got ${JSON.stringify(finalPub)}`);
+    }
+    // Legacy file should be unlinked
+    if (existsSync(legacyPath)) {
+      fail(`10: legacy file must be unlinked after migration completes`);
+    }
+    // getProfile returned the post-save state (since it serialized behind the save)
+    if (!profile || !profile.includes('BRAND NEW saved fact')) {
+      fail(`10: getProfile result should reflect post-save state, got ${JSON.stringify(profile)}`);
+    }
+    testNum++;
+  }
+
+  // ── 11. #143 fix preserved: removeProfileLine still works (no deadlock) ──
+  //   The fix's risk: making listProfileLines internally take the mutex
+  //   could deadlock removeProfileLine's existing mutex acquisition
+  //   that calls listProfileLines from inside. Caught + fixed during
+  //   implementation via _listProfileLinesLocked. This test pins the
+  //   contract — if a future refactor reverts to calling the public
+  //   variant from inside the mutex, removeProfileLine would hang.
+  {
+    const user = 'ou_no_deadlock';
+    await store.saveProfile(user, 'line one', 'public', 'append');
+    await store.saveProfile(user, 'line two', 'public', 'append');
+    const lines = await store.listProfileLines(user, 'public');
+    const targetHash = lines.find((l) => l.text === 'line one')?.hash;
+    if (!targetHash) fail(`11: setup — line one should be present`);
+    // This call would hang pre-followup-fix
+    const result = await Promise.race([
+      store.removeProfileLine(user, 'public', targetHash!),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('removeProfileLine deadlock')), 2000)),
+    ]);
+    if (result.removed !== 1) fail(`11: removeProfileLine should remove 1 line, got ${result.removed}`);
+    const after = tierLines(user, 'public');
+    if (after.includes('line one')) fail(`11: line one should be removed`);
+    if (!after.includes('line two')) fail(`11: line two should be preserved`);
+    testNum++;
+  }
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

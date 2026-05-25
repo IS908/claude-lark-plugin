@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.48] - 2026-05-25
+
+### Fixed
+- **`migrateIfNeeded` race between mutex-wrapped `saveProfile` and unmutexed `getProfile` / `listProfileLines`** (#143). On a legacy user's first concurrent touch after upgrade, the read paths called `migrateIfNeeded` without acquiring the per-user mutex (`withProfileMutex`, #54 fix). A `getProfile` and `saveProfile` racing on the same legacy user could both pass the `existsSync(legacy)` check before either had `mkdir`'d the new tier layout, then both write L1-split content to `public.md` — and the unmutexed read's L1-split could LAND LAST, clobbering the save's NEW content. Silent data loss on first-touch concurrency.
+
+  Fix: `getProfile` and `listProfileLines` now wrap their `migrateIfNeeded` call in `withProfileMutex(ownerId, ...)`. The reads themselves stay outside the mutex (eventual-consistency on tier reads is fine for enrichment; locking every read would serialize the hot path for no benefit post-migration). When the read's migrate step fires, any in-flight `saveProfile` on the same user has already completed and unlinked the legacy file → the existing `if (existsSync(dir))` short-circuit at the top of `migrateIfNeeded` takes the safe unlink-only branch.
+
+  **Deadlock pitfall caught in implementation**: `removeProfileLine` (already inside its own `withProfileMutex`) calls `listProfileLines` from inside the lock. The naive fix (just adding `withProfileMutex` to `listProfileLines`'s body) would deadlock — the inner mutex acquisition chains behind the outer's tail, which never resolves. Solved by extracting a private `_listProfileLinesLocked(ownerId, tier)` that skips the migrate step + mutex; `removeProfileLine` calls `migrateIfNeeded` directly (already in mutex) then `_listProfileLinesLocked`. Public `listProfileLines` is the migrate-then-list wrapper for outside-mutex callers. Test 11 in `scripts/profile-toctou-smoke.ts` locks the contract — a future refactor that reverts to calling the public variant from inside the mutex would hang the smoke immediately (Promise.race with a 2s deadlock detector).
+
+### Added
+- New private `MemoryStore._listProfileLinesLocked(ownerId, tier)` — internal variant for callers ALREADY inside `withProfileMutex` on the same userId.
+- Two new tests in `scripts/profile-toctou-smoke.ts` (now 11 total):
+  - **Test 10**: legacy-first-touch race — seed legacy file, run `saveProfile` + `getProfile` concurrently, assert the save's NEW content survives in `public.md` AND legacy content is preserved AND legacy file is unlinked.
+  - **Test 11**: deadlock guard — `removeProfileLine` still completes within 2s (Promise.race deadlock detector). Pins the public-vs-locked variant invariant.
+
+### Operator notes
+- **No behavior change for non-legacy users.** Migration only runs on profiles that pre-date v0.10's tiered layout; once migrated, `migrateIfNeeded` short-circuits at `!existsSync(legacy)` and the mutex acquisition is a no-op chained-tail (microseconds).
+- **First-touch reads on a legacy profile now queue briefly behind any in-flight save on the same user.** The mutex tail is empty in steady state, so the overhead is only paid on the actual first-touch race scenario.
+- **No data-format changes.** Tier file layout, legacy file shape, and the migration's L1 classification logic are unchanged.
+
+---
+
 ## [1.0.47] - 2026-05-25
 
 ### Fixed
