@@ -95,13 +95,21 @@ const fakeServer = {
 
 async function run() {
   const client = mockLarkClient();
-  const botTrackerAdded: string[] = [];
+  // v1.0.32 (#80): BotMessageTracker.add now requires chatId (+ optional
+  // threadId). Tests verify the call sites pass them through correctly.
+  const botTrackerAdded: { id: string; chatId: string; threadId?: string }[] = [];
   const botTracker = {
     ids: new Set<string>(),
     maxSize: 500,
     set: new Set<string>(),
-    add(id: string) { botTrackerAdded.push(id); this.ids.add(id); },
+    meta: new Map<string, { chatId: string; threadId?: string }>(),
+    add(id: string, chatId: string, threadId?: string) {
+      botTrackerAdded.push({ id, chatId, threadId });
+      this.ids.add(id);
+      this.meta.set(id, { chatId, threadId });
+    },
     has(id: string) { return this.ids.has(id); },
+    get(id: string) { return this.meta.get(id); },
   };
   const buffer = makeBuffer();
   // v1.0.30 (#85): ackReactions is now { reactionId, addedAt }, not bare string,
@@ -152,8 +160,13 @@ async function run() {
   const sentContent = JSON.parse(createCall.args.data.content);
   if (sentContent.type !== 'template') fail('Test 1: card content not passed through');
 
-  if (botTrackerAdded.length !== 1 || botTrackerAdded[0] !== 'mock_msg_001') {
+  if (botTrackerAdded.length !== 1 || botTrackerAdded[0].id !== 'mock_msg_001') {
     fail(`Test 1: botTracker not updated: ${JSON.stringify(botTrackerAdded)}`);
+  }
+  // v1.0.32 (#80): chatId must be plumbed through so reaction events can
+  // resolve the chat from the tracked id.
+  if (botTrackerAdded[0].chatId !== 'chat_001') {
+    fail(`Test 1: botTracker should record chatId, got ${botTrackerAdded[0].chatId}`);
   }
 
   // ── Test 2: invalid card JSON → isError ──

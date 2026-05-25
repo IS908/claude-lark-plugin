@@ -106,7 +106,7 @@ function makeSdkLogger(prefix: string) {
  * - Only chat list → gate on chat only
  * - Both lists → allow when user OR chat matches (either list whitelists the message)
  */
-function passesWhitelist(senderId: string, chatId: string): boolean {
+export function passesWhitelist(senderId: string, chatId: string): boolean {
   const userConfigured = appConfig.allowedUserIds.length > 0;
   const chatConfigured = appConfig.allowedChatIds.length > 0;
   if (!userConfigured && !chatConfigured) return true;
@@ -162,27 +162,63 @@ export function resolveMentionPlaceholders(
 
 type MessageHandler = (message: LarkMessage) => Promise<void>;
 
+/**
+ * Per-message metadata kept alongside the tracked id (#80).
+ *
+ * Reaction events from Feishu carry `message_id` but NOT `chat_id` (see
+ * `handleReactionEvent`). Pre-v1.0.32 the tracker only stored ids in a
+ * Set, so `handleReactionEvent` had to call `passesWhitelist(operatorId, '')`
+ * and built `larkMessage.chatId = ''`. That:
+ *   1. broke any whitelist config that set only `LARK_ALLOWED_CHAT_IDS`
+ *      (the chat-id check was `chatConfigured && [...].includes('')` → false)
+ *   2. left identity unbound — sensitive MCP tools called from the
+ *      reaction's Claude turn would `resolveCaller('','')` → null → fail
+ *
+ * Storing `{chatId, threadId}` keyed by message_id lets the reaction
+ * handler reconstitute both fields when an emoji lands on a previously-
+ * sent bot message.
+ */
+export interface BotMessageMeta {
+  chatId: string;
+  threadId?: string;
+}
+
 export class BotMessageTracker {
   private ids: string[] = [];
-  private set = new Set<string>();
+  private meta = new Map<string, BotMessageMeta>();
   private readonly maxSize: number;
 
   constructor(maxSize = 500) {
     this.maxSize = maxSize;
   }
 
-  add(messageId: string): void {
-    if (this.set.has(messageId)) return;
-    this.set.add(messageId);
+  /**
+   * Track a bot-sent message id and the chat it landed in. `chatId` is
+   * required (#80): the reaction handler needs it to whitelist-check and
+   * bind identity. Callers that don't have a chatId (cronjob and
+   * edit_message historically) should be migrated to pass one — tracked
+   * separately as #81.
+   */
+  add(messageId: string, chatId: string, threadId?: string): void {
+    if (this.meta.has(messageId)) return;
+    this.meta.set(messageId, { chatId, threadId });
     this.ids.push(messageId);
     while (this.ids.length > this.maxSize) {
       const oldest = this.ids.shift()!;
-      this.set.delete(oldest);
+      this.meta.delete(oldest);
     }
   }
 
   has(messageId: string): boolean {
-    return this.set.has(messageId);
+    return this.meta.has(messageId);
+  }
+
+  /**
+   * Look up the chat / thread the tracked message was sent into.
+   * Returns undefined for unknown / evicted ids. (#80)
+   */
+  get(messageId: string): BotMessageMeta | undefined {
+    return this.meta.get(messageId);
   }
 }
 
@@ -936,20 +972,41 @@ export class LarkChannel {
     // Ignore bot's own reactions (operator_type=app means the bot itself)
     if (operatorType === 'app') return;
 
-    // Only process reactions on messages the bot sent
-    if (!this.botMessageTracker.has(messageId)) return;
+    // Only process reactions on messages the bot sent. The tracker entry
+    // (#80) also gives us back the chatId/threadId Feishu's reaction
+    // payload omits — we need both for whitelist evaluation and identity
+    // binding below.
+    const target = this.botMessageTracker.get(messageId);
+    if (!target) return;
+    const { chatId: targetChatId, threadId: targetThreadId } = target;
 
-    // Whitelist filtering (reaction events carry no chat_id, so pass '')
-    if (!passesWhitelist(operatorId, '')) {
-      debugLog(`[channel] Reaction from ${operatorId} rejected by whitelist`);
+    // Whitelist filtering — now with the REAL chatId from the tracker.
+    // Pre-#80 fix this passed empty string, which made
+    // `chatConfigured && [...].includes('')` always false → every
+    // reaction was rejected if the operator only had a chat whitelist
+    // (a common config). Now the chatId is plumbed through.
+    if (!passesWhitelist(operatorId, targetChatId)) {
+      debugLog(
+        `[channel] Reaction from ${operatorId} in ${targetChatId} rejected by whitelist`,
+      );
       return;
     }
+
+    // Identity binding — same shape as handleMessageEvent (line 697).
+    // Pre-#80 fix this was missing, so any sensitive MCP tool Claude
+    // called from the reaction's turn would `resolveCaller('','')` →
+    // null → "No active identity session" error. The reaction is just
+    // another caller-action in the chat; bind it under the same key
+    // shape (chatId#threadId) so downstream tools resolve to the user
+    // who reacted.
+    this.identitySession?.setCaller(targetChatId, targetThreadId, operatorId);
 
     const senderName = await this.resolveUserName(operatorId);
 
     const larkMessage: LarkMessage = {
       messageId,
-      chatId: '',
+      chatId: targetChatId,
+      threadId: targetThreadId,
       chatType: 'reaction',
       senderId: operatorId,
       senderName: senderName || undefined,

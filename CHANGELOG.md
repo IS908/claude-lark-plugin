@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.32] - 2026-05-25
+
+### Fixed
+- **Reaction handler: chat-only whitelist drops every reaction + identity unbinding breaks sensitive tools** (#80 — **HIGH whitelist functional failure + silent identity gap**). Two related bugs in `LarkChannel.handleReactionEvent`:
+  - **Whitelist drops everything when only `LARK_ALLOWED_CHAT_IDS` is configured**. Feishu reaction payloads carry `message_id` but NOT `chat_id`. Pre-fix the handler called `passesWhitelist(operatorId, '')` (empty string). When the operator had configured ONLY the chat whitelist (a common "open this group, restrict everything else" config), `chatConfigured && [...].includes('')` evaluated to false → every reaction silently rejected, including from legitimate users inside the whitelisted chat. Debug log said `"rejected by whitelist"` — misleading even on inspection.
+  - **No identity binding** — pre-fix the handler dispatched the reaction's Claude turn without calling `setCaller`. If Claude then invoked any sensitive MCP tool (`save_memory`, `create_job`, `what_do_you_know`, `forget_memory`, `update_job`, `delete_job`, `save_skill`, `list_jobs`), `resolveCaller(chatId, threadId)` returned null → tool returned the generic "No active identity session" error. The reaction turn appeared accepted but couldn't actually do any cross-session work.
+
+  Root cause: the tracker only stored bare `message_id`s, so the handler had no way to recover the chat from a tracked-bot-message id at reaction time.
+
+  Fix: `BotMessageTracker.add(messageId, chatId, threadId?)` now stores `{ chatId, threadId }` alongside each tracked id. New `tracker.get(messageId)` returns the meta. `handleReactionEvent` looks it up, passes the real `chatId` to `passesWhitelist`, and binds identity via `identitySession.setCaller(chatId, threadId, operatorId)` matching the shape `handleMessageEvent` uses. `larkMessage.chatId` and `.threadId` on the reaction notification are now populated so downstream consumers see the real chat.
+
+  All 5 `botMessageTracker.add(sentId)` call sites in `src/tools.ts:reply` were updated to pass `chat_id` and `thread_id` (which are both in scope in the reply handler).
+
+### Added
+- New `scripts/reaction-event-smoke.ts` (13 tests, wired into `scripts/test.sh`):
+  - **Part A (7 tests) — BotMessageTracker**: `add(id, chatId)` stores chat; `add(id, chatId, threadId)` stores both; `get(unknown)` returns undefined; `has()` still works; duplicate `add` is idempotent (first chatId wins); FIFO eviction drops both the id AND the meta entry; eviction order preserved across batch insertion.
+  - **Part B (6 tests) — `passesWhitelist` semantics**: chat-only whitelist accepts matching `chatId`; chat-only whitelist **rejects empty `chatId`** (the exact pre-#80 silent-drop); chat-only rejects non-matching; user-only whitelist works with empty `chatId`; OR semantics when both lists configured; no whitelists configured → accept all. Test 9 specifically locks in the regression.
+- `passesWhitelist` and the new `BotMessageMeta` type are now exported from `src/channel.ts` for testability (both pure / data-only).
+
+### Changed
+- `BotMessageTracker.add` signature: `add(messageId)` → `add(messageId, chatId, threadId?)`. The `chatId` parameter is **required** (TypeScript-enforced at every call site). Callers that don't have a chatId at hand — currently only the `edit_message` and cronjob outbound paths in `src/scheduler.ts` — already don't call `add` at all (tracked as #81), so nothing breaks. Once #81 lands they'll be migrated to pass their chatId too.
+- `LarkMessage.threadId` is now populated for `chatType: 'reaction'` notifications (was always missing pre-fix).
+
+### Operator notes
+- No data-format or config changes. Existing `LARK_ALLOWED_CHAT_IDS` / `LARK_ALLOWED_USER_IDS` env vars work exactly as before for inbound messages; reactions now ALSO respect them the same way.
+- Pre-#80 reaction events were silently dropped under the chat-only config — there's no replay; the fix takes effect on the next reaction received post-deployment.
+- The reaction's identity binding overwrites the chat-level entry in `IdentitySession` if no `threadId` is set. Concurrent reaction + inbound-message handling in the same chat could race on identity (handler order non-deterministic — reactions bypass the per-chat queue). Real exposure is low (reaction handlers complete fast), but if you observe a sensitive tool resolving to the wrong caller in a high-traffic chat, file a followup against this PR.
+
 ## [1.0.31] - 2026-05-25
 
 ### Fixed
