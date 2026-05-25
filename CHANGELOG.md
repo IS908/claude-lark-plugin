@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.33] - 2026-05-25
+
+### Fixed
+- **Cronjob outbound messages bypassed `BotMessageTracker`** (#81 — **MEDIUM reactions on cronjob messages silently dropped**). Pre-fix only the `reply` tool's success paths called `botMessageTracker.add`; the scheduler's four direct `client.im.v1.message.create` call sites (`executeMessageJob`, `notifyStaleSkip` Tier 1, `notifyStaleSkip` Tier 2, `notifyOwnerOnTargetFail`) sent messages WITHOUT informing the tracker. A user reacting to a cronjob-delivered message (daily briefing, stale-skip notice, auto-pause alert) hit `handleReactionEvent` → `botMessageTracker.get(messageId)` → `undefined` → silently dropped. The intended UX of "react to a cronjob with a thumbs-up to acknowledge" was completely non-functional.
+
+  Fix: new private helper `JobScheduler.trackOutbound(resp, chatId)` calls `botMessageTracker.add(id, chatId)` after each successful cronjob send. Wired through:
+  - `executeMessageJob` — tracks under `job.meta.target_chat_id`
+  - `notifyStaleSkip` Tier 1 (target chat) — tracks under `target_chat_id`
+  - `notifyStaleSkip` Tier 2 (owner DM fallback) — tracks under `created_by` (open_id; DMs in Feishu are addressed via the recipient's open_id, which `IdentitySession` treats as the chat-key for that 1:1 conversation)
+  - `notifyOwnerOnTargetFail` (auto-pause notice DM, #106) — tracks under `created_by`
+
+  `SchedulerOptions.botMessageTracker` is optional (legacy callers and tests that don't pass one continue to work, with absence degrading silently to pre-fix behavior). `src/index.ts` wires `channel.getBotMessageTracker()` through to the scheduler so production uses the same shared tracker the `reply` tool populates.
+
+  Threading: cronjob outbound has no `thread_id` (message-type jobs and scheduler notices are fresh single sends, not replies into an existing thread). Reactions to cronjob messages bind at the chat level, which is correct — a reaction belongs to whoever reacted, not to the cronjob owner.
+
+### Added
+- 7 new scheduler-smoke assertions (Part H, tests 30–36):
+  - **30**: `executeMessageJob` with tracker present → `tracker.add` fires exactly once with `(sentId, target_chat_id, undefined)`.
+  - **31**: `executeMessageJob` WITHOUT tracker → no throw (backward compat).
+  - **32**: `notifyStaleSkip` Tier 1 success → exactly one tracker entry under `target_chat_id`.
+  - **33**: `notifyStaleSkip` Tier 1 fails → Tier 2 (owner DM) succeeds → exactly one tracker entry under `created_by` (open_id).
+  - **34**: `notifyOwnerOnTargetFail` (#106 auto-pause path) → exactly one tracker entry under `created_by`.
+  - **35 (R2-followup)**: direct unit test of `trackOutbound`'s silent-drop contract — 4 sub-cases (no tracker / missing message_id / empty chatId / happy path). Pre-followup the call-site tests would silently pass if a future refactor broke the helper's contract.
+  - **36 (R2-followup)**: end-to-end `recoverMissedJobs` + tracker — covers the most realistic production scenario (a missed message-type cronjob recovered at startup) that test 19c didn't pin.
+
+### Scope notes
+- **`edit_message` intentionally NOT updated**: Feishu's `im.v1.message.patch` edits in-place (same `message_id`, no new id returned). The original `reply` already tracked that id — if it's been FIFO-evicted by the time the user reacts to the edited content, the eviction is the actual cause, not the lack of an `edit_message` re-add. Adding `edit_message` to the tracking surface would require either an extra `message.get` round-trip (to recover `chat_id`) or a new optional `chat_id` parameter on the tool. Deferred unless a real user-reported case surfaces.
+- **`react` tool intentionally NOT updated**: the `react` tool adds an emoji reaction to a user's message — it doesn't produce a NEW message, so there's nothing to track.
+
+### R2-audit followups (closed in this PR)
+- **`trackOutbound` now emits a breadcrumb on silent-drop**. Pre-followup the helper silently did nothing on missing `message_id` or empty `chatId` — a future SDK shape drift would have produced symptoms indistinguishable from the original bug. Added a `console.error` line; existing happy-path tests confirm no spurious breadcrumb.
+- **Direct unit test for `trackOutbound` (test 35)** pins all 4 contract branches (no tracker / missing message_id / empty chatId / happy path) so a future refactor that breaks the silent-drop guarantee fails fast.
+- **End-to-end recovery + tracker test (test 36)** closes the coverage gap R2 caught: test 19c exercises `recoverMissedJobs` but didn't thread a tracker through.
+
+### Known limitations (R1-audit followups, documented here; no code fix in this PR)
+- **DM auto-pause / stale-skip reactions against chat-only whitelist**. When the operator reacts to a Tier-2 stale-skip DM or to a `notifyOwnerOnTargetFail` auto-pause DM, the tracker entry stores `chatId='ou_owner'` (the recipient's open_id, since DMs key by open_id in `IdentitySession`). `handleReactionEvent` then calls `passesWhitelist(operatorId='ou_owner', chatId='ou_owner')`. If the operator has configured ONLY `LARK_ALLOWED_CHAT_IDS=['oc_xxx']` (chat-only whitelist), this rejects — the same shape as the #80 bug, recurring for DM reactions. Workaround: add the operator's `ou_*` to `LARK_ALLOWED_USER_IDS` when using chat-only configs. Fix path is similar to #80 (special-case DM-to-self) but adds enough complexity to warrant a separate PR if it becomes a real friction.
+- **Message-type cronjobs require `oc_*` chat-id targets**. `executeMessageJob` sends via `receive_id_type: 'chat_id'`, so a cronjob created with `target_chat_id='ou_xxx'` (an open_id, intending a DM) would fail at Feishu's API. This is pre-existing (not introduced by #81) but worth surfacing — the create_job path doesn't validate prefix. If you need a "DM me at 9am" cronjob, the workaround is to use a prompt-type cronjob that calls `reply` with the operator's open_id as the destination.
+
+### Operator notes
+- No data-format or config changes. The shared tracker is in-process only and bounded at `LARK_BOT_MESSAGE_TRACKER_SIZE` (default 500); cronjob messages now share that budget with reply tool messages.
+- **Sizing guidance**: a useful rule of thumb is `LARK_BOT_MESSAGE_TRACKER_SIZE ≈ 2 × daily bot-sent messages` if reactions on day-old cards matter to you. Default 500 covers ~250 messages/day with headroom; a deployment with 30 daily cronjobs across 100 active chats plus replies can easily exceed 500/day — set to 2000+ if users routinely react to messages from prior days.
+- Pre-#81 reactions on cronjob messages were silently dropped (or logged via the dedupe breadcrumb added in #80 R2-followup). Post-#81 they route normally through `handleReactionEvent` → identity binding → Claude notification.
+
 ## [1.0.32] - 2026-05-25
 
 ### Fixed

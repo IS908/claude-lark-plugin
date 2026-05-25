@@ -11,6 +11,7 @@ import { appConfig } from './config.js';
 import { cronJobPrompt } from './prompts.js';
 import { sanitizeOutboundText } from './tools.js';
 import type { IdentitySession } from './identity-session.js';
+import type { BotMessageTracker } from './channel.js';
 import {
   listAllJobs,
   readJob,
@@ -32,6 +33,16 @@ export interface SchedulerOptions {
   server: Server;
   client: Lark.Client;
   identitySession: IdentitySession;
+  /**
+   * Optional botMessageTracker (#81). When present, every cronjob outbound
+   * message (message-type job, stale-skip notice, owner-DM auto-pause
+   * notice) is tracked so reactions on those messages flow through
+   * `handleReactionEvent` instead of being silently dropped. Optional
+   * because legacy callers (and tests) may construct the scheduler
+   * without one; absence just degrades to pre-#81 behavior for the
+   * reaction-on-cronjob-message UX.
+   */
+  botMessageTracker?: BotMessageTracker;
 }
 
 // ─── Retry Logic ────────────────────────────────────────────
@@ -149,6 +160,7 @@ export class JobScheduler {
   private server: Server;
   private client: Lark.Client;
   private identitySession: IdentitySession;
+  private botMessageTracker: BotMessageTracker | undefined;
   private running = false;
   /**
    * Per-job re-entrancy guard (#77, v1.0.29).
@@ -175,6 +187,42 @@ export class JobScheduler {
     this.server = opts.server;
     this.client = opts.client;
     this.identitySession = opts.identitySession;
+    this.botMessageTracker = opts.botMessageTracker;
+  }
+
+  /**
+   * Track an outbound cronjob message in botMessageTracker (#81) so a
+   * user reaction to it lands on the reaction handler with a recognized
+   * (id, chatId) pair. Best-effort — never throws. `chatId` is the
+   * receive_id the send used (a real `oc_xxx` chat id for chat_id sends,
+   * the recipient's `ou_xxx` open_id for DM sends — both work as
+   * chat-key in `IdentitySession` because DMs are addressed via the
+   * recipient's open_id).
+   *
+   * Cronjob outbound has no `thread_id` — message-type jobs and
+   * scheduler notices are single, fresh sends (not replies into an
+   * existing thread). `setCaller` will key by chat-level only, which
+   * is correct: a reaction to a cronjob message belongs to whoever
+   * reacted, not to the cronjob owner.
+   */
+  private trackOutbound(resp: any, chatId: string): void {
+    if (!this.botMessageTracker) return;
+    const id = resp?.data?.message_id;
+    if (id && chatId) {
+      this.botMessageTracker.add(id, chatId);
+      return;
+    }
+    // R2-audit followup: a successful send that lacks message_id in
+    // the response (malformed Feishu response, future SDK shape drift)
+    // would silently fail to track. Without a breadcrumb the symptom
+    // — "reactions on cronjob messages still don't land post-#81" —
+    // would be indistinguishable from the original bug. Log once per
+    // call so the operator can grep for the regression.
+    console.error(
+      `[scheduler] trackOutbound: no message_id in response or empty chatId ` +
+      `(id=${id ? 'set' : 'missing'} chatId=${chatId ? 'set' : 'empty'}); ` +
+      `cronjob message not tracked, reactions on it will not route`,
+    );
   }
 
   /**
@@ -559,7 +607,7 @@ export class JobScheduler {
       `or delete with delete_job if it's no longer needed.`,
     );
     try {
-      await this.client.im.v1.message.create({
+      const resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'open_id' },
         data: {
           receive_id: job.meta.created_by,
@@ -567,6 +615,7 @@ export class JobScheduler {
           msg_type: 'text',
         },
       });
+      this.trackOutbound(resp, job.meta.created_by); // #81 — DMs key by open_id
     } catch (err) {
       console.error(
         `[scheduler] notifyOwnerOnTargetFail: DM to ${job.meta.created_by} also failed for ${job.meta.id}:`,
@@ -620,10 +669,11 @@ export class JobScheduler {
 
     // Tier 1 — the job's chat.
     try {
-      await this.client.im.v1.message.create({
+      const resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: { receive_id: job.meta.target_chat_id, content, msg_type: 'text' },
       });
+      this.trackOutbound(resp, job.meta.target_chat_id); // #81
       return; // delivered
     } catch (err) {
       console.error(
@@ -636,10 +686,11 @@ export class JobScheduler {
     // for a legacy job with no resolvable owner; skip the fallback then.
     if (job.meta.created_by) {
       try {
-        await this.client.im.v1.message.create({
+        const resp = await this.client.im.v1.message.create({
           params: { receive_id_type: 'open_id' },
           data: { receive_id: job.meta.created_by, content, msg_type: 'text' },
         });
+        this.trackOutbound(resp, job.meta.created_by); // #81 — DMs key by open_id
         console.error(
           `[scheduler] Stale-skip notice for ${job.meta.id} delivered to owner DM (target chat unreachable).`,
         );
@@ -692,7 +743,7 @@ export class JobScheduler {
     // such payload that landed before #96 shipped.
     const content = sanitizeOutboundText(rawContent);
 
-    await this.client.im.v1.message.create({
+    const resp = await this.client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: {
         receive_id: job.meta.target_chat_id,
@@ -700,6 +751,8 @@ export class JobScheduler {
         msg_type: 'text',
       },
     });
+    // #81: track so a reaction on the cronjob's message routes correctly.
+    this.trackOutbound(resp, job.meta.target_chat_id);
   }
 
   /**
