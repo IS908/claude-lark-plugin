@@ -32,10 +32,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **`scripts/test.sh` audit gate** — runs `npm audit --omit=dev --audit-level=high` early in the suite. CI fails red if any HIGH or CRITICAL CVE lands in the production dep tree. Forces the operator to either add a new override or wait for an upstream SDK bump, rather than silently shipping vulnerable code.
 - `package.json` `overrides` block with 9 pinned versions. Adjacent `//overrides` comment field documents the rationale + the "stay within SDK's declared major" constraint.
 
+### R1-audit followups (closed in this PR)
+- **Axios tilde→caret widening documented**. R1 caught that the SDK declares `axios: ~1.13.3` (tilde — locked to 1.13.x), but the `^1.15.2` override resolves to `axios@1.16.1`. The SDK doesn't touch the 1.13→1.16 API changes (`parseProtocol` stricter, `unescape()` replacement, basic-auth URL decoding, fetch-adapter limit enforcement) — verified via grep of the SDK's `lib/index.js` — so the risk is low. Updated the `//overrides` rationale comment to call this out explicitly so a future SDK bump doesn't surprise the next maintainer.
+- The other 8 overrides match the SDK's caret-style ranges (e.g. SDK declares `protobufjs: ^7.2.6`, override `^7.5.8` stays within the same caret), so no widening concern there.
+
 ### Operator notes
 - No code changes; no env vars added. The override block only changes which version of each package npm resolves to. SDK API surface is unchanged — same `client.im.v1.message.*` calls work as before.
 - Run `npm install` (or just restart the plugin's auto `prestart`) to apply. `npm audit --omit=dev` should report `found 0 vulnerabilities`.
 - **Upstream SDK bump tracking**: when `@larksuiteoapi/node-sdk` ships a release that depends on patched transitive versions natively, the overrides become no-ops (npm prefers the SDK's spec when it's already satisfied). Safe to leave indefinitely; can be removed in a future cleanup pass.
+- **Offline CI**: the audit gate hits the npm registry. In an airgapped CI without registry access, the audit will error (non-zero exit → fails the gate, NOT silently). To bypass for emergencies, comment out the audit block in `scripts/test.sh` or set up an internal registry mirror.
 - The audit gate uses `--audit-level=high`. Moderate-level CVEs are reported on stderr but don't fail CI. Adjust to `moderate` if your deployment requires stricter posture.
 
 ## [1.0.39] - 2026-05-25

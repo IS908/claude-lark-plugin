@@ -27,7 +27,7 @@
     "node": ">=20.0.0"
   },
   "license": "Apache-2.0",
-  "//overrides": "Transitive CVE pins (#94, v1.0.40). All come in via @larksuiteoapi/node-sdk's dep tree; upstream hasn't bumped yet so we override directly. Stay within the same major as the SDK's declared range to avoid breaking it (e.g. protobufjs 7.x not 8.x). Re-evaluate / unpin when the SDK ships fixes upstream.",
+  "//overrides": "Transitive CVE pins (#94, v1.0.40). All come in via @larksuiteoapi/node-sdk's dep tree; upstream hasn't bumped yet so we override directly. Stay within the same major as the SDK's declared range to avoid breaking it (e.g. protobufjs 7.x not 8.x). NOTE (R1-followup): the axios override widens the SDK's `~1.13.3` tilde-pin to `^1.15.2` (caret), resolving to ~1.16.x. The SDK doesn't use the parseProtocol / unescape / maxBodyLength / maxContentLength APIs that changed across 1.13→1.16, so risk is low in practice — but watch for SDK breakage if you bump it later. Re-evaluate / unpin all entries when the SDK ships fixes upstream.",
   "overrides": {
     "axios": "^1.15.2",
     "protobufjs": "^7.5.8",
