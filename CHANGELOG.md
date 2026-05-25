@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.29] - 2026-05-25
+
+### Fixed
+- **Scheduler: tick re-entrancy + read-modify-write race** (#77 + #78 — **HIGH duplicate-execution + silent clobber of user updates**). Two correlated scheduler concurrency bugs, both reachable any time a job's execution takes more than 60s (i.e. any retry of a transient Feishu 5xx or rate-limit, which sleeps 30 + 60 + 120 = up to 210s):
+  - **#77 tick re-entrancy**: `setInterval(tick, 60s)` had no per-job guard. A job sitting in the retry loop was still `next_run_at <= now` (runtime isn't persisted until the loop exits), so the next tick saw it as due and re-launched `executeJob`. Each retry-attempt window produced one duplicate execution — for `type=message` jobs, duplicate chat sends; for `type=prompt` jobs, duplicate prompt injections into Claude. Same observable symptom #62 had already tried to eliminate via the filename-as-id refactor, only via a different root cause (timing rather than naming).
+  - **#78 read-modify-write race**: `executeJob` took a snapshot of `job` when the tick fired and `writeJob(job)` 30–210s later wrote the whole snapshot back. Any `update_job(...)` or `delete_job(...)` issued during that window was silently clobbered: `update_job(status='paused')` reverted to `active`, schedule/prompt changes lost, and **deleted jobs were resurrected** because writeJob never checked file existence. `update_job(status='paused')` is the operator's main "stop a runaway job" lever — losing it makes a misbehaving cronjob much harder to contain.
+
+  Fix:
+  - **#77**: new `private inFlight = new Set<string>()` on `JobScheduler`. `tick()` checks membership before scheduling a job and uses `.catch().finally()` (rather than `await`) so a slow job does NOT serialize other jobs in the same tick. Cleanup happens in `.finally`, so even a synchronous throw inside `executeJob` cannot leak the entry. Not applied to `recoverMissedJobs` — `start()` awaits recovery before installing the tick timer, so the two paths are temporally disjoint.
+  - **#78**: both success and failure paths of `executeJob` re-read the job via `readJob(id)` before writing. If the file is gone, the run is logged-and-dropped (no resurrection). Otherwise the fresh disk meta wins — user updates to schedule / prompt / status survive — and only the runtime fields (last_run_at, next_run_at from the FRESH schedule, run_count, last_error) plus the `#106` auto-pause status are applied to the fresh object. The fresh meta+runtime is then copied back onto the input `job` reference so existing callers (tests, recoverMissedJobs) see the post-write state.
+
+### Added
+- 8 new scheduler-smoke assertions (tests 20–27) covering:
+  - re-entrancy: pre-populated `inFlight` → tick skips; cross-job parallelism preserved (different ids don't gate each other); `.finally` cleanup on success and failure paths both work.
+  - read-modify-write: success-path mid-flight delete → no resurrection; failure-path mid-flight delete → no resurrection; mid-flight `update_job(status='paused')` → disk status wins on the post-write merge while runtime fields still apply; mid-flight `update_job(schedule=...)` → next_run_at computed from the NEW schedule, not the stale one captured at tick time.
+
+### Changed
+- Existing scheduler-smoke tests 16–19 + 19c updated to `await writeJob(job)` before `executeJob` / `recoverMissedJobs`. Pre-fix the in-memory `job` was mutated directly; post-fix `executeJob` requires the file to be on disk for its fresh-read merge — which mirrors production exactly, where `executeJob` is only ever called on jobs returned by `listAllJobs`. Test 18 also temporarily clears `appConfig.ownerOpenId` to exercise the truly-orphan path, because `backfillJob` (now invoked via `readJob`) resurrects `created_by` from `LARK_OWNER_OPEN_ID`.
+
+### Operator notes
+- No data-format changes — existing job files on disk are read and written in the same shape as v1.0.28. The fix is purely in scheduler memory semantics; there is nothing to migrate.
+- The `inFlight` Set is in-process. A daemon restart clears it, but `start()` runs `recoverMissedJobs` once before installing the tick timer, so there is no window for cross-restart re-entrancy.
+
 ## [1.0.28] - 2026-05-25
 
 ### Fixed

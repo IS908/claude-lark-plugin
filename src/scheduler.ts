@@ -13,6 +13,7 @@ import { sanitizeOutboundText } from './tools.js';
 import type { IdentitySession } from './identity-session.js';
 import {
   listAllJobs,
+  readJob,
   writeJob,
   computeNextRun,
   mostRecentMissedSlot,
@@ -149,6 +150,26 @@ export class JobScheduler {
   private client: Lark.Client;
   private identitySession: IdentitySession;
   private running = false;
+  /**
+   * Per-job re-entrancy guard (#77, v1.0.29).
+   *
+   * `tick()` runs on a 60s setInterval, but `executeJob()` can sit inside
+   * the retry loop for up to 210s (30 + 60 + 120). Without this guard,
+   * the second tick would see the same job's `next_run_at <= now`
+   * (because runtime isn't persisted until the retry loop exits) and
+   * fire executeJob a second time — duplicate execution, the exact
+   * symptom #62 already tried to eliminate via filename-as-id.
+   *
+   * Membership is keyed by `job.meta.id` (the filename stem). The
+   * Set is in-process: a daemon restart clears it, but on restart
+   * recoverMissedJobs runs once before tick begins, so there is no
+   * window for cross-restart re-entrancy.
+   *
+   * NOT used by recoverMissedJobs — start() awaits recoverMissedJobs
+   * before installing the tick timer, so the two paths are temporally
+   * disjoint.
+   */
+  private inFlight = new Set<string>();
 
   constructor(opts: SchedulerOptions) {
     this.server = opts.server;
@@ -303,6 +324,13 @@ export class JobScheduler {
    * Periodic tick: scan all active jobs and execute due ones.
    * Also piggybacks a cleanup pass over the identity session to drop
    * stale entries so the in-memory map does not grow unboundedly.
+   *
+   * Per-job re-entrancy is gated by `this.inFlight` (#77, v1.0.29).
+   * Execution is launched fire-and-forget (`.catch().finally()` rather
+   * than `await`) so a slow job — typically one churning through the
+   * 30/60/120s retry sleeps — does NOT serialize the rest of this
+   * tick's jobs, and the next tick can still run other jobs while
+   * the slow one is in flight.
    */
   private async tick(): Promise<void> {
     this.identitySession.cleanup();
@@ -313,14 +341,21 @@ export class JobScheduler {
     for (const job of jobs) {
       if (job.meta.status !== 'active') continue;
       if (!job.runtime.next_run_at) continue;
+      // #77 re-entrancy guard: skip jobs whose previous execution is
+      // still in flight. Without this, a job in the 30+60+120s retry
+      // sleep window would be re-launched on each subsequent tick.
+      if (this.inFlight.has(job.meta.id)) continue;
 
       const nextRun = new Date(job.runtime.next_run_at).getTime();
       if (nextRun <= now) {
-        try {
-          await this.executeJob(job);
-        } catch (err) {
-          console.error(`[scheduler] Failed to execute job ${job.meta.id}:`, err);
-        }
+        this.inFlight.add(job.meta.id);
+        this.executeJob(job)
+          .catch((err) => {
+            console.error(`[scheduler] Failed to execute job ${job.meta.id}:`, err);
+          })
+          .finally(() => {
+            this.inFlight.delete(job.meta.id);
+          });
       }
     }
   }
@@ -333,6 +368,23 @@ export class JobScheduler {
    * - Only retries transient errors (network, 5xx, rate-limit)
    * - Permanent errors (permission denied, invalid params) fail immediately
    * - On final failure, records last_error and advances next_run_at
+   *
+   * #78 read-modify-write race fix (v1.0.29): the in-memory `job`
+   * snapshot taken when the tick fired can be stale by the time the
+   * retry loop exits (up to 210s later). During that window the user
+   * may have `update_job`'d schedule/status/prompt or `delete_job`'d
+   * entirely. Pre-fix, `writeJob(job)` blindly stomped those changes
+   * (resurrecting deleted jobs, un-pausing user-paused jobs, ignoring
+   * a new schedule).
+   *
+   * Post-fix: before each write we re-read the file via {@link readJob}.
+   * If the file is gone the run is logged-and-dropped (no resurrection).
+   * Otherwise we apply only the runtime fields we computed (and the
+   * auto-pause status from the #106 path) onto the fresh on-disk meta,
+   * so user updates to schedule / prompt / status survive in-flight
+   * executions. The fresh meta+runtime is also copied back onto the
+   * input `job` reference so callers see the post-write state without
+   * needing a separate readJob.
    */
   private async executeJob(job: JobFile): Promise<void> {
     const startTime = Date.now();
@@ -346,19 +398,37 @@ export class JobScheduler {
           await this.executePromptJob(job);
         }
 
-        // Success — update runtime
-        job.runtime.last_run_at = new Date(startTime).toISOString();
-        job.runtime.next_run_at = computeNextRun(job.meta.schedule);
-        job.runtime.run_count += 1;
-        job.runtime.last_error = null;
+        // Success — fresh-read merge (#78). The on-disk file may have
+        // changed mid-execution; user updates to meta (schedule,
+        // status, prompt, etc.) win, and `next_run_at` is computed
+        // against the FRESH schedule so a `update_job(schedule=...)`
+        // mid-flight takes effect on the next tick. A deletion mid-
+        // flight is honored: no writeJob, no resurrection.
+        const fresh = await readJob(job.meta.id);
+        if (!fresh) {
+          console.error(
+            `[scheduler] Job ${job.meta.id} was deleted during execution — ` +
+            `the run succeeded but no runtime is recorded (not resurrecting the file).`,
+          );
+          return;
+        }
+        fresh.runtime.last_run_at = new Date(startTime).toISOString();
+        fresh.runtime.next_run_at = computeNextRun(fresh.meta.schedule);
+        fresh.runtime.run_count = (fresh.runtime.run_count ?? 0) + 1;
+        fresh.runtime.last_error = null;
 
         if (attempt > 0) {
-          console.error(`[scheduler] Job ${job.meta.id} succeeded on retry #${attempt} (run #${job.runtime.run_count})`);
+          console.error(`[scheduler] Job ${fresh.meta.id} succeeded on retry #${attempt} (run #${fresh.runtime.run_count})`);
         } else {
-          console.error(`[scheduler] Job ${job.meta.id} executed successfully (run #${job.runtime.run_count})`);
+          console.error(`[scheduler] Job ${fresh.meta.id} executed successfully (run #${fresh.runtime.run_count})`);
         }
 
-        await writeJob(job);
+        await writeJob(fresh);
+        // Reflect post-write state on the caller's `job` reference so
+        // existing call sites (tick / recoverMissedJobs / tests) see
+        // the same state that's now on disk.
+        job.meta = fresh.meta;
+        job.runtime = fresh.runtime;
         return;
       } catch (err: any) {
         lastErr = err;
@@ -377,10 +447,20 @@ export class JobScheduler {
       }
     }
 
-    // All retries exhausted or permanent error — record failure.
-    job.runtime.last_run_at = new Date(startTime).toISOString();
-    job.runtime.next_run_at = computeNextRun(job.meta.schedule);
-    job.runtime.last_error = lastErr?.message ?? String(lastErr);
+    // Failure path — fresh-read merge (#78). Same rationale as the
+    // success path above. If the file was deleted during execution,
+    // record the failure to stderr only and do not resurrect.
+    const freshFail = await readJob(job.meta.id);
+    if (!freshFail) {
+      console.error(
+        `[scheduler] Job ${job.meta.id} was deleted during execution — ` +
+        `failure (${lastErr?.message ?? lastErr}) not recorded (not resurrecting the file).`,
+      );
+      return;
+    }
+    freshFail.runtime.last_run_at = new Date(startTime).toISOString();
+    freshFail.runtime.next_run_at = computeNextRun(freshFail.meta.schedule);
+    freshFail.runtime.last_error = lastErr?.message ?? String(lastErr);
 
     // #106 fix: detect permanent target-chat errors (bot kicked / chat
     // archived / etc) and AUTO-PAUSE the job so it stops re-firing every
@@ -389,29 +469,38 @@ export class JobScheduler {
     // tokens for type=prompt cronjobs that never produced output.
     // The owner gets a one-shot DM with the failure reason so they
     // can decide whether to re-target, re-create, or delete the job.
+    //
+    // Note: the auto-pause OVERRIDES whatever status was on disk. If
+    // the user paused mid-flight, the disk already says 'paused' →
+    // setting 'paused' again is a no-op. If the user un-paused or
+    // changed nothing, the auto-pause still applies — correct, because
+    // the target is unreachable regardless of user intent.
     const apiCode = getFeishuApiCode(lastErr);
     const isPermanentTarget = apiCode !== null && PERMANENT_TARGET_CODES.has(apiCode);
     if (isPermanentTarget) {
-      job.meta.status = 'paused';
+      freshFail.meta.status = 'paused';
       console.error(
-        `[scheduler] Job ${job.meta.id} AUTO-PAUSED — target chat ${job.meta.target_chat_id} ` +
+        `[scheduler] Job ${freshFail.meta.id} AUTO-PAUSED — target chat ${freshFail.meta.target_chat_id} ` +
         `permanently unreachable (Feishu code ${apiCode}: ${getFeishuApiMsg(lastErr)}). ` +
-        `Owner ${job.meta.created_by} notified via DM (best-effort).`,
+        `Owner ${freshFail.meta.created_by} notified via DM (best-effort).`,
       );
     } else {
       const retryNote = isRetryableError(lastErr)
         ? ` (exhausted ${MAX_RETRIES} retries)`
         : ' (non-retryable)';
-      console.error(`[scheduler] Job ${job.meta.id} failed${retryNote}: ${job.runtime.last_error}`);
+      console.error(`[scheduler] Job ${freshFail.meta.id} failed${retryNote}: ${freshFail.runtime.last_error}`);
     }
 
-    await writeJob(job);
+    await writeJob(freshFail);
+    // Reflect post-write state on the caller's `job` reference.
+    job.meta = freshFail.meta;
+    job.runtime = freshFail.runtime;
 
     // Best-effort owner notification AFTER the file is persisted so a
     // DM failure (owner unreachable too) doesn't lose the paused-state
     // write. Throws are swallowed — recovery must not abort.
     if (isPermanentTarget) {
-      await this.notifyOwnerOnTargetFail(job, apiCode!, getFeishuApiMsg(lastErr));
+      await this.notifyOwnerOnTargetFail(freshFail, apiCode!, getFeishuApiMsg(lastErr));
     }
   }
 
