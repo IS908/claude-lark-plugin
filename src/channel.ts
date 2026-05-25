@@ -411,8 +411,18 @@ export class LarkChannel {
     // sit on the user's message visually forever AND leak Map memory in
     // a long-running daemon. ACK_PRUNE_INTERVAL_MS controls how often
     // we scan; ACK_TTL_MS is the staleness threshold.
+    // R2-audit followup: wrap the setInterval callback in try/catch.
+    // pruneStaleAcksImpl can't realistically throw today (Map.delete
+    // during entries() iteration is spec-safe, NaN arithmetic falls
+    // through), but a synchronous throw inside the callback would
+    // propagate to uncaughtException → process.exit(1) per
+    // src/index.ts. Defense in depth against a future regression.
     this.ackPruneTimer = setInterval(() => {
-      this.pruneStaleAcks(ACK_TTL_MS);
+      try {
+        this.pruneStaleAcks(ACK_TTL_MS);
+      } catch (err) {
+        console.error('[channel] pruneStaleAcks threw (swallowed to keep timer alive):', err);
+      }
     }, ACK_PRUNE_INTERVAL_MS);
     // .unref() so the timer never holds the process open by itself; if
     // everything else stops, Node can exit even with the timer pending.
@@ -420,13 +430,22 @@ export class LarkChannel {
   }
 
   /**
-   * Shutdown hook (R1-followup on #85). Clears the ackPrune timer and
-   * marks the channel un-started so a subsequent `start()` can re-init
-   * cleanly. Not called by the default `main()` flow (the process exit
-   * is responsible for releasing handles), but available for tests and
-   * for any future shutdown orchestration.
+   * Partial shutdown hook (R1-followup on #85; scope clarified per
+   * R2-audit). Clears the ackPrune timer and resets the `started` flag.
+   *
+   * Does NOT close `this.wsClient`. The Lark SDK's WSClient has no
+   * documented synchronous close API, and process exit (the default
+   * `main()` shutdown path) releases the socket. A future caller that
+   * wants true re-init across stop()/start() will need to extend this
+   * to wsClient teardown — current production has no such caller, so
+   * this method exists only to release the ackPrune timer for tests.
    *
    * Idempotent — safe to call multiple times.
+   *
+   * NOTE: do not pair this with a subsequent `start()` in the same
+   * process while the WSClient is still subscribed (you'll get
+   * duplicate event handling). Filed as the unstated half of #136
+   * if/when a real re-init use case emerges.
    */
   stop(): void {
     if (this.ackPruneTimer) {

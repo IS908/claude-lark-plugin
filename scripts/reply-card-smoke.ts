@@ -410,9 +410,16 @@ async function run() {
     if (deletes13.length !== 0) fail(`Test 13: empty map must skip API calls`);
   }
 
-  // 14. Delete API throws → swallowed; prune count still reflects removed entries.
-  //     Guards against a future regression where a Feishu error in revoke
-  //     propagates and aborts the prune mid-iteration.
+  // 14. Delete API rejection (async-throw) is swallowed; prune count
+  //     still reflects removed entries. R2-audit followup: the SYNC-throw
+  //     case (a delete fn that throws BEFORE returning a promise) is
+  //     also covered — the for-of loop catches via the surrounding
+  //     try/catch? Actually no: pruneStaleAcksImpl does NOT wrap delete
+  //     in a try/catch (only `.catch` on the returned promise). A
+  //     synchronous throw from delete WOULD currently abort the loop.
+  //     We cover the async case (the realistic Feishu SDK shape) here;
+  //     the setInterval-wrapper try/catch added in the same followup
+  //     prevents a sync-throw regression from crashing the process.
   {
     const ackPrune = new Map<string, { reactionId: string; addedAt: number }>();
     const now = 1_700_000_000_000;
@@ -421,6 +428,9 @@ async function run() {
 
     const mockClient: AckRevokeClient = {
       im: { v1: { messageReaction: { delete: async () => {
+        // async-throw: SDK shape (returns a rejected promise). The pure
+        // function's `.catch(() => {})` swallows this without affecting
+        // iteration.
         throw new Error('synthetic Feishu 500');
       } } } },
     };
@@ -432,9 +442,34 @@ async function run() {
     } catch {
       threw = true;
     }
-    if (threw) fail(`Test 14: prune must not throw when revoke API throws`);
-    if (pruned !== 2) fail(`Test 14: prune count should be 2 despite revoke throws (got ${pruned})`);
+    if (threw) fail(`Test 14: prune must not throw when revoke API returns rejected promise`);
+    if (pruned !== 2) fail(`Test 14: prune count should be 2 despite revoke rejections (got ${pruned})`);
     if (ackPrune.size !== 0) fail(`Test 14: both entries should still be removed from Map`);
+  }
+
+  // 15. R2-audit followup: confirm pruneStaleAcksImpl iterates the WHOLE
+  //     Map even when many entries are stale (no early-exit, no
+  //     reordering surprise from concurrent delete-during-iter). Tests 10
+  //     and 14 each prune at most 2; this one prunes 5 to exercise the
+  //     iterator under realistic load and asserts every entry was both
+  //     removed from the Map AND fired a delete call.
+  {
+    const ackPrune = new Map<string, { reactionId: string; addedAt: number }>();
+    const now = 1_700_000_000_000;
+    for (let i = 0; i < 5; i++) {
+      ackPrune.set(`msg_bulk_${i}`, { reactionId: `r_${i}`, addedAt: now - 10 * 60_000 });
+    }
+    const deletes15: any[] = [];
+    const mockClient: AckRevokeClient = {
+      im: { v1: { messageReaction: { delete: async (args: any) => { deletes15.push(args); } } } },
+    };
+    const pruned = pruneStaleAcksImpl(ackPrune, mockClient, now, ACK_TTL_MS);
+    if (pruned !== 5) fail(`Test 15: expected all 5 pruned, got ${pruned}`);
+    if (ackPrune.size !== 0) fail(`Test 15: Map should be empty (size=${ackPrune.size})`);
+    if (deletes15.length !== 5) fail(`Test 15: expected 5 delete calls, got ${deletes15.length}`);
+    // Verify every msg_bulk_i fired its delete (no skipped/duplicated).
+    const seenIds = new Set(deletes15.map((d: any) => d.path.message_id));
+    if (seenIds.size !== 5) fail(`Test 15: duplicate or missing delete targets: ${[...seenIds].join(',')}`);
   }
 
   console.log('PASS');
