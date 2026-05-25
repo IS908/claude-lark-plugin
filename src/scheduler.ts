@@ -365,6 +365,31 @@ export class JobScheduler {
             `[scheduler] Recovering missed job ${job.meta.id} (no intermediate slots to skip)`,
           );
         }
+        // #156 fix: re-read before executeJob to catch a recycle that
+        // happened between listAllJobs (boot, called once in start())
+        // and this per-job recovery call. Window is small (only the
+        // few ms of tier-1/tier-2 notifyStaleSkip sends per iteration)
+        // but a delete_job + create_job inside it would otherwise have
+        // recoverMissedJobs deliver OLD content to OLD target before
+        // the new tick lifecycle catches up. executeJob's own
+        // isRecycledJob guard already protects the NEW runtime, but
+        // the unwanted OLD side effect (Feishu send) would still land.
+        // Re-read here closes the gap symmetrically with executeJob.
+        const recheck = await readJob(job.meta.id);
+        if (!recheck) {
+          console.error(
+            `[scheduler] Job ${job.meta.id} deleted during boot recovery; skipping (no side effect).`,
+          );
+          continue;
+        }
+        if (isRecycledJob(job, recheck)) {
+          console.error(
+            `[scheduler] Job ${job.meta.id} was recycled during boot recovery ` +
+            `(created_at: ${job.meta.created_at} → ${recheck.meta.created_at}); ` +
+            `skipping OLD-snapshot execute (the NEW job will fire on its own schedule via tick()).`,
+          );
+          continue;
+        }
         await this.executeJob(job);
       } catch (err) {
         console.error(`[scheduler] Failed to recover job ${job.meta.id}:`, err);
