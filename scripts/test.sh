@@ -106,4 +106,8 @@ echo "=== Enrichment envelope unit checks ==="
 npx tsx scripts/enrichment-envelope-smoke.ts
 
 echo ""
+echo "=== Reaction event whitelist + identity unit checks ==="
+npx tsx scripts/reaction-event-smoke.ts
+
+echo ""
 echo "All tests passed."

@@ -86,10 +86,16 @@ const fakeServer = {
 async function setup() {
   apiCalls.length = 0;
   const client = mockClient();
+  // v1.0.32 (#80): tracker.add now requires chatId (and optional threadId).
   const botTracker = {
     ids: new Set<string>(),
-    add(id: string) { this.ids.add(id); },
+    meta: new Map<string, { chatId: string; threadId?: string }>(),
+    add(id: string, chatId: string, threadId?: string) {
+      this.ids.add(id);
+      this.meta.set(id, { chatId, threadId });
+    },
     has(id: string) { return this.ids.has(id); },
+    get(id: string) { return this.meta.get(id); },
   };
   const identitySession = new IdentitySession(() => null);
   identitySession.setCaller('chat_grp', 'thread_abc', 'ou_caller');

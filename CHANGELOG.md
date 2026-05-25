@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.32] - 2026-05-25
+
+### Fixed
+- **Reaction handler: chat-only whitelist drops every reaction + identity unbinding breaks sensitive tools** (#80 — **HIGH whitelist functional failure + silent identity gap**). Two related bugs in `LarkChannel.handleReactionEvent`:
+  - **Whitelist drops everything when only `LARK_ALLOWED_CHAT_IDS` is configured**. Feishu reaction payloads carry `message_id` but NOT `chat_id`. Pre-fix the handler called `passesWhitelist(operatorId, '')` (empty string). When the operator had configured ONLY the chat whitelist (a common "open this group, restrict everything else" config), `chatConfigured && [...].includes('')` evaluated to false → every reaction silently rejected, including from legitimate users inside the whitelisted chat. Debug log said `"rejected by whitelist"` — misleading even on inspection.
+  - **No identity binding** — pre-fix the handler dispatched the reaction's Claude turn without calling `setCaller`. If Claude then invoked any sensitive MCP tool (`save_memory`, `create_job`, `what_do_you_know`, `forget_memory`, `update_job`, `delete_job`, `save_skill`, `list_jobs`), `resolveCaller(chatId, threadId)` returned null → tool returned the generic "No active identity session" error. The reaction turn appeared accepted but couldn't actually do any cross-session work.
+
+  Root cause: the tracker only stored bare `message_id`s, so the handler had no way to recover the chat from a tracked-bot-message id at reaction time.
+
+  Fix: `BotMessageTracker.add(messageId, chatId, threadId?)` now stores `{ chatId, threadId }` alongside each tracked id. New `tracker.get(messageId)` returns the meta. `handleReactionEvent` looks it up, passes the real `chatId` to `passesWhitelist`, and binds identity via `identitySession.setCaller(chatId, threadId, operatorId)` matching the shape `handleMessageEvent` uses. `larkMessage.chatId` and `.threadId` on the reaction notification are now populated so downstream consumers see the real chat.
+
+  All 5 `botMessageTracker.add(sentId)` call sites in `src/tools.ts:reply` were updated to pass `chat_id` and `thread_id` (which are both in scope in the reply handler).
+
+### Added
+- New `scripts/reaction-event-smoke.ts` (13 tests, wired into `scripts/test.sh`):
+  - **Part A (7 tests) — BotMessageTracker**: `add(id, chatId)` stores chat; `add(id, chatId, threadId)` stores both; `get(unknown)` returns undefined; `has()` still works; duplicate `add` is idempotent (first chatId wins); FIFO eviction drops both the id AND the meta entry; eviction order preserved across batch insertion.
+  - **Part B (6 tests) — `passesWhitelist` semantics**: chat-only whitelist accepts matching `chatId`; chat-only whitelist **rejects empty `chatId`** (the exact pre-#80 silent-drop); chat-only rejects non-matching; user-only whitelist works with empty `chatId`; OR semantics when both lists configured; no whitelists configured → accept all. Test 9 specifically locks in the regression.
+- `passesWhitelist` and the new `BotMessageMeta` type are now exported from `src/channel.ts` for testability (both pure / data-only).
+
+### Changed
+- `BotMessageTracker.add` signature: `add(messageId)` → `add(messageId, chatId, threadId?)`. The `chatId` parameter is **required** (TypeScript-enforced at every call site). Callers that don't have a chatId at hand — currently only the `edit_message` and cronjob outbound paths in `src/scheduler.ts` — already don't call `add` at all (tracked as #81), so nothing breaks. Once #81 lands they'll be migrated to pass their chatId too.
+- `LarkMessage.threadId` is now populated for `chatType: 'reaction'` notifications (was always missing pre-fix).
+
+### R1-audit followups (closed in this PR)
+- **Reactions now route through the per-chat `MessageQueue`** (was direct-dispatch). R1 caught the original wording — "real exposure is low" — was wrong: reactions bypassing the queue meant an in-flight Claude turn from user A could have its `setCaller` overwritten mid-turn by user B's reaction in the same chat, with B's identity then resolving any subsequent `save_memory` / `create_job` from A's turn — silent misattribution. The fix wraps the `setCaller` + `messageHandler` dispatch in `this.queue.enqueue(targetChatId, targetThreadId, async () => { ... })`, mirroring `handleMessageEvent` exactly. `setCaller` runs INSIDE the queued task so the identity binding happens at dispatch time, after any pending inbound-message work for that chat has finished.
+- **Stale-tracker breadcrumb**: when a reaction lands on a bot message that's no longer in `BotMessageTracker` (default 500 entries, FIFO eviction; or pre-tracker-startup messages), the handler now `debugLog`s `[channel] Reaction dropped: bot message X not in tracker ...` so an operator debugging the silent return has a hint. Pre-fix the silent return was symmetric with pre-#80, but the operator notes didn't surface it.
+- **`first-add-wins` rationale documented inline** on `BotMessageTracker.add` — matches the pre-PR `Set.has()` semantic; Feishu message_ids are globally unique per the SDK contract so the first chatId IS the true chatId, and silently ignoring a duplicate-add-with-different-chatId is safer than letting bad state replace good.
+
+### R2-audit followups (closed in this PR)
+- **Stale-tracker breadcrumb dedupe + cap** — R2 caught that the R1 breadcrumb fired BEFORE both `passesWhitelist` and the operator-type check, making it a log-flood vector: an adversarial user in any chat the bot is in could repeatedly react to old bot cards (still rendered by Feishu after they've aged out of the 500-entry tracker), each reaction writing an unbounded `appendFileSync` line to `debug.log` plus a duplicate to stderr. Mitigation: dedupe by messageId in a Set, capped at 100 entries per process lifetime. Past the cap, additional stale hits silently drop.
+- **Pre-queue `await resolveUserName` reorder documented** — R2 observed (correctly) that the pre-queue name resolution latency reorders concurrent reactions whose users have different cache states. Same shape exists in `handleMessageEvent`; the cost of moving name resolution into the queued task (blocking the chat's serial chain on Feishu's contact API) outweighs the benefit (reaction order is rarely semantically meaningful — every reaction triggers a fresh Claude turn). Inline comment added so a future maintainer doesn't add ordering-dependent logic downstream.
+
+### Operator notes
+- No data-format or config changes. Existing `LARK_ALLOWED_CHAT_IDS` / `LARK_ALLOWED_USER_IDS` env vars work exactly as before for inbound messages; reactions now ALSO respect them the same way.
+- Pre-#80 reaction events were silently dropped under the chat-only config — there's no replay; the fix takes effect on the next reaction received post-deployment.
+- Reactions on bot messages that have aged out of `BotMessageTracker` (default size 500, configurable via `LARK_BOT_MESSAGE_TRACKER_SIZE`) are still silently dropped, but now log a breadcrumb to `debug.log` so the operator can see why. The breadcrumb is deduped + capped at 100 entries per process lifetime to defeat log-flood attacks. If you have a high-traffic deployment where users react to days-old bot cards, raise `LARK_BOT_MESSAGE_TRACKER_SIZE`.
+- **Behavior change (per-chat serialization)**: reactions are now serialized behind any in-flight inbound-message work in the same chat (the per-chat `MessageQueue` is FIFO across event types). A multi-minute Claude turn in chat C delays any reaction-driven turn in C until that drains. Pre-PR the reaction dispatched immediately. This is the cost of the identity-race fix (R1-followup) — concurrent reactions and messages in the same chat could otherwise race on `setCaller`.
+
 ## [1.0.31] - 2026-05-25
 
 ### Fixed

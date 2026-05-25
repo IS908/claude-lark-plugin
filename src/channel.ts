@@ -106,7 +106,7 @@ function makeSdkLogger(prefix: string) {
  * - Only chat list → gate on chat only
  * - Both lists → allow when user OR chat matches (either list whitelists the message)
  */
-function passesWhitelist(senderId: string, chatId: string): boolean {
+export function passesWhitelist(senderId: string, chatId: string): boolean {
   const userConfigured = appConfig.allowedUserIds.length > 0;
   const chatConfigured = appConfig.allowedChatIds.length > 0;
   if (!userConfigured && !chatConfigured) return true;
@@ -162,27 +162,70 @@ export function resolveMentionPlaceholders(
 
 type MessageHandler = (message: LarkMessage) => Promise<void>;
 
+/**
+ * Per-message metadata kept alongside the tracked id (#80).
+ *
+ * Reaction events from Feishu carry `message_id` but NOT `chat_id` (see
+ * `handleReactionEvent`). Pre-v1.0.32 the tracker only stored ids in a
+ * Set, so `handleReactionEvent` had to call `passesWhitelist(operatorId, '')`
+ * and built `larkMessage.chatId = ''`. That:
+ *   1. broke any whitelist config that set only `LARK_ALLOWED_CHAT_IDS`
+ *      (the chat-id check was `chatConfigured && [...].includes('')` → false)
+ *   2. left identity unbound — sensitive MCP tools called from the
+ *      reaction's Claude turn would `resolveCaller('','')` → null → fail
+ *
+ * Storing `{chatId, threadId}` keyed by message_id lets the reaction
+ * handler reconstitute both fields when an emoji lands on a previously-
+ * sent bot message.
+ */
+export interface BotMessageMeta {
+  chatId: string;
+  threadId?: string;
+}
+
 export class BotMessageTracker {
   private ids: string[] = [];
-  private set = new Set<string>();
+  private meta = new Map<string, BotMessageMeta>();
   private readonly maxSize: number;
 
   constructor(maxSize = 500) {
     this.maxSize = maxSize;
   }
 
-  add(messageId: string): void {
-    if (this.set.has(messageId)) return;
-    this.set.add(messageId);
+  /**
+   * Track a bot-sent message id and the chat it landed in. `chatId` is
+   * required (#80): the reaction handler needs it to whitelist-check and
+   * bind identity. Callers that don't have a chatId (cronjob and
+   * edit_message historically) should be migrated to pass one — tracked
+   * separately as #81.
+   *
+   * First-add-wins semantic on duplicate `messageId` — matches the
+   * pre-#80 `Set.has()` semantic. Feishu message_ids are globally
+   * unique per the SDK contract, so the first chatId IS the only true
+   * chatId; a duplicate `add` with a different chatId would indicate a
+   * caller bug rather than a legitimate update, and silently ignoring
+   * it is safer than letting bad state replace good.
+   */
+  add(messageId: string, chatId: string, threadId?: string): void {
+    if (this.meta.has(messageId)) return;
+    this.meta.set(messageId, { chatId, threadId });
     this.ids.push(messageId);
     while (this.ids.length > this.maxSize) {
       const oldest = this.ids.shift()!;
-      this.set.delete(oldest);
+      this.meta.delete(oldest);
     }
   }
 
   has(messageId: string): boolean {
-    return this.set.has(messageId);
+    return this.meta.has(messageId);
+  }
+
+  /**
+   * Look up the chat / thread the tracked message was sent into.
+   * Returns undefined for unknown / evicted ids. (#80)
+   */
+  get(messageId: string): BotMessageMeta | undefined {
+    return this.meta.get(messageId);
   }
 }
 
@@ -291,6 +334,17 @@ export class LarkChannel {
   private ackPruneTimer: NodeJS.Timeout | null = null;
   /** Guards `start()` against double-invocation (R1-followup on #85). */
   private started = false;
+  /**
+   * Dedupe + cap for the stale-tracker breadcrumb (R2-followup on #80).
+   * An adversarial user in any chat the bot is in can spam reactions on
+   * old bot messages (the ones that aged out of `botMessageTracker`'s
+   * 500-entry FIFO). Without this guard each reaction wrote a line to
+   * `debug.log` via unbounded `appendFileSync` — gigabytes of growth
+   * over hours of sustained adversarial pressure. With this guard the
+   * breadcrumb fires AT MOST 100 times per process lifetime (one per
+   * unique stale messageId), then silently drops further occurrences.
+   */
+  private loggedStaleAcks = new Set<string>();
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
   private latestMessageTracker = new LatestMessageTracker();
 
@@ -936,20 +990,72 @@ export class LarkChannel {
     // Ignore bot's own reactions (operator_type=app means the bot itself)
     if (operatorType === 'app') return;
 
-    // Only process reactions on messages the bot sent
-    if (!this.botMessageTracker.has(messageId)) return;
+    // Only process reactions on messages the bot sent. The tracker entry
+    // (#80) also gives us back the chatId/threadId Feishu's reaction
+    // payload omits — we need both for whitelist evaluation and identity
+    // binding below.
+    const target = this.botMessageTracker.get(messageId);
+    if (!target) {
+      // R1-followup on this PR: emit a breadcrumb so an operator
+      // debugging "why didn't my reaction register on the old bot
+      // card" doesn't have to guess at the silent return. Tracker is
+      // bounded at LARK_BOT_MESSAGE_TRACKER_SIZE (default 500); a
+      // reaction on an evicted or pre-tracker-startup bot message
+      // ends up here.
+      //
+      // R2-followup: dedupe + cap to defeat the log-flood vector. An
+      // adversarial user in any chat the bot is in can repeatedly
+      // react to old bot cards (which Feishu still renders even after
+      // they've aged out of the bot's in-memory tracker). Without
+      // dedupe each event wrote a line to debug.log; with this guard
+      // we emit at most one breadcrumb per unique messageId, capped
+      // at 100 entries per process lifetime. Past the cap, additional
+      // stale hits silently drop — operator can still diagnose via
+      // event-console / packet capture if needed.
+      if (!this.loggedStaleAcks.has(messageId) && this.loggedStaleAcks.size < 100) {
+        this.loggedStaleAcks.add(messageId);
+        debugLog(
+          `[channel] Reaction dropped: bot message ${messageId} not in tracker (stale, evicted, or sent before tracker started)`,
+        );
+      }
+      return;
+    }
+    const { chatId: targetChatId, threadId: targetThreadId } = target;
 
-    // Whitelist filtering (reaction events carry no chat_id, so pass '')
-    if (!passesWhitelist(operatorId, '')) {
-      debugLog(`[channel] Reaction from ${operatorId} rejected by whitelist`);
+    // Whitelist filtering — now with the REAL chatId from the tracker.
+    // Pre-#80 fix this passed empty string, which made
+    // `chatConfigured && [...].includes('')` always false → every
+    // reaction was rejected if the operator only had a chat whitelist
+    // (a common config). Now the chatId is plumbed through.
+    if (!passesWhitelist(operatorId, targetChatId)) {
+      debugLog(
+        `[channel] Reaction from ${operatorId} in ${targetChatId} rejected by whitelist`,
+      );
       return;
     }
 
+    // Resolve sender name BEFORE queuing — name resolution is async I/O
+    // (Feishu contact API + name cache) and isn't part of the per-chat
+    // serialized work. Pre-queue keeps the queued task itself short and
+    // CPU-bound; same shape as the reply-handler's text formatting
+    // happening before the in-flight send.
+    //
+    // R2-followup observation: a pre-queue `await` reorders concurrent
+    // reactions whose name-resolution latency differs (cached user
+    // resolves in 0ms, uncached takes ~100–500ms via contact API).
+    // The wire-order from Feishu is lost — two reactions arriving at
+    // T=0 and T=10ms can enqueue in either order depending on cache
+    // state. Same shape exists in `handleMessageEvent`; we accept it
+    // here for the same reason — reaction order is rarely semantically
+    // meaningful (every reaction triggers a fresh Claude turn) and
+    // moving name resolution into the queued task would block the
+    // chat's serial chain on Feishu's contact API.
     const senderName = await this.resolveUserName(operatorId);
 
     const larkMessage: LarkMessage = {
       messageId,
-      chatId: '',
+      chatId: targetChatId,
+      threadId: targetThreadId,
       chatType: 'reaction',
       senderId: operatorId,
       senderName: senderName || undefined,
@@ -958,9 +1064,28 @@ export class LarkChannel {
       rawContent: JSON.stringify(data),
     };
 
-    if (this.messageHandler) {
-      await this.messageHandler(larkMessage);
-    }
+    // R1-followup on this PR: route the reaction through the per-chat
+    // MessageQueue (instead of dispatching directly). Pre-fix, an
+    // inbound message and a reaction in the SAME chat could be processed
+    // in parallel — both called `setCaller(chatId, undefined, ...)`,
+    // racing on the chat-level identity entry. If user A's in-flight
+    // Claude turn (multi-second tool calls) was still pending when user
+    // B's reaction landed, B's `setCaller` would overwrite A's, and A's
+    // subsequent `save_memory(chat_id, thread_id=undefined)` would
+    // resolve to B → misattributed write.
+    //
+    // Queueing makes the reaction wait its turn in the same per-chat
+    // chain `handleMessageEvent` uses (queue.enqueue at line 730), so
+    // setCaller / messageHandler run serially with any pending inbound
+    // message work for that chat. setCaller runs INSIDE the queued task
+    // so the identity binding happens at the moment of dispatch, not
+    // at event-receive time.
+    this.queue.enqueue(targetChatId, targetThreadId, async () => {
+      this.identitySession?.setCaller(targetChatId, targetThreadId, operatorId);
+      if (this.messageHandler) {
+        await this.messageHandler(larkMessage);
+      }
+    });
   }
 
   /**

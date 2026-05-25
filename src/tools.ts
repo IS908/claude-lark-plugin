@@ -525,7 +525,7 @@ export function registerTools(
             });
           }
           const sentId = resp?.data?.message_id;
-          if (sentId && botMessageTracker) botMessageTracker.add(sentId);
+          if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
         } catch (err: any) {
           const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
           if (defer) return defer;
@@ -566,7 +566,7 @@ export function registerTools(
               resp = await sendFollowup({ content, msg_type: 'interactive' });
             }
             const sentId = resp?.data?.message_id;
-            if (sentId && botMessageTracker) botMessageTracker.add(sentId);
+            if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
           } catch (err: any) {
             const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
             if (defer) return defer;
@@ -612,7 +612,7 @@ export function registerTools(
               });
             }
             const sentId = resp?.data?.message_id;
-            if (sentId && botMessageTracker) botMessageTracker.add(sentId);
+            if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
           } catch (err: any) {
             const defer = handlePermanentTargetError(err, { tool: 'reply', chat_id });
             if (defer) return defer;
@@ -653,7 +653,7 @@ export function registerTools(
                   msg_type: 'image',
                 });
                 const sentId = (sent as any)?.data?.message_id;
-                if (sentId && botMessageTracker) botMessageTracker.add(sentId);
+                if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
               }
             } else {
               // For file uploads, use im.v1.file.create
@@ -674,7 +674,7 @@ export function registerTools(
                   msg_type: 'file',
                 });
                 const sentId = (sent as any)?.data?.message_id;
-                if (sentId && botMessageTracker) botMessageTracker.add(sentId);
+                if (sentId && botMessageTracker) botMessageTracker.add(sentId, chat_id, thread_id);
               }
             }
           } catch (err) {
