@@ -13,6 +13,64 @@ import { TERMINAL_CHAT_ID } from './identity-session.js';
 import { writeSdkResource } from './sdk-resource.js';
 
 const DEBUG_LOG = path.join(os.homedir(), '.claude', 'channels', 'lark', 'debug.log');
+
+/**
+ * Ack-reaction TTL (#85): an ack older than this is considered orphaned
+ * and gets force-revoked by `pruneStaleAcks`. 5 minutes is long enough
+ * to span a slow reply (the longest Claude turn we'd expect under
+ * normal load) and short enough that an orphaned ack doesn't stay on
+ * the user's message for an annoying duration.
+ */
+export const ACK_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * How often `pruneStaleAcks` runs. 60s is the same cadence as the
+ * scheduler tick; faster doesn't help (an orphan only matters once it
+ * exceeds ACK_TTL_MS) and would just spend CPU iterating the Map.
+ */
+export const ACK_PRUNE_INTERVAL_MS = 60_000;
+
+/**
+ * Minimal client surface needed by {@link pruneStaleAcksImpl}. Decoupling
+ * via this interface (rather than depending on the full Lark.Client type)
+ * lets the smoke test pass a mock without constructing a real SDK client
+ * (which would need LARK_APP_ID / LARK_APP_SECRET env).
+ */
+export interface AckRevokeClient {
+  im: { v1: { messageReaction: { delete: (args: any) => Promise<any> } } };
+}
+
+/**
+ * Pure-function implementation of the ack TTL prune (#85). Iterates the
+ * Map and, for each entry older than `maxAgeMs`, removes it AND fires a
+ * best-effort `messageReaction.delete` so the orphaned emoji is also
+ * cleaned up on Feishu's side. Returns the number of entries pruned.
+ *
+ * Race-safety: a concurrent normal-path revoke for the same entry is
+ * benign — both deletes target the same reaction_id; Feishu returns 404
+ * on the second one and `.catch` swallows it. The Map.delete inside a
+ * for...entries() iteration is safe per spec — the deleted entry is
+ * either visited or skipped depending on iteration position, never
+ * causes the iterator to throw.
+ */
+export function pruneStaleAcksImpl(
+  ackReactions: Map<string, { reactionId: string; addedAt: number }>,
+  client: AckRevokeClient,
+  now: number,
+  maxAgeMs: number,
+): number {
+  let pruned = 0;
+  for (const [messageId, entry] of ackReactions.entries()) {
+    if (now - entry.addedAt > maxAgeMs) {
+      ackReactions.delete(messageId);
+      client.im.v1.messageReaction.delete({
+        path: { message_id: messageId, reaction_id: entry.reactionId },
+      }).catch(() => {});
+      pruned++;
+    }
+  }
+  return pruned;
+}
 function debugLog(msg: string) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   try { appendFileSync(DEBUG_LOG, line); } catch {}
@@ -215,7 +273,24 @@ export class LarkChannel {
   private memoryStore: MemoryStore | null = null;
   private conversationBuffer: ConversationBuffer | null = null;
   private identitySession: IdentitySession | null = null;
-  private ackReactions = new Map<string, string>(); // messageId → reactionId
+  /**
+   * Tracks pending ack reactions (the MeMeMe emoji bot adds on receive to
+   * signal "I'm processing this"). Keyed by inbound `message_id`; value
+   * carries the Feishu `reaction_id` (needed for the revoke API) and the
+   * insert timestamp (for the TTL backstop in `pruneStaleAcks`).
+   *
+   * Lifecycle:
+   *  - `handleMessageEvent` adds an entry after the ack reaction lands.
+   *  - `reply` tool revokes the entry in its `finally` block (#85 fix),
+   *    so ack always clears whether the send succeeded or threw.
+   *  - `pruneStaleAcks` (timer in `start()`) sweeps anything older than
+   *    `ACK_TTL_MS` and best-effort revokes, so any escaped entry doesn't
+   *    sit on the user's message forever or leak Map memory.
+   */
+  private ackReactions = new Map<string, { reactionId: string; addedAt: number }>();
+  private ackPruneTimer: NodeJS.Timeout | null = null;
+  /** Guards `start()` against double-invocation (R1-followup on #85). */
+  private started = false;
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
   private latestMessageTracker = new LatestMessageTracker();
 
@@ -263,7 +338,7 @@ export class LarkChannel {
     return this.client;
   }
 
-  getAckReactions(): Map<string, string> {
+  getAckReactions(): Map<string, { reactionId: string; addedAt: number }> {
     return this.ackReactions;
   }
 
@@ -276,6 +351,17 @@ export class LarkChannel {
   }
 
   async start(): Promise<void> {
+    // R1-followup on #85: guard against double-invocation. Pre-fix a
+    // second start() call would arm a second ackPruneTimer and a second
+    // wsClient — leaking timers AND opening duplicate WebSockets. No
+    // current call site does this (main() calls start once), but the
+    // guard is cheap and removes a future-regression footgun.
+    if (this.started) {
+      console.error('[channel] start() called twice; ignoring second call');
+      return;
+    }
+    this.started = true;
+
     // Fetch bot's own open_id for filtering group @mentions
     await this.fetchBotOpenId();
 
@@ -315,6 +401,74 @@ export class LarkChannel {
 
     this.wsClient.start({ eventDispatcher });
     debugLog('[channel] lark channel: connected to Feishu via WebSocket');
+
+    // #85 fix: TTL backstop for ackReactions. The normal lifecycle revokes
+    // acks in `reply`'s finally block (handles partial-send failures), but
+    // events outside that path can still leave an entry orphaned: the bot
+    // received a message but Claude never called `reply` for that exact
+    // message_id (e.g. cron-only turn that doesn't reply, hook block,
+    // model abandoned the turn, etc.). Without this prune, those entries
+    // sit on the user's message visually forever AND leak Map memory in
+    // a long-running daemon. ACK_PRUNE_INTERVAL_MS controls how often
+    // we scan; ACK_TTL_MS is the staleness threshold.
+    // R2-audit followup: wrap the setInterval callback in try/catch.
+    // pruneStaleAcksImpl can't realistically throw today (Map.delete
+    // during entries() iteration is spec-safe, NaN arithmetic falls
+    // through), but a synchronous throw inside the callback would
+    // propagate to uncaughtException → process.exit(1) per
+    // src/index.ts. Defense in depth against a future regression.
+    this.ackPruneTimer = setInterval(() => {
+      try {
+        this.pruneStaleAcks(ACK_TTL_MS);
+      } catch (err) {
+        console.error('[channel] pruneStaleAcks threw (swallowed to keep timer alive):', err);
+      }
+    }, ACK_PRUNE_INTERVAL_MS);
+    // .unref() so the timer never holds the process open by itself; if
+    // everything else stops, Node can exit even with the timer pending.
+    this.ackPruneTimer.unref?.();
+  }
+
+  /**
+   * Partial shutdown hook (R1-followup on #85; scope clarified per
+   * R2-audit). Clears the ackPrune timer and resets the `started` flag.
+   *
+   * Does NOT close `this.wsClient`. The Lark SDK's WSClient has no
+   * documented synchronous close API, and process exit (the default
+   * `main()` shutdown path) releases the socket. A future caller that
+   * wants true re-init across stop()/start() will need to extend this
+   * to wsClient teardown — current production has no such caller, so
+   * this method exists only to release the ackPrune timer for tests.
+   *
+   * Idempotent — safe to call multiple times.
+   *
+   * NOTE: do not pair this with a subsequent `start()` in the same
+   * process while the WSClient is still subscribed (you'll get
+   * duplicate event handling). Filed as the unstated half of #136
+   * if/when a real re-init use case emerges.
+   */
+  stop(): void {
+    if (this.ackPruneTimer) {
+      clearInterval(this.ackPruneTimer);
+      this.ackPruneTimer = null;
+    }
+    this.started = false;
+  }
+
+  /**
+   * Instance-method wrapper around {@link pruneStaleAcksImpl}. The pure
+   * function lives at module scope so smoke tests can exercise it
+   * without instantiating a full LarkChannel (which needs LARK_APP_ID /
+   * LARK_APP_SECRET to construct the SDK client).
+   */
+  pruneStaleAcks(maxAgeMs: number): number {
+    const pruned = pruneStaleAcksImpl(this.ackReactions, this.client, Date.now(), maxAgeMs);
+    if (pruned > 0) {
+      console.error(
+        `[channel] pruneStaleAcks: revoked ${pruned} stale ack(s) older than ${maxAgeMs}ms`,
+      );
+    }
+    return pruned;
   }
 
   private async handleMessageEvent(data: any): Promise<void> {
@@ -380,7 +534,13 @@ export class LarkChannel {
         data: { reaction_type: { emoji_type: ackEmoji } },
       }).then((resp: any) => {
         const reactionId = resp?.data?.reaction_id;
-        if (reactionId) this.ackReactions.set(messageId, reactionId);
+        if (reactionId) {
+          // addedAt timestamp powers the TTL backstop (#85): pruneStaleAcks
+          // sweeps entries older than ACK_TTL_MS so anything that escaped
+          // the normal revoke path doesn't sit on the user's message
+          // forever or leak Map memory.
+          this.ackReactions.set(messageId, { reactionId, addedAt: Date.now() });
+        }
       }).catch(() => {});
     }
 
