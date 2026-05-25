@@ -303,32 +303,29 @@ async function run() {
   //   was garbage.
   //
   //   Detection uses the JOB_THREAD_PREFIX synthetic id on thread_id.
+  //   R1-followup: bind identities for BOTH threads up front so the
+  //   sanity-check non-cron call has a valid caller; pre-fix the test
+  //   had a stale ordering that made the sanity check effectively dead
+  //   code (the first non-cron call was discarded before assertion).
   {
+    const cronThread = `${JOB_THREAD_PREFIX}some-job-123`;
+    identitySession.setCaller('chat_cron', cronThread, 'ou_cron_owner');
+    identitySession.setCaller('chat_cron', 'thr_real_user', 'ou_real_user');
+
+    // Sub-case a: cron-thread → buffer.recorded stays at 0
     apiCalls.length = 0;
     buffer.recorded.length = 0;
-    const cronThread = `${JOB_THREAD_PREFIX}some-job-123`;
-    // The cronjob path binds a caller under (chat_id, cron-thread-id).
-    identitySession.setCaller('chat_cron', cronThread, 'ou_cron_owner');
-
     await replyHandler({
       chat_id: 'chat_cron',
       thread_id: cronThread,
       text: 'hourly status update from cron',
     });
-
     if (buffer.recorded.length !== 0) {
-      fail(`8b: cron-thread reply must NOT record into buffer, got ${buffer.recorded.length} entries`);
+      fail(`8b-cron: cron-thread reply must NOT record (got ${buffer.recorded.length})`);
     }
 
-    // Sanity: the same reply WITHOUT the cron prefix DOES record.
-    buffer.recorded.length = 0;
-    await replyHandler({
-      chat_id: 'chat_cron',
-      thread_id: 'thr_real_user',
-      text: 'user-driven reply',
-    });
-    // Need an identity binding for the non-cron path too
-    identitySession.setCaller('chat_cron', 'thr_real_user', 'ou_real_user');
+    // Sub-case b: non-cron thread → buffer.recorded === 1
+    apiCalls.length = 0;
     buffer.recorded.length = 0;
     await replyHandler({
       chat_id: 'chat_cron',
@@ -336,7 +333,7 @@ async function run() {
       text: 'user-driven reply',
     });
     if (buffer.recorded.length !== 1) {
-      fail(`8b sanity: non-cron-thread reply MUST record into buffer, got ${buffer.recorded.length}`);
+      fail(`8b-sanity: non-cron-thread reply MUST record (got ${buffer.recorded.length})`);
     }
   }
 

@@ -469,10 +469,17 @@ export function registerTools(
         // shouldn't summarize "the bot's hourly cron status update"
         // as part of the user's conversation history.
         //
-        // Detection uses the same `isSyntheticThread` flag computed
-        // above (line ~411): cronjob threads carry the
-        // JOB_THREAD_PREFIX synthetic id.
-        if (isSyntheticThread) return;
+        // Alias the `isSyntheticThread` flag (R1-followup): it's load-
+        // bearing for TWO unrelated decisions in this handler — thread
+        // routing (line ~411) and buffer skip (here). If a future
+        // change narrows the routing flag (e.g. "only treat as
+        // synthetic if also has reply_to"), the buffer-skip behavior
+        // would silently change too. The local alias signals "this
+        // value is consumed here for a different reason — preserve
+        // semantics or split the flag if either consumer's intent
+        // changes."
+        const isCronOriginated = isSyntheticThread;
+        if (isCronOriginated) return;
 
         conversationBuffer?.record(chat_id, {
           role: 'assistant',
