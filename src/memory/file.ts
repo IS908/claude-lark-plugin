@@ -786,10 +786,15 @@ export class MemoryStore {
             removedFiles++;
             bytesFreed += s.size;
           }
-        } catch {
-          // stat / unlink raced with a concurrent delete or hit EACCES.
-          // Best-effort; skip this file but count for operator visibility.
-          skipped++;
+        } catch (err: any) {
+          // R2-followup: distinguish benign ENOENT (file vanished between
+          // readdir and stat — e.g. concurrent prune at the periodic
+          // tick + startup overlap, or operator manual `rm`) from real
+          // EACCES / EBUSY / EISDIR / etc. Only the latter is operator-
+          // actionable, so only the latter should increment `skipped`
+          // and surface in the log. Pre-followup the counter conflated
+          // them and produced false-alarm "N skipped" notices.
+          if (err?.code !== 'ENOENT') skipped++;
         }
       }
     };

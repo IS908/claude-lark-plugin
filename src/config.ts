@@ -180,9 +180,21 @@ export const appConfig = {
   // limits / write-only-ing the cache.
   nameCacheTtlHours: optionalPositiveNumber('LARK_NAME_CACHE_TTL_HOURS', 24),
   nameCacheSize: optionalPositiveNumber('LARK_NAME_CACHE_SIZE', 2000),
-  // chatTypeCache: chat_id → 'p2p' | 'group'. Even smaller per entry.
-  // Larger cap because a Slack-scale deployment can have many channels.
-  chatTypeCacheTtlHours: optionalPositiveNumber('LARK_CHAT_TYPE_CACHE_TTL_HOURS', 24),
+  // chatTypeCache: chat_id → 'p2p' | 'group'. Chat type is STRUCTURAL —
+  // a p2p chat doesn't become a group chat. A short TTL (like the 24h
+  // initial proposal) would just spuriously recompute; worse, R2 audit
+  // caught that an idle p2p chat past TTL expiry would have
+  // `isPrivateChat` return false (cache miss → default-to-group), and
+  // any tool call from a cronjob in that chat (no fresh inbound to
+  // re-set the entry) would widen the visibility filter — silent
+  // privacy regression.
+  //
+  // Default 720 hours (30 days) effectively means "never expire while
+  // the daemon is running"; LRU cap (5000) is the real defender against
+  // pathological growth. Operator who wants tighter TTL (e.g. a
+  // deployment that frequently re-uses chat_ids for different chats —
+  // shouldn't happen but defensive) can shorten via the env.
+  chatTypeCacheTtlHours: optionalPositiveNumber('LARK_CHAT_TYPE_CACHE_TTL_HOURS', 720),
   chatTypeCacheSize: optionalPositiveNumber('LARK_CHAT_TYPE_CACHE_SIZE', 5000),
   // Log rotation: single rotated copy (`<file>.1`). Effective on-disk
   // cap is ~2 × maxBytes per log. 50MB default × 2 × 3 logs = 300MB

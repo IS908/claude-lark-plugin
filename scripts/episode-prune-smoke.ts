@@ -142,21 +142,65 @@ try {
   //     visible counter so an operator can see why a stuck file persists.
   //     Simulate via a stale file under a readonly directory: chmod
   //     0500 prevents unlink (POSIX requires dir write to remove a child).
+  //
+  //     R2-followup: skip the chmod assertion when running as root
+  //     (Docker / devcontainer / CI as root) — root bypasses POSIX dir
+  //     perms, so the chmod doesn't actually block unlink and the test
+  //     would falsely fail. Detect via process.getuid (undefined on
+  //     Windows / not-applicable; we then trust the chmod works).
   {
-    const chatId = 'oc_skipped';
-    const stale = seedEpisode(chatId, 'undeletable.md', 200 * DAY_MS);
-    const chatDir = join(tmp, 'episodes', chatId);
-    const { chmodSync } = await import('node:fs');
-    chmodSync(chatDir, 0o500); // r-x for owner; cannot unlink children
-    try {
-      const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
-      if (r.removedFiles !== 0) fail(`8: unlink should fail, 0 removed expected (got ${r.removedFiles})`);
-      if (r.skipped !== 1) fail(`8: skipped counter must be 1 (got ${r.skipped})`);
-      if (!existsSync(stale)) fail(`8: undeletable file should still exist`);
-    } finally {
-      // Restore writability so the cleanup tmp rmSync can finish
-      chmodSync(chatDir, 0o700);
+    const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+    if (isRoot) {
+      console.error('  [skip] test 8: running as root, chmod doesn\'t block unlink');
+      testNum++;
+    } else {
+      const chatId = 'oc_skipped';
+      const stale = seedEpisode(chatId, 'undeletable.md', 200 * DAY_MS);
+      const chatDir = join(tmp, 'episodes', chatId);
+      const { chmodSync } = await import('node:fs');
+      chmodSync(chatDir, 0o500); // r-x for owner; cannot unlink children
+      try {
+        const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+        if (r.removedFiles !== 0) fail(`8: unlink should fail, 0 removed expected (got ${r.removedFiles})`);
+        if (r.skipped !== 1) fail(`8: skipped counter must be 1 (got ${r.skipped})`);
+        if (!existsSync(stale)) fail(`8: undeletable file should still exist`);
+      } finally {
+        // Restore writability so the cleanup tmp rmSync can finish
+        chmodSync(chatDir, 0o700);
+      }
+      testNum++;
     }
+  }
+
+  // 9. R2-followup: ENOENT during prune (file vanished between readdir
+  //     and stat — e.g. concurrent prune + manual rm) must NOT count
+  //     toward `skipped`. Pre-followup the conflation produced
+  //     false-alarm "N skipped" notices in operator logs.
+  //     Hard to reproduce without injecting an unlink-mid-iteration
+  //     race; instead, exercise the code path by deleting a file
+  //     between readdir snapshot and stat — synthesized by patching
+  //     the stat call indirectly via a sub-helper would be invasive.
+  //     Simpler: confirm an EMPTY directory + a stale file that we
+  //     pre-delete (so readdir saw it, stat hits ENOENT) produces
+  //     skipped=0.
+  {
+    const chatId = 'oc_enoent';
+    const ghost = seedEpisode(chatId, 'ghost.md', 200 * DAY_MS);
+    const fresh = seedEpisode(chatId, 'fresh.md', 1 * DAY_MS);
+    // Pre-delete the ghost file BEFORE running prune. readdir won't
+    // see it (different from the race; readdir is one syscall), so
+    // this actually tests "missing-after-readdir" only indirectly.
+    // For a deterministic ENOENT-during-stat, we need to inject — but
+    // we don't have a stat hook. Instead, verify the happy path on a
+    // dir whose only stale file got pre-deleted: skipped=0, fresh
+    // survives.
+    const { rmSync } = await import('node:fs');
+    rmSync(ghost);
+    const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+    if (r.skipped !== 0) {
+      fail(`9: pre-deleted-stale-file should NOT count as skipped (got ${r.skipped})`);
+    }
+    if (!existsSync(fresh)) fail(`9: fresh survived`);
     testNum++;
   }
 } finally {

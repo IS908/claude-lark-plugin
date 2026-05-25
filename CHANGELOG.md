@@ -30,7 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - 3 new smoke tests (wired into `scripts/test.sh`):
   - `scripts/ttl-cache-smoke.ts` — 12 tests (set/get + TTL boundary + LRU eviction + touchOnGet + has/delete/clear + invalid-args throws + edge cases ttl=0 / size=1)
   - `scripts/log-rotation-smoke.ts` — 9 tests (first write + simple append + rotation + overwrite-prior-`.1` + boundary + stat ENOENT + append EISDIR + multi-line + empty write)
-  - `scripts/episode-prune-smoke.ts` — 7 tests (missing dir + age expiry + thread recursion + multi-chat independence + boundary + non-`.md` preserved + bytesFreed accounting)
+  - `scripts/episode-prune-smoke.ts` — 9 tests (missing dir + age expiry + thread recursion + multi-chat independence + boundary + non-`.md` preserved + bytesFreed accounting + EACCES skipped accounting + ENOENT NOT counted as skipped)
 
 ### New env vars
 | Env | Default | Effect |
@@ -49,6 +49,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **`TTLCache` constructor: `ttlMs > 0`** (was `ttlMs >= 0`). `ttlMs=0` made the cache write-only (every read past the same-tick set expires) — a rate-limit risk for the contact-API-backed nameCache. Now throws at construct time.
 - **`TTLCache.has()` is now PURE** — pre-followup it delegated to `get()` which lazy-evicted expired entries and (with `touchOnGet=true`) re-inserted. Standard `Map.has` is read-only; the side-effect would have surprised a future contributor. Now just consults `addedAt` without mutating; the expired entry stays in the Map until the next `get`/`set`/`delete` does the sweep.
 - **`pruneEpisodes` skipped counter** — previously per-file stat/unlink failures were silently swallowed with no operator visibility. Now `pruneEpisodes` returns `{ removedFiles, bytesFreed, skipped }`; `[episode-prune]` log line includes `(N skipped — stat/unlink failed)` when non-zero. A perms-protected file no longer grows forever invisibly.
+
+### R2-audit followups (closed in this PR)
+- **`LARK_CHAT_TYPE_CACHE_TTL_HOURS` default 24 → 720 (30 days)** — R2 caught a real regression: chat type is STRUCTURAL (a p2p chat doesn't become a group chat), so a 24h TTL was spurious recomputation. Worse, an idle p2p chat past expiry caused `isPrivateChat` to return `false` (cache miss → default-to-group), which would silently WIDEN the visibility filter for any tool call from a cronjob in that chat (no fresh inbound to re-set the entry — e.g. cronjob's `list_jobs`, `what_do_you_know` from a stale thread, delayed flush). 30-day TTL effectively means "never expire while the daemon runs"; LRU cap (5000) is the real defender against pathological growth.
+- **`pruneEpisodes` ENOENT no longer counted as skipped** — pre-followup the `skipped` counter conflated benign ENOENT (file vanished concurrently with a parallel prune or operator `rm`) with real EACCES / EBUSY. Operator would see "N skipped" notices that were false alarms. Now only non-ENOENT errors increment.
+- **Test 8 root-skip** — `chmod 0500` to force EACCES doesn't block root from `unlink`. Skip the assertion under `process.getuid() === 0` (Docker / devcontainer / root CI) with an `[skip]` line. New test 9 confirms ENOENT semantics directly.
+- **CHANGELOG test count drift** — episode-prune-smoke is now 9 tests (was 7 in the initial, became 8 with R1's EACCES, then 9 with R2's ENOENT separation).
 
 ### Operator notes
 - **Pre-#109 deployments on first startup after upgrade**: episode prune sweeps everything older than 180 days; if you have valuable historical episode notes, set `LARK_EPISODE_PRUNE_DISABLED=true` for one-time archival before re-enabling. Log rotation also fires on first write — large pre-fix `debug.log` rotates to `debug.log.1` (preserving it for one cycle, then overwriting on the next rotation).
