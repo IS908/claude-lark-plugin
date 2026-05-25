@@ -134,4 +134,8 @@ echo "=== Feishu retry helper unit checks ==="
 npx tsx scripts/feishu-retry-smoke.ts
 
 echo ""
+echo "=== Buffer hard-cap unit checks ==="
+npx tsx scripts/buffer-cap-smoke.ts
+
+echo ""
 echo "All tests passed."

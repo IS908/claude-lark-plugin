@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.38] - 2026-05-25
+
+### Fixed
+- **Cronjob replies bled into ConversationBuffer → auto-flush never fired → buffer grew unbounded + cron mixed with user dialogue** (#110 — **HIGH memory leak + episode quality regression**). The `reply` tool unconditionally recorded every reply (including prompt-type cronjob outputs) into the per-chat `ConversationBuffer`. A cronjob targeting an active chat (typical: hourly "team status update" → that team's group chat) reset the buffer's inactivity timer on every fire — auto-flush (default 3h) NEVER triggered as long as the cron kept hitting. Effects:
+  - **Memory leak**: per-chat buffer grew unboundedly across days/weeks.
+  - **Episode garbage**: when a flush eventually happened (cron paused, chat went truly idle), the distillation prompt saw a mixed stream of cron output + real user dialogue; the resulting episode `.md` blended "the bot's hourly status update" with "what users actually said."
+  - **No memory enrichment for the affected chat**: distillation effectively disabled for as long as the cron kept the timer reset.
+
+  Fix (two layers):
+
+  **1. Skip buffer-record for cron-originated replies** (`src/tools.ts:recordReply`). The detection reuses the `isSyntheticThread` flag (`thread_id.startsWith(JOB_THREAD_PREFIX)`) already computed earlier in the same handler for thread-routing decisions. One-line root-cause fix:
+  ```ts
+  if (isSyntheticThread) return; // cron output is not user dialogue
+  ```
+  Semantically correct: a cronjob's reply is not part of the conversation history that should be distilled.
+
+  **2. Hard-cap backstop on `ConversationBuffer`** — even if a future regression re-introduces bleed (or a high-cadence non-cron writer somehow keeps the timer reset), the buffer can't grow unboundedly. New `LARK_BUFFER_MAX_MESSAGES` env (default 200) caps per-chat entries; the (cap-1)th push triggers a force-flush regardless of timer state. Idempotent via the existing `flushing.has(chatId)` guard — concurrent records during the flush short-circuit (same as the pre-existing timer-flush path).
+
+  `ConversationBuffer` constructor now takes an optional `{ maxMessages }` override for testability — ESM hoisting prevents env overrides at the top of a smoke-test from reaching config.ts's capture point.
+
+### Added
+- New `LARK_BUFFER_MAX_MESSAGES` env (default 200, positive-validated via `optionalPositiveNumber`).
+- New `scripts/buffer-cap-smoke.ts` (5 tests, wired into `scripts/test.sh`):
+  - 1: under-cap pushes do NOT trigger flush
+  - 2: at-cap push (5th of 5) triggers exactly one force-flush
+  - 3: concurrent pushes during flush DO NOT double-flush (idempotent via `flushing` guard)
+  - 4: after flush completes, fresh pushes accumulate again (cap doesn't permanently disable timer-flush)
+  - 5: per-chat independence (chat A at cap flushes; chat B unaffected)
+- New `reply-card-smoke.ts` test 8b: cron-thread reply (`thread_id` prefixed with `JOB_THREAD_PREFIX`) does NOT record into the buffer; non-cron-thread reply DOES (sanity check the detection isn't over-eager).
+
+### Operator notes
+- No data-format or config changes; existing buffers carry over.
+- Pre-#110 deployments may have accumulated large in-memory buffers for chats with active cronjobs. On first restart after upgrade those buffers are dropped (they're in-memory only) — no on-disk impact. Future flushes will produce cleaner episodes since cron output is no longer recorded.
+- If you've been relying on cronjob outputs appearing in episode history for that chat, that's no longer the case post-fix. The cron's `[scheduler] Job X executed ...` stderr line remains the canonical audit trail.
+- `LARK_BUFFER_MAX_MESSAGES=0` rejected by `optionalPositiveNumber` and snapped to default 200 with a breadcrumb (matches the env-hardening pattern from #109).
+
 ## [1.0.37] - 2026-05-25
 
 ### Fixed

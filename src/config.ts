@@ -124,6 +124,14 @@ export const appConfig = {
   minSearchScore: optionalNumber('LARK_MIN_SEARCH_SCORE', 0.3),
   maxSearchResults: optionalNumber('LARK_MAX_SEARCH_RESULTS', 2),
   inactivityHours: optionalNumber('LARK_INACTIVITY_HOURS', 3),
+  // #110 fix: hard cap on per-chat buffer entries. The inactivity
+  // timer was the only pre-fix bound; a chat that produced events
+  // faster than the timer could fire (or a cronjob that kept
+  // resetting the timer) would grow the buffer without limit. This
+  // is the belt-and-suspenders backstop — once a buffer reaches the
+  // cap, force-flush regardless of timer state. 200 entries × ~1KB
+  // each ≈ 200KB per chat — comfortably bounded.
+  bufferMaxMessages: optionalPositiveNumber('LARK_BUFFER_MAX_MESSAGES', 200),
 
   // Identity / privacy
   ownerOpenId: ownerOpenId(),

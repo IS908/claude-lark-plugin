@@ -8,6 +8,7 @@ import type { MemoryStore } from '../src/memory/file.js';
 import { IdentitySession } from '../src/identity-session.js';
 import { pruneStaleAcksImpl, ACK_TTL_MS } from '../src/channel.js';
 import type { LarkChannel, AckRevokeClient } from '../src/channel.js';
+import { JOB_THREAD_PREFIX } from '../src/scheduler.js';
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -292,6 +293,52 @@ async function run() {
     (c) => c.method === 'message.create' && c.args.data.msg_type === 'text'
   );
   if (!normalCreate) fail('Test 8: plain text path should use msg_type=text');
+
+  // ── Test 8b: #110 fix — cron-originated reply does NOT record into buffer ──
+  //   Pre-fix, every reply (including prompt-type cronjob replies) was
+  //   recorded into the per-chat ConversationBuffer. A cronjob hitting
+  //   an active chat reset the buffer's inactivity timer on every fire
+  //   → auto-flush (default 3h) never triggered → buffer grew unboundedly,
+  //   cron output got mixed with real user dialogue, eventual distillation
+  //   was garbage.
+  //
+  //   Detection uses the JOB_THREAD_PREFIX synthetic id on thread_id.
+  {
+    apiCalls.length = 0;
+    buffer.recorded.length = 0;
+    const cronThread = `${JOB_THREAD_PREFIX}some-job-123`;
+    // The cronjob path binds a caller under (chat_id, cron-thread-id).
+    identitySession.setCaller('chat_cron', cronThread, 'ou_cron_owner');
+
+    await replyHandler({
+      chat_id: 'chat_cron',
+      thread_id: cronThread,
+      text: 'hourly status update from cron',
+    });
+
+    if (buffer.recorded.length !== 0) {
+      fail(`8b: cron-thread reply must NOT record into buffer, got ${buffer.recorded.length} entries`);
+    }
+
+    // Sanity: the same reply WITHOUT the cron prefix DOES record.
+    buffer.recorded.length = 0;
+    await replyHandler({
+      chat_id: 'chat_cron',
+      thread_id: 'thr_real_user',
+      text: 'user-driven reply',
+    });
+    // Need an identity binding for the non-cron path too
+    identitySession.setCaller('chat_cron', 'thr_real_user', 'ou_real_user');
+    buffer.recorded.length = 0;
+    await replyHandler({
+      chat_id: 'chat_cron',
+      thread_id: 'thr_real_user',
+      text: 'user-driven reply',
+    });
+    if (buffer.recorded.length !== 1) {
+      fail(`8b sanity: non-cron-thread reply MUST record into buffer, got ${buffer.recorded.length}`);
+    }
+  }
 
   // ── Test 9: partial-failure leak — ack STILL revoked when send throws (#85) ──
   //   Pre-v1.0.30: recordAndRevokeAck was called ONLY after every send

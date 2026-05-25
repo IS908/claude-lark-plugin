@@ -20,6 +20,19 @@ export class ConversationBuffer {
   private timers = new Map<string, NodeJS.Timeout>();
   private flushing = new Set<string>(); // guard against re-entry during flush
   private flushHandler: FlushHandler | null = null;
+  /**
+   * Hard cap on per-chat buffer entries (#110). Pre-fix only the
+   * inactivity timer bounded the buffer; cron output (or any high-
+   * cadence writer) could keep resetting the timer indefinitely and
+   * grow the buffer unbounded. Cap defaults to `appConfig.bufferMaxMessages`;
+   * constructor override exists for tests (ESM hoisting prevents the
+   * smoke test from changing the env-derived default at script start).
+   */
+  private readonly maxMessages: number;
+
+  constructor(opts?: { maxMessages?: number }) {
+    this.maxMessages = opts?.maxMessages ?? appConfig.bufferMaxMessages;
+  }
 
   setFlushHandler(handler: FlushHandler): void {
     this.flushHandler = handler;
@@ -34,6 +47,24 @@ export class ConversationBuffer {
     }
     this.buffers.get(chatId)!.push(message);
     this.resetTimer(chatId);
+
+    // #110 fix: hard-cap backstop. The inactivity-timer-based flush
+    // is the primary trigger, but anything that keeps resetting the
+    // timer (e.g. a regression that re-introduces cron-into-buffer
+    // bleed, or a chat with sub-inactivity-window cadence) would
+    // otherwise let the buffer grow unbounded. Once we hit the cap,
+    // force-flush even if the timer hasn't expired. Best-effort —
+    // triggerFlush is async + idempotent against `this.flushing`
+    // guard, so calling it here doesn't double-fire.
+    const buf = this.buffers.get(chatId)!;
+    if (buf.length >= this.maxMessages) {
+      // Fire-and-forget — record() is sync (downstream callers don't
+      // await it). The flush sets `this.flushing` synchronously
+      // inside triggerFlush before the first await, so concurrent
+      // record() calls during the flush will short-circuit at the
+      // `flushing.has` check at the top of this method.
+      void this.triggerFlush(chatId);
+    }
   }
 
   getMessages(chatId: string): BufferedMessage[] {
