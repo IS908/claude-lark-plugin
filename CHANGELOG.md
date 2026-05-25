@@ -44,11 +44,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 | `LARK_EPISODE_PRUNE_INTERVAL_MIN` | 1440 (24h) | prune cadence |
 | `LARK_EPISODE_PRUNE_DISABLED` | false | opt-out |
 
+### R1-audit followups (closed in this PR)
+- **`optionalPositiveNumber` env helper** — new validator in `src/config.ts` rejects `0` and negatives for the sizing knobs (`LARK_LOG_MAX_BYTES`, `LARK_*_CACHE_SIZE`, `LARK_*_TTL_HOURS`, `LARK_EPISODE_RETENTION_DAYS`, `LARK_EPISODE_PRUNE_INTERVAL_MIN`). Pre-followup `LARK_LOG_MAX_BYTES=0` would have rotated after every write — debug.log retains 1 live line + 1 in `.1`, all history lost in seconds. The hook had the right guard; the src side now matches. Falls back to default with stderr breadcrumb on invalid value.
+- **`TTLCache` constructor: `ttlMs > 0`** (was `ttlMs >= 0`). `ttlMs=0` made the cache write-only (every read past the same-tick set expires) — a rate-limit risk for the contact-API-backed nameCache. Now throws at construct time.
+- **`TTLCache.has()` is now PURE** — pre-followup it delegated to `get()` which lazy-evicted expired entries and (with `touchOnGet=true`) re-inserted. Standard `Map.has` is read-only; the side-effect would have surprised a future contributor. Now just consults `addedAt` without mutating; the expired entry stays in the Map until the next `get`/`set`/`delete` does the sweep.
+- **`pruneEpisodes` skipped counter** — previously per-file stat/unlink failures were silently swallowed with no operator visibility. Now `pruneEpisodes` returns `{ removedFiles, bytesFreed, skipped }`; `[episode-prune]` log line includes `(N skipped — stat/unlink failed)` when non-zero. A perms-protected file no longer grows forever invisibly.
+
 ### Operator notes
 - **Pre-#109 deployments on first startup after upgrade**: episode prune sweeps everything older than 180 days; if you have valuable historical episode notes, set `LARK_EPISODE_PRUNE_DISABLED=true` for one-time archival before re-enabling. Log rotation also fires on first write — large pre-fix `debug.log` rotates to `debug.log.1` (preserving it for one cycle, then overwriting on the next rotation).
 - Caches start cold. First few minutes after restart have higher Feishu contact API traffic as names re-resolve; well within standard rate limits.
 - Re-enabling episode prune after disabling: `LARK_EPISODE_PRUNE_DISABLED=false` (or unset) restores the periodic timer on next start.
-- `LARK_LOG_MAX_BYTES=0` is a footgun (every write triggers rotation since size > 0). Use `LARK_LOG_MAX_BYTES` ≥ a typical line length (a few KB minimum); 50MB default is comfortable.
+- All numeric tuning envs now snap back to defaults on `=0` or negative values with a stderr breadcrumb. To disable the relevant subsystem, use the dedicated `_DISABLED=true` flag (currently only `LARK_EPISODE_PRUNE_DISABLED` exists; log rotation and caches have no disable knob — bound them via the size envs).
 
 ## [1.0.35] - 2026-05-25
 

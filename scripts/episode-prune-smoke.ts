@@ -133,6 +133,30 @@ try {
     if (r.removedFiles !== 2) fail(`7: expected 2 removed, got ${r.removedFiles}`);
     if (r.bytesFreed !== 5100) fail(`7: bytesFreed must equal sum of removed sizes, got ${r.bytesFreed}`);
     if (existsSync(big) || existsSync(small)) fail(`7: stale files should be gone`);
+    if (r.skipped !== 0) fail(`7: happy path → 0 skipped, got ${r.skipped}`);
+    testNum++;
+  }
+
+  // 8. R1-followup: `skipped` counter — files we tried to unlink but
+  //     couldn't (stat raced with delete, EACCES, etc.) increment a
+  //     visible counter so an operator can see why a stuck file persists.
+  //     Simulate via a stale file under a readonly directory: chmod
+  //     0500 prevents unlink (POSIX requires dir write to remove a child).
+  {
+    const chatId = 'oc_skipped';
+    const stale = seedEpisode(chatId, 'undeletable.md', 200 * DAY_MS);
+    const chatDir = join(tmp, 'episodes', chatId);
+    const { chmodSync } = await import('node:fs');
+    chmodSync(chatDir, 0o500); // r-x for owner; cannot unlink children
+    try {
+      const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+      if (r.removedFiles !== 0) fail(`8: unlink should fail, 0 removed expected (got ${r.removedFiles})`);
+      if (r.skipped !== 1) fail(`8: skipped counter must be 1 (got ${r.skipped})`);
+      if (!existsSync(stale)) fail(`8: undeletable file should still exist`);
+    } finally {
+      // Restore writability so the cleanup tmp rmSync can finish
+      chmodSync(chatDir, 0o700);
+    }
     testNum++;
   }
 } finally {

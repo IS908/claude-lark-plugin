@@ -45,8 +45,12 @@ export class TTLCache<K, V> {
     if (opts.maxSize < 1) {
       throw new Error(`TTLCache: maxSize must be ≥ 1, got ${opts.maxSize}`);
     }
-    if (opts.ttlMs < 0) {
-      throw new Error(`TTLCache: ttlMs must be ≥ 0, got ${opts.ttlMs}`);
+    // R1-followup on #109: require strictly positive ttlMs. `ttlMs=0`
+    // makes the cache write-only (every read past the same-tick set
+    // expires) — useless and a rate-limit risk for the contact-API-
+    // backed name resolution.
+    if (opts.ttlMs <= 0) {
+      throw new Error(`TTLCache: ttlMs must be > 0, got ${opts.ttlMs}`);
     }
     this.maxSize = opts.maxSize;
     this.ttlMs = opts.ttlMs;
@@ -85,9 +89,22 @@ export class TTLCache<K, V> {
     this.map.set(key, { value, addedAt: this.nowFn() });
   }
 
+  /**
+   * Pure TTL-aware existence check (#109 R1-followup).
+   *
+   * Standard `Map.has` is read-only — a future contributor might write
+   * `if (cache.has(k)) cache.get(k)` and be surprised if the `has`
+   * silently lazy-evicted or (with `touchOnGet`) promoted the entry
+   * twice. Implementation only consults `addedAt`; no `delete`, no
+   * re-insert. The expired entry stays in the Map until the next
+   * `get`/`set`/`delete` call cleans it up — fine, it's a stale check
+   * not a sweep.
+   */
   has(key: K): boolean {
-    // Defer to get() so the TTL check fires.
-    return this.get(key) !== undefined;
+    const entry = this.map.get(key);
+    if (!entry) return false;
+    if (this.nowFn() - entry.addedAt > this.ttlMs) return false;
+    return true;
   }
 
   delete(key: K): boolean {

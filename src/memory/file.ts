@@ -751,11 +751,17 @@ export class MemoryStore {
    * bad file doesn't abort the rest. Empty per-chat dirs are left as
    * empty dirs (cheap, occasional readdir of an empty dir is fine).
    */
-  async pruneEpisodes(maxAgeMs: number, nowMs: number = Date.now()): Promise<{ removedFiles: number; bytesFreed: number }> {
+  async pruneEpisodes(maxAgeMs: number, nowMs: number = Date.now()): Promise<{ removedFiles: number; bytesFreed: number; skipped: number }> {
     const root = path.join(this.baseDir, 'episodes');
     const cutoff = nowMs - maxAgeMs;
     let removedFiles = 0;
     let bytesFreed = 0;
+    // R1-followup on #109: track files we tried to prune but couldn't
+    // (stat/unlink raced with delete, or EACCES). Pre-followup these
+    // were silently swallowed with no operator visibility — a perms-
+    // protected file would silently grow forever. Now surfaced in the
+    // return so the startup log can flag it.
+    let skipped = 0;
 
     // Recursive walker — handles both `episodes/<chat>/*.md` and
     // `episodes/<chat>/threads/<thread>/*.md` shapes.
@@ -782,7 +788,8 @@ export class MemoryStore {
           }
         } catch {
           // stat / unlink raced with a concurrent delete or hit EACCES.
-          // Best-effort; skip this file.
+          // Best-effort; skip this file but count for operator visibility.
+          skipped++;
         }
       }
     };
@@ -792,7 +799,7 @@ export class MemoryStore {
     } catch {
       // root readdir failed — no episodes dir. No-op.
     }
-    return { removedFiles, bytesFreed };
+    return { removedFiles, bytesFreed, skipped };
   }
 
   async listEpisodes(chatId: string): Promise<Episode[]> {

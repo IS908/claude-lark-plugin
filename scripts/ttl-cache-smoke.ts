@@ -131,27 +131,50 @@ const HOUR_MS = 60 * 60 * 1000;
   testNum++;
 }
 
-// 10. Invalid constructor args throw
+// 10. Invalid constructor args throw — R1-followup tightens ttlMs > 0
+//     (was ≥ 0 pre-followup). `ttlMs=0` was useless (write-only cache)
+//     and a rate-limit risk for the contact-API-backed nameCache.
 {
   let threw = 0;
   try { new TTLCache({ maxSize: 0, ttlMs: HOUR_MS }); } catch { threw++; }
   try { new TTLCache({ maxSize: -1, ttlMs: HOUR_MS }); } catch { threw++; }
   try { new TTLCache({ maxSize: 10, ttlMs: -1 }); } catch { threw++; }
-  if (threw !== 3) fail(`10: invalid args must throw, got ${threw}/3 throws`);
+  try { new TTLCache({ maxSize: 10, ttlMs: 0 }); } catch { threw++; }
+  if (threw !== 4) fail(`10: invalid args must throw, got ${threw}/4 throws`);
   testNum++;
 }
 
-// 11. ttlMs=0 → every read past the set returns undefined (deliberate
-//     "always expire" knob; not generally useful but the math should
-//     work consistently)
+// 11. R1-followup: has() is now PURE (no lazy evict, no touch). Pre-
+//     followup it delegated to get() which mutated the Map. A future
+//     contributor writing `if (cache.has(k)) cache.get(k)` would have
+//     unexpectedly double-promoted with touchOnGet=true, or double-
+//     evicted on expired entries.
 {
   let now = NOW;
-  const c = new TTLCache<string, string>({ maxSize: 10, ttlMs: 0, nowFn: () => now });
+  const c = new TTLCache<string, string>({
+    maxSize: 10,
+    ttlMs: HOUR_MS,
+    touchOnGet: true,
+    nowFn: () => now,
+  });
   c.set('a', 'alpha');
-  // Same tick — `now - addedAt === 0`, NOT > 0, so survives (strict >).
-  if (c.get('a') !== 'alpha') fail(`11: same-tick get with ttl=0 survives (strict >)`);
-  now = NOW + 1;
-  if (c.get('a') !== undefined) fail(`11: 1ms after set with ttl=0 expires`);
+  const sizeBefore = c.size;
+  // Multiple has() calls must not mutate
+  if (!c.has('a')) fail(`11: has on fresh entry`);
+  if (!c.has('a')) fail(`11: has on fresh entry (2nd call)`);
+  if (c.size !== sizeBefore) fail(`11: has must not mutate size`);
+
+  // Expired entry: has must return false but NOT evict (next get()
+  // will do that). Check that the underlying Map still holds the
+  // entry post-has.
+  now = NOW + HOUR_MS + 1;
+  if (c.has('a')) fail(`11: has on expired must return false`);
+  // Access internal map to verify no eviction happened (white-box test).
+  const internalMap = (c as any).map as Map<string, unknown>;
+  if (!internalMap.has('a')) fail(`11: has must not evict expired entries (saw eviction)`);
+  // get() does the eviction (lazy sweep)
+  c.get('a');
+  if (internalMap.has('a')) fail(`11: get() should evict the expired entry`);
   testNum++;
 }
 

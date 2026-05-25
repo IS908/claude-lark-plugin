@@ -438,10 +438,11 @@ async function main() {
       try {
         const ageMs = appConfig.episodeRetentionDays * 86_400_000;
         const r = await memoryStore.pruneEpisodes(ageMs);
-        if (r.removedFiles > 0) {
+        if (r.removedFiles > 0 || r.skipped > 0) {
           const mb = (r.bytesFreed / (1024 * 1024)).toFixed(2);
+          const skipPart = r.skipped > 0 ? ` (${r.skipped} skipped — stat/unlink failed)` : '';
           console.error(
-            `[episode-prune] removed ${r.removedFiles} stale episode file(s), freed ${mb}MB`,
+            `[episode-prune] removed ${r.removedFiles} stale episode file(s), freed ${mb}MB${skipPart}`,
           );
         }
       } catch (err) {
