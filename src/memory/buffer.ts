@@ -205,10 +205,32 @@ export class ConversationBuffer {
     } catch (err) {
       console.error(`[buffer] Flush failed for chat ${chatId}:`, err);
     } finally {
+      // #148 fix: cleanup INSIDE the finally so the gate-release is
+      // strictly the LAST step. Pre-fix shape was:
+      //   finally { flushing.delete }; buffers.delete; timers.delete
+      // The current V8 single-threaded execution model means there's
+      // no real yield window between `flushing.delete` and the next
+      // sync statement, so the race the issue describes is not
+      // exploitable today — BUT the contract is fragile. Any future
+      // refactor that adds an `await` between gate-release and
+      // cleanup (or a sync hook that fires during sync execution,
+      // e.g. a future async-hooks integration) would reopen a real
+      // window where a concurrent `record()` could pass the
+      // `flushing.has` guard, push to the live buffer, and then have
+      // its push wiped by the about-to-fire `buffers.delete`.
+      //
+      // Moving cleanup INSIDE finally makes the contract explicit:
+      // (1) wipe old buffer, (2) clear old timer, (3) release gate —
+      // strictly in that order, atomically as one sync block. A
+      // concurrent `record()` AFTER step 3 sees an empty Map and
+      // creates a fresh buffer/timer pair; its message survives.
+      // Also use `clearTimer()` instead of bare `timers.delete()` so
+      // the underlying setTimeout is actually cancelled (pre-fix the
+      // Map entry was dropped but the timeout fired and self-no-op'd,
+      // wasting a small amount of work).
+      this.buffers.delete(chatId);
+      this.clearTimer(chatId);
       this.flushing.delete(chatId);
     }
-
-    this.buffers.delete(chatId);
-    this.timers.delete(chatId);
   }
 }

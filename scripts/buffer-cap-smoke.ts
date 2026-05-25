@@ -273,4 +273,89 @@ let testNum = 0;
   testNum++;
 }
 
+// 10. #148 fix: atomic cleanup-and-release ordering. The pre-fix
+//     shape moved buffers.delete OUTSIDE the finally block, so a
+//     theoretical interleaving between gate-release and cleanup
+//     could lose a concurrent record(). V8 single-threaded JS makes
+//     this not exploitable today, but the fix codifies the contract:
+//     after triggerFlush returns, a fresh record() lands cleanly in
+//     a NEW buffer/timer pair (proves cleanup-then-release was
+//     atomic). Test exercises the full lifecycle.
+{
+  const buf = new ConversationBuffer({ maxMessages: 100 });
+  let flushCount = 0;
+  buf.setFlushHandler(async () => { flushCount++; });
+
+  buf.record('chat_cleanup', { role: 'user', senderId: 'u', text: 'a', timestamp: 't1' });
+  buf.record('chat_cleanup', { role: 'user', senderId: 'u', text: 'b', timestamp: 't2' });
+
+  await (buf as any).triggerFlush('chat_cleanup');
+  if (flushCount !== 1) fail(`10: flush should fire exactly once, got ${flushCount}`);
+
+  // Post-flush state: old buffer wiped, gate released
+  if (buf.getMessages('chat_cleanup').length !== 0) {
+    fail(`10: buffer should be empty post-flush, got ${buf.getMessages('chat_cleanup').length}`);
+  }
+  if ((buf as any).flushing.has('chat_cleanup')) {
+    fail(`10: flushing gate must be released post-flush`);
+  }
+  if ((buf as any).timers.has('chat_cleanup')) {
+    fail(`10: timer entry must be cleared post-flush`);
+  }
+
+  // A new record() now should land cleanly in a fresh buffer + arm a new timer.
+  buf.record('chat_cleanup', { role: 'user', senderId: 'u', text: 'fresh', timestamp: 't3' });
+  if (buf.getMessages('chat_cleanup').length !== 1) {
+    fail(`10: post-flush record() must create fresh entry, got ${buf.getMessages('chat_cleanup').length}`);
+  }
+  if (!(buf as any).timers.has('chat_cleanup')) {
+    fail(`10: post-flush record() must arm new timer`);
+  }
+
+  testNum++;
+}
+
+// 11. #148 fix: record() DURING a held flush is still dropped (the
+//     pre-existing re-entry guard preserved). Confirms the cleanup
+//     reordering didn't accidentally relax the during-flush drop
+//     semantics — flushing.delete is still LAST, so any record()
+//     before the finally completes hits the `flushing.has` guard.
+{
+  const buf = new ConversationBuffer({ maxMessages: 100 });
+  let flushResume!: () => void;
+  const flushBlock = new Promise<void>((r) => { flushResume = r; });
+  let flushHandlerEntered = false;
+  buf.setFlushHandler(async () => {
+    flushHandlerEntered = true;
+    await flushBlock;
+  });
+
+  buf.record('chat_drop', { role: 'user', senderId: 'u', text: 'a', timestamp: 't1' });
+
+  const flushP = (buf as any).triggerFlush('chat_drop');
+  await new Promise((r) => setImmediate(r));
+  if (!flushHandlerEntered) fail(`11: flush should have entered handler`);
+
+  // While the flush is held, record() must be dropped (existing contract).
+  buf.record('chat_drop', { role: 'user', senderId: 'u', text: 'during-flush', timestamp: 't2' });
+  // The dropped message must NOT appear in the buffer (still empty during flush)
+  if (buf.getMessages('chat_drop').length !== 1) {
+    // Note: buffer still has the ORIGINAL 'a' since cleanup hasn't fired yet
+    fail(`11: buffer should still have original during flush, got ${buf.getMessages('chat_drop').length}`);
+  }
+  if (buf.getMessages('chat_drop').some(m => m.text === 'during-flush')) {
+    fail(`11: during-flush record() must be dropped (not appear in buffer)`);
+  }
+
+  flushResume();
+  await flushP;
+
+  // Post-flush: original wiped, drop confirmed never landed
+  if (buf.getMessages('chat_drop').length !== 0) {
+    fail(`11: post-flush buffer should be empty, got ${buf.getMessages('chat_drop').length}`);
+  }
+
+  testNum++;
+}
+
 console.log(`buffer-cap smoke: ${testNum}/${testNum} PASS`);

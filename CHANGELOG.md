@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.47] - 2026-05-25
+
+### Fixed
+- **`ConversationBuffer.triggerFlush` cleanup-and-release ordering made atomic** (#148). Pre-fix the cleanup steps lived OUTSIDE the `finally` block:
+
+  ```ts
+  this.flushing.add(chatId);
+  try { await this.flushHandler(chatId, [...messages]); }
+  catch (err) { ... }
+  finally { this.flushing.delete(chatId); }  // gate released here
+  this.buffers.delete(chatId);               // …but cleanup runs AFTER
+  this.timers.delete(chatId);
+  ```
+
+  Theoretical race: between `flushing.delete` (gate released) and `buffers.delete`, a concurrent `record()` could pass the `flushing.has` guard, push to the still-live buffer, then have its push silently wiped by `buffers.delete`. **In practice, V8's single-threaded execution model means there is no real yield window between two consecutive sync statements** — once the await resumes, the finally block and the cleanup lines run as one atomic JS turn. The race is not exploitable today.
+
+  **So why fix it?** The contract is fragile. Any future refactor that adds an `await` between gate-release and cleanup (or a sync hook integration that observes mid-block state) would reopen a real window — and the failure mode is silent data loss, the hardest class to debug. Moving cleanup INSIDE `finally` makes the contract explicit and refactor-safe:
+
+  ```ts
+  finally {
+    this.buffers.delete(chatId);   // 1. wipe old buffer
+    this.clearTimer(chatId);        // 2. cancel + clear old timer
+    this.flushing.delete(chatId);   // 3. release gate LAST
+  }
+  ```
+
+  Also switched bare `this.timers.delete(chatId)` to `this.clearTimer(chatId)` — the helper additionally calls `clearTimeout`, so the underlying setTimeout is properly cancelled rather than leaked-then-self-no-op'd.
+
+### Added
+- Two new smoke tests in `scripts/buffer-cap-smoke.ts` (now 11 total):
+  - **Test 10**: post-flush state verification — `flushing` gate released, `buffers` entry wiped, `timers` entry cleared. A new `record()` post-flush lands cleanly in a fresh buffer+timer pair.
+  - **Test 11**: pre-existing re-entry guard preserved — `record()` during a held flush is dropped (the cleanup reorder didn't accidentally relax the during-flush drop semantics, since the gate is still released LAST).
+
+### Operator notes
+- **No behavior change in any reachable scenario.** This is a code-clarity / refactor-safety fix, not a bug fix for an observed symptom. Existing flush behavior — drop during flush, fresh state after — is identical.
+- **Marginal cleanup**: timers that previously self-no-op'd are now cancelled, saving a small amount of event-loop work in chats that flush via the cap-trigger path.
+- No data-format or storage changes.
+
+---
+
 ## [1.0.46] - 2026-05-25
 
 ### Fixed
