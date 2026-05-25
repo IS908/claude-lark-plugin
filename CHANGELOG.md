@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.41] - 2026-05-25
+
+### Fixed
+- **`searchSkills` / `searchEpisodes` matched keywords via bare substring → spurious recall** (#102 — **MEDIUM context pollution, invisible to user**). Both functions scored a hit via `haystack.includes(kw)` with no word-boundary check. Short keywords like `pi` matched `pipeline-deploy`, `api-gateway`, `apiary`; `go` matched `google`, `argo`; `api` matched `rapid-fix`. Result: unrelated skills/episodes injected into Claude's memory enrichment, wasting tokens AND misdirecting Claude's reasoning. Users couldn't see this — they only saw Claude reference a workflow that had no relation to their question.
+
+  Fix (length-threshold word-boundary, threading "too lenient" vs "too strict"):
+  - **ASCII keyword length ≤ 3** → require word boundary on BOTH sides (`\b...\b`). Catches the "pi vs pipeline" case the issue cited. Short tokens are noise-prone; demand exact word match.
+  - **ASCII keyword length ≥ 4** → require word boundary at start only (`\b...`). Preserves legitimate stem/prefix matches: `deploy` still matches `deployment-script`, `config` still matches `configuration`. Without this, the fix would have regressed user-meaningful stems.
+  - **Non-ASCII keyword (CJK, Cyrillic, etc.)** → substring match preserves existing behavior. `\b` is ASCII-defined; using it on Chinese chars would produce surprising results (no inter-character boundaries the way English has).
+
+  Also (Fix C in the issue's suggested approach): drop `file` / `filename` from the search haystack. `searchSkills` was scoring against `name + description + file` where `file` is just `sanitizeSkillSlug(name) + ".md"` — a derivative of `name` that doubles the surface and adds the literal token `md`. `searchEpisodes` was scoring against `firstLines + filename` where `filename` is a timestamp like `2026-05-25T14-30-00-000Z.md` — pure noise for keyword matching. Both surfaces now use semantic fields only.
+
+  Implemented as a new `MemoryStore.matchKeyword(haystack, kw): boolean` static method (pure, no `this` dependency) so tests can pin the contract directly. Both `searchSkills` and `searchEpisodes` call it instead of inlining `includes`.
+
+### Added
+- New `MemoryStore.matchKeyword` static method — pure word-boundary-aware keyword matcher with the length-threshold + ASCII/CJK split documented above.
+- New `scripts/search-precision-smoke.ts` (13 tests, wired into `scripts/test.sh`):
+  - Part A (4): short ASCII keywords no longer false-match (the bug — `pi` ≠ `pipeline`, `go` ≠ `google`, `api` ≠ `apiary`), but DO match genuine word boundaries (`raspberry pi`, `go programming`, `api-gateway`, `rapid-api`).
+  - Part B (2): long ASCII keywords PRESERVE prefix/stem match (`deploy` matches `deployment-script` / `deployable` / `deployment`; `config` matches `configuration` / `configurable` / `configfile`). Plus negative guards: no boundary-leading prefix match (`deploy` ≠ `redeploy`, `config` ≠ `misconfig`).
+  - Part C (3): non-ASCII (CJK + Cyrillic) keywords preserve substring semantics.
+  - Part D (4): edge cases — empty haystack, case-insensitivity, regex-metachar escape, end-to-end "Raspberry Pi vs pipeline-deploy" scenario from the issue.
+
+### Operator notes
+- No data-format or config changes; the cache/storage shape is identical. Only the search-time scoring changes.
+- Pre-#102 behavior: a chat where the user asks technical questions sees more skill/episode recalls because of the loose substring match. Post-fix: fewer false-positives → cleaner enrichment context → less token waste → less Claude misdirection.
+- If a previously-recalled skill stops being recalled after upgrade, check whether the keyword overlap was actually meaningful or was a spurious substring hit. Operators with legitimate stem-matching needs (keyword `deploy`, want to match `deployment-*`) keep working because the length-≥4 path preserves prefix matching.
+
 ## [1.0.40] - 2026-05-25
 
 ### Fixed

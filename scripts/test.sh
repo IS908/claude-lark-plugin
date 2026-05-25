@@ -155,4 +155,8 @@ echo "=== Buffer hard-cap unit checks ==="
 npx tsx scripts/buffer-cap-smoke.ts
 
 echo ""
+echo "=== Search precision (word-boundary) unit checks ==="
+npx tsx scripts/search-precision-smoke.ts
+
+echo ""
 echo "All tests passed."
