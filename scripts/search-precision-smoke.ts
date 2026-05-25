@@ -191,4 +191,38 @@ let testNum = 0;
   testNum++;
 }
 
+// ── Part E: R2-followup hardening ──
+
+// 14. Empty keyword returns false (was true pre-followup: regex `\b\b`
+//     matches everything; `''.includes('')` is true). Production
+//     unreachable via extractKeywords' length>1 filter, but the
+//     exported static API gets an explicit guard.
+{
+  if (MemoryStore.matchKeyword('any haystack here', '')) {
+    fail(`14: empty kw must return false (defense-in-depth)`);
+  }
+  if (MemoryStore.matchKeyword('', '')) {
+    fail(`14b: empty kw + empty haystack must return false`);
+  }
+  testNum++;
+}
+
+// 15. Underscore semantics — matchKeyword itself does NOT normalize
+//     `_` (the search SITES do); this codifies that contract.
+//     `\bapi\b` against `api_gateway` → false (underscore is a word
+//     char in regex). Search sites pre-normalize via `.replace(/_/g, ' ')`
+//     so production calls see `api gateway` and match correctly.
+{
+  // Raw matchKeyword: underscore is word char → no boundary inside
+  if (MemoryStore.matchKeyword('api_gateway flow', 'api')) {
+    fail(`15: raw matchKeyword does NOT cross underscore (this is documented)`);
+  }
+  // After search-site normalization, the haystack becomes `api gateway flow`
+  const normalized = 'api_gateway flow'.replace(/_/g, ' ');
+  if (!MemoryStore.matchKeyword(normalized, 'api')) {
+    fail(`15: after underscore→space normalization, api matches api_gateway`);
+  }
+  testNum++;
+}
+
 console.log(`search-precision smoke: ${testNum}/${testNum} PASS`);

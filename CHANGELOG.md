@@ -26,10 +26,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - Part C (3): non-ASCII (CJK + Cyrillic) keywords preserve substring semantics.
   - Part D (4): edge cases — empty haystack, case-insensitivity, regex-metachar escape, end-to-end "Raspberry Pi vs pipeline-deploy" scenario from the issue.
 
+### R2-audit followups (closed in this PR)
+- **`matchKeyword('', '')` empty-kw guard** — pre-followup, empty kw matched everything (`\b` regex matches at any word boundary; `''.includes('')` is always true). Production-unreachable via `extractKeywords` (filters `length > 1`), but the static API is exported. Added explicit `if (!kw) return false;` at the top — trivial cost, eliminates the failure mode regardless of caller hygiene. Test 14 codifies.
+- **Underscore-as-separator asymmetry** — `\b` treats `_` as a word char in regex, so `\bapi\b` matched `api-gateway` but NOT `api_gateway`. Skill slugs are sanitized to hyphens, but LLM-distilled episode prose often contains underscore-separated identifiers (`api_gateway_setup`, `my_var`). Fixed by pre-normalizing `_` → ` ` at both search sites (NOT in `matchKeyword` — keeps the static-API contract pure). Test 15 codifies both layers.
+
+### Known limitations / forward links
+- **`searchEpisodes` has no `score > 0` gate** (pre-existing): all scored episodes are pushed, sorted, sliced. With `recencyScore = max(0, 1 - ageDays/30)`, a 9-day-old episode scores 0.7 on recency — clearing `LARK_MIN_SEARCH_SCORE` (default 0.3) **with zero keyword overlap**. Post-#102 this is materially more pronounced because the stricter matcher zeros out more keyword scores, leaving recency to dominate. This is the symptom tracked by **#100** (memory enrichment empty-keyword recency-only injection + no per-episode size cap); #102 amplifies it without introducing the underlying bug. #100 is the natural next target.
+
 ### Operator notes
 - No data-format or config changes; the cache/storage shape is identical. Only the search-time scoring changes.
 - Pre-#102 behavior: a chat where the user asks technical questions sees more skill/episode recalls because of the loose substring match. Post-fix: fewer false-positives → cleaner enrichment context → less token waste → less Claude misdirection.
 - If a previously-recalled skill stops being recalled after upgrade, check whether the keyword overlap was actually meaningful or was a spurious substring hit. Operators with legitimate stem-matching needs (keyword `deploy`, want to match `deployment-*`) keep working because the length-≥4 path preserves prefix matching.
+- **Underscore identifiers**: search-site normalization makes `api_gateway` searchable as `api gateway`. If you had skills relying on the OLD `\b`-blocked-by-underscore behavior (rare — would require deliberately wanting `api` to NOT match `api_gateway`), they'll surface differently.
 
 ## [1.0.40] - 2026-05-25
 

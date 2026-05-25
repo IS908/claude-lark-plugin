@@ -678,7 +678,11 @@ export class MemoryStore {
         // (Fix C): drop filename — episode filenames are timestamps
         // (`2026-05-25T14-30-00-000Z.md`) which can't meaningfully
         // match human keywords; including them just adds noise tokens.
-        const firstLines = content.split('\n').slice(0, 3).join(' ').toLowerCase();
+        //
+        // R2-followup: normalize `_` → ` ` (same rationale as
+        // searchSkills) so underscore-separated identifiers in
+        // LLM-distilled episode prose surface correctly.
+        const firstLines = content.split('\n').slice(0, 3).join(' ').toLowerCase().replace(/_/g, ' ');
         let keywordScore = 0;
         for (const kw of keywords) {
           // #102 fix (Fix A): word-boundary aware via matchKeyword.
@@ -876,7 +880,16 @@ export class MemoryStore {
         // that just doubles the surface for spurious substring hits
         // and adds the literal token "md". `name` + `description`
         // carry all the user-meaningful signal.
-        const searchText = `${name} ${description}`.toLowerCase();
+        //
+        // R2-followup: normalize `_` → ` ` so identifier-style words
+        // like `api_gateway_setup` match keyword `api` the same way
+        // `api-gateway-setup` does. Pre-followup `\b` treated `_` as
+        // a word char (no boundary inside `api_gateway`), so the
+        // hyphen-vs-underscore asymmetry silently dropped recall on
+        // underscore-separated identifiers (common in Python/Go/
+        // config code that LLM-distilled skill descriptions often
+        // contain).
+        const searchText = `${name} ${description}`.toLowerCase().replace(/_/g, ' ');
         for (const kw of keywords) {
           // #102 fix (Fix A): word-boundary aware via matchKeyword.
           // Pre-fix `searchText.includes(kw)` matched any substring.
@@ -1258,6 +1271,13 @@ export class MemoryStore {
    * directly without round-tripping through searchSkills/Episodes.
    */
   static matchKeyword(haystack: string, kw: string): boolean {
+    // R2-followup defense-in-depth: extractKeywords filters length>1,
+    // so production never passes empty kw. But matchKeyword is
+    // exported as a static API contract — an external caller passing
+    // empty string would otherwise match everything (`/\b/i.test()`
+    // succeeds on any haystack with a word boundary, OR
+    // `haystack.includes('')` is always true). Reject explicitly.
+    if (!kw) return false;
     // ASCII word-like (alphanumeric + underscore + hyphen) → use
     // word-boundary regex. The kw was already lowercased by
     // extractKeywords; the haystack is lowercased at the search site.
