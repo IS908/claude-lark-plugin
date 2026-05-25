@@ -735,6 +735,66 @@ export class MemoryStore {
     await fs.writeFile(path.join(dir, fileName), content, 'utf-8');
   }
 
+  /**
+   * Retention prune for episode files (#109). `saveEpisode` writes one
+   * `.md` per buffer flush; `listEpisodes` / `searchEpisodes` then do
+   * `readdir + per-file score` on every memory enrichment, so cost is
+   * O(N) per inbound message. Without prune N grows monotonically —
+   * search becomes the slow path before disk fills.
+   *
+   * Walks every chat directory under `episodes/` and unlinks files
+   * whose mtime is older than `maxAgeMs`. Subdirectories (chat threads
+   * live under `episodes/<chat>/threads/<thread>/`) are recursed.
+   *
+   * Returns {removedFiles, bytesFreed} for observability + tests.
+   * Best-effort throughout: unlink/stat failures are swallowed so one
+   * bad file doesn't abort the rest. Empty per-chat dirs are left as
+   * empty dirs (cheap, occasional readdir of an empty dir is fine).
+   */
+  async pruneEpisodes(maxAgeMs: number, nowMs: number = Date.now()): Promise<{ removedFiles: number; bytesFreed: number }> {
+    const root = path.join(this.baseDir, 'episodes');
+    const cutoff = nowMs - maxAgeMs;
+    let removedFiles = 0;
+    let bytesFreed = 0;
+
+    // Recursive walker — handles both `episodes/<chat>/*.md` and
+    // `episodes/<chat>/threads/<thread>/*.md` shapes.
+    const walk = async (dir: string): Promise<void> => {
+      let entries: import('node:fs').Dirent[];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return; // dir gone — benign
+      }
+      for (const e of entries) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          await walk(p);
+          continue;
+        }
+        if (!e.isFile() || !e.name.endsWith('.md')) continue;
+        try {
+          const s = await fs.stat(p);
+          if (s.mtimeMs < cutoff) {
+            await fs.unlink(p);
+            removedFiles++;
+            bytesFreed += s.size;
+          }
+        } catch {
+          // stat / unlink raced with a concurrent delete or hit EACCES.
+          // Best-effort; skip this file.
+        }
+      }
+    };
+
+    try {
+      await walk(root);
+    } catch {
+      // root readdir failed — no episodes dir. No-op.
+    }
+    return { removedFiles, bytesFreed };
+  }
+
   async listEpisodes(chatId: string): Promise<Episode[]> {
     assertSafeKey(chatId, 'chatId');
     const dir = path.join(this.baseDir, 'episodes', chatId);

@@ -10,9 +10,11 @@
  * Best-effort: log failures never propagate out of this module (would be
  * worse to crash a tool call because of a log I/O issue).
  */
-import { appendFile, mkdir } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { appendWithRotationSync } from './log-rotation.js';
+import { appConfig } from './config.js';
 
 const DEFAULT_PATH = join(homedir(), '.claude', 'channels', 'lark', 'audit.log');
 
@@ -50,7 +52,11 @@ export async function audit(
 
     const path = resolvePath();
     await mkdir(dirname(path), { recursive: true });
-    await appendFile(path, line, 'utf8');
+    // #109 fix: rotate at LARK_LOG_MAX_BYTES (default 50MB). Pre-fix
+    // audit.log grew without bound. Uses the sync helper here even
+    // though the surrounding flow is async — the rotation check is
+    // cheap (one stat) and keeps the failure modes obvious.
+    appendWithRotationSync(path, line, appConfig.logMaxBytes);
   } catch {
     // Silent — log failures should never affect tool behavior.
   }

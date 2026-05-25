@@ -142,6 +142,33 @@ export const appConfig = {
   inboxMaxSizeMB: optionalNumber('LARK_INBOX_MAX_SIZE_MB', 500),
   inboxGcIntervalMin: optionalNumber('LARK_INBOX_GC_INTERVAL_MIN', 60),
   inboxGcDisabled: (process.env.LARK_INBOX_GC_DISABLED ?? '').toLowerCase() === 'true',
+
+  // Daemon hygiene (#109). The bot's in-memory caches and append-only
+  // log files grew without bound pre-v1.0.36. These tunables bound
+  // each surface; defaults are sized for a typical org-wide bot
+  // (thousands of users / hundreds of chats / multi-week deployment).
+  //
+  // nameCache: open_id / chat_id → display name. ~50 bytes/entry; 2000
+  // entries ≈ 100KB. 24h TTL is generous — names rarely change within
+  // a day, and a re-resolution miss costs one Feishu contact API call.
+  nameCacheTtlHours: optionalNumber('LARK_NAME_CACHE_TTL_HOURS', 24),
+  nameCacheSize: optionalNumber('LARK_NAME_CACHE_SIZE', 2000),
+  // chatTypeCache: chat_id → 'p2p' | 'group'. Even smaller per entry.
+  // Larger cap because a Slack-scale deployment can have many channels.
+  chatTypeCacheTtlHours: optionalNumber('LARK_CHAT_TYPE_CACHE_TTL_HOURS', 24),
+  chatTypeCacheSize: optionalNumber('LARK_CHAT_TYPE_CACHE_SIZE', 5000),
+  // Log rotation: single rotated copy (`<file>.1`). Effective on-disk
+  // cap is ~2 × maxBytes per log. 50MB default × 2 × 3 logs = 300MB
+  // worst case, which is much smaller than the pre-fix multi-GB growth.
+  logMaxBytes: optionalNumber('LARK_LOG_MAX_BYTES', 50 * 1024 * 1024),
+  // Episode retention. saveEpisode writes one .md per buffer flush;
+  // listEpisodes / searchEpisodes do `readdir + per-file score` so cost
+  // is O(N) per enrichment — prune keeps the search amortized. 180 days
+  // is generous (half-year history); operator can shorten for tighter
+  // privacy or extend for archival.
+  episodeRetentionDays: optionalNumber('LARK_EPISODE_RETENTION_DAYS', 180),
+  episodePruneIntervalMin: optionalNumber('LARK_EPISODE_PRUNE_INTERVAL_MIN', 1440),
+  episodePruneDisabled: (process.env.LARK_EPISODE_PRUNE_DISABLED ?? '').toLowerCase() === 'true',
 } as const;
 
 export type AppConfig = typeof appConfig;

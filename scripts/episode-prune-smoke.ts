@@ -1,0 +1,142 @@
+/**
+ * Episode prune smoke test (v1.0.36, closes #109 part 3).
+ *
+ * Exercises `MemoryStore.pruneEpisodes(maxAgeMs)` end-to-end. Creates
+ * a tmp episodes directory, seeds with fresh + stale `.md` files
+ * (using `utimesSync` for deterministic mtimes), runs prune, asserts
+ * the right files survived.
+ */
+process.env.LARK_APP_ID = process.env.LARK_APP_ID ?? 'cli_test_app_id';
+process.env.LARK_APP_SECRET = process.env.LARK_APP_SECRET ?? 'test_secret';
+
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  existsSync,
+  utimesSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { MemoryStore } from '../src/memory/file.js';
+
+function fail(msg: string): never {
+  console.error(`FAIL: ${msg}`);
+  process.exit(1);
+}
+
+const tmp = mkdtempSync(join(tmpdir(), 'episode-prune-'));
+const DAY_MS = 86_400_000;
+const NOW = 1_700_000_000_000;
+
+let testNum = 0;
+const store = new MemoryStore(tmp);
+
+function seedEpisode(chatId: string, name: string, ageMs: number, content = '# episode\n'): string {
+  const dir = join(tmp, 'episodes', chatId);
+  mkdirSync(dir, { recursive: true });
+  const p = join(dir, name);
+  writeFileSync(p, content);
+  const t = (NOW - ageMs) / 1000;
+  utimesSync(p, t, t);
+  return p;
+}
+
+function seedThreadEpisode(chatId: string, threadId: string, name: string, ageMs: number): string {
+  const dir = join(tmp, 'episodes', chatId, 'threads', threadId);
+  mkdirSync(dir, { recursive: true });
+  const p = join(dir, name);
+  writeFileSync(p, '# thread episode\n');
+  const t = (NOW - ageMs) / 1000;
+  utimesSync(p, t, t);
+  return p;
+}
+
+try {
+  // 1. Missing episodes dir → no throw, all-zeros result
+  {
+    const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+    if (r.removedFiles !== 0) fail(`1: missing dir should return 0 removed, got ${r.removedFiles}`);
+    if (r.bytesFreed !== 0) fail(`1: missing dir should return 0 bytes, got ${r.bytesFreed}`);
+    testNum++;
+  }
+
+  // 2. Age expiry: stale episode deleted, fresh kept
+  {
+    const stale = seedEpisode('oc_test2', 'old.md', 200 * DAY_MS);
+    const fresh = seedEpisode('oc_test2', 'new.md', 30 * DAY_MS);
+    const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+    if (r.removedFiles !== 1) fail(`2: expected 1 removed, got ${r.removedFiles}`);
+    if (existsSync(stale)) fail(`2: stale must be unlinked`);
+    if (!existsSync(fresh)) fail(`2: fresh must survive`);
+    testNum++;
+  }
+
+  // 3. Recursive walk hits chat thread episodes too
+  {
+    const stale = seedEpisode('oc_test3', 'top-old.md', 200 * DAY_MS);
+    const staleThread = seedThreadEpisode('oc_test3', 'thr_x', 'old.md', 200 * DAY_MS);
+    const freshThread = seedThreadEpisode('oc_test3', 'thr_x', 'new.md', 1 * DAY_MS);
+    const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+    if (r.removedFiles !== 2) fail(`3: should remove top+thread stale, got ${r.removedFiles}`);
+    if (existsSync(stale)) fail(`3: top stale gone`);
+    if (existsSync(staleThread)) fail(`3: thread stale gone`);
+    if (!existsSync(freshThread)) fail(`3: thread fresh survives`);
+    testNum++;
+  }
+
+  // 4. Multiple chats — each pruned independently
+  {
+    const a1 = seedEpisode('oc_chatA', 'a1.md', 200 * DAY_MS);
+    const a2 = seedEpisode('oc_chatA', 'a2.md', 1 * DAY_MS);
+    const b1 = seedEpisode('oc_chatB', 'b1.md', 200 * DAY_MS);
+    const b2 = seedEpisode('oc_chatB', 'b2.md', 1 * DAY_MS);
+    const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+    if (r.removedFiles !== 2) fail(`4: 2 stales across 2 chats, got ${r.removedFiles}`);
+    if (existsSync(a1) || existsSync(b1)) fail(`4: both stales should be gone`);
+    if (!existsSync(a2) || !existsSync(b2)) fail(`4: both fresh should survive`);
+    testNum++;
+  }
+
+  // 5. Boundary: file exactly at retention age is KEPT (strict <)
+  {
+    const exactly = seedEpisode('oc_boundary', 'exactly.md', 180 * DAY_MS);
+    const justOver = seedEpisode('oc_boundary', 'just-over.md', 180 * DAY_MS + 1);
+    const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+    if (!existsSync(exactly)) fail(`5: exactly-at-threshold must survive (strict <)`);
+    if (existsSync(justOver)) fail(`5: just-over-threshold must be removed`);
+    if (r.removedFiles !== 1) fail(`5: only the over should be removed, got ${r.removedFiles}`);
+    testNum++;
+  }
+
+  // 6. Non-.md files in the episodes dir are NOT touched
+  {
+    const stale = seedEpisode('oc_nonmd', 'old.md', 200 * DAY_MS);
+    const nonMd = join(tmp, 'episodes', 'oc_nonmd', 'something.txt');
+    writeFileSync(nonMd, 'not an episode');
+    const t = (NOW - 200 * DAY_MS) / 1000;
+    utimesSync(nonMd, t, t); // stale too
+    const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+    if (existsSync(stale)) fail(`6: stale .md should be gone`);
+    if (!existsSync(nonMd)) fail(`6: non-.md file must survive even if stale-aged`);
+    testNum++;
+  }
+
+  // 7. bytesFreed accounting matches sum of removed file sizes
+  {
+    const big = seedEpisode('oc_bytes', 'big.md', 200 * DAY_MS, 'A'.repeat(5000));
+    const small = seedEpisode('oc_bytes', 'small.md', 200 * DAY_MS, 'B'.repeat(100));
+    seedEpisode('oc_bytes', 'fresh.md', 1 * DAY_MS, 'fresh'); // not removed
+    const r = await store.pruneEpisodes(180 * DAY_MS, NOW);
+    if (r.removedFiles !== 2) fail(`7: expected 2 removed, got ${r.removedFiles}`);
+    if (r.bytesFreed !== 5100) fail(`7: bytesFreed must equal sum of removed sizes, got ${r.bytesFreed}`);
+    if (existsSync(big) || existsSync(small)) fail(`7: stale files should be gone`);
+    testNum++;
+  }
+} finally {
+  rmSync(tmp, { recursive: true, force: true });
+}
+
+console.log(`episode-prune smoke: ${testNum}/${testNum} PASS`);
