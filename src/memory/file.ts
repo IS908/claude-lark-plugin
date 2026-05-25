@@ -224,11 +224,24 @@ export class MemoryStore {
     this.profileMutex.set(userId, tail);
     // Cleanup: delete the entry when this call's tail resolves AND no
     // later call has chained on top. Prevents unbounded Map growth.
-    tail.then(() => {
-      if (this.profileMutex.get(userId) === tail) {
-        this.profileMutex.delete(userId);
-      }
-    });
+    //
+    // R1-followup belt-and-suspenders: tail is already constructed with
+    // both .then handlers returning undefined (lines just above) so it
+    // can never reject — but a future contributor refactoring this
+    // file might inadvertently swap `tail` for `next` here, which would
+    // produce unhandled rejections every time fn() rejects. The
+    // explicit .catch closes that hole.
+    tail.then(
+      () => {
+        if (this.profileMutex.get(userId) === tail) {
+          this.profileMutex.delete(userId);
+        }
+      },
+      () => {
+        // Unreachable today (tail handlers above always resolve),
+        // belt-and-suspenders only.
+      },
+    );
     return next;
   }
 
@@ -380,8 +393,75 @@ export class MemoryStore {
     mode: 'append' | 'replace' = 'append',
   ): Promise<void> {
     // #54 fix: serialize cross-chat concurrent writes for the same userId.
+    // INVARIANT: anything inside this closure must NOT recurse back into
+    // saveProfile / saveProfileTiered / removeProfileLine for the same
+    // userId — would deadlock the per-user mutex.
     return this.withProfileMutex(userId, async () => {
       await this._saveProfileLocked(userId, content, tier, mode);
+    });
+  }
+
+  /**
+   * Atomic dual-tier replace (#54 R1-followup). The `profile_tiered` path
+   * (called from `tools.ts:save_memory(type='profile_tiered')` and the
+   * auto-flush distillation flow) needs to REPLACE both `public.md` and
+   * `private.md` from a single fresh read of recent history. Pre-followup
+   * this was two separate `saveProfile(...,'replace')` calls — each grabbed
+   * the per-user mutex independently, so a CROSS-CHAT save between the two
+   * calls could land mid-pair (after public-replace but before private-
+   * replace), then be silently clobbered by the private-replace. The dual
+   * write was NOT atomic from a same-user-cross-chat concurrency
+   * perspective even with the #54 fix.
+   *
+   * This method does both writes inside ONE `withProfileMutex` invocation,
+   * so the public+private pair is observable as atomic to any other
+   * concurrent same-user save / remove.
+   *
+   * Inputs are pre-formatted strings (caller does the JSON parse + bullet
+   * formatting; we don't re-parse). L1 safety net is re-applied to the
+   * public tier as defense-in-depth — even though `parseTieredProfile`
+   * already classified, a future caller bypassing parseTieredProfile
+   * would still get the L1 protection.
+   */
+  async saveProfileTiered(
+    userId: string,
+    content: { public: string; private: string },
+  ): Promise<void> {
+    return this.withProfileMutex(userId, async () => {
+      await this.migrateIfNeeded(userId);
+
+      // L1 safety net (defense-in-depth — see saveProfile's analogous
+      // path at lines 408-440). Lines that pass parseTieredProfile but
+      // L1 thinks are private get moved into the replacement private
+      // content here, not appended on top of existing private — because
+      // the caller's intent is REPLACE of both tiers.
+      const publicLines = content.public.split('\n');
+      const safePublic: string[] = [];
+      const redirected: string[] = [];
+      for (const line of publicLines) {
+        if (line.trim() && applyL1(line) === 'private') {
+          redirected.push(line);
+        } else {
+          safePublic.push(line);
+        }
+      }
+      if (redirected.length > 0) {
+        console.error(
+          `[memory] L1 safety net (saveProfileTiered): redirected ${redirected.length} line(s) ` +
+          `from public to private for ${userId} (LLM-classified public but L1 matched private rules).`,
+        );
+      }
+      const sep =
+        content.private && !content.private.endsWith('\n') ? '\n' : '';
+      const finalPrivate =
+        redirected.length > 0
+          ? content.private + sep + redirected.join('\n')
+          : content.private;
+
+      // Atomic pair INSIDE the single mutex acquisition. No other
+      // same-user save / remove can interleave between these two writes.
+      await this._writeProfileTier(userId, 'public', safePublic.join('\n'), 'replace');
+      await this._writeProfileTier(userId, 'private', finalPrivate, 'replace');
     });
   }
 
@@ -541,6 +621,10 @@ export class MemoryStore {
     // writeFile`) and the same cross-chat race window: a forget_memory
     // in chat A concurrent with a save_memory in chat B for the same
     // user would lose the save's delta if forget's write landed last.
+    //
+    // INVARIANT: anything inside this closure must NOT recurse back into
+    // saveProfile / saveProfileTiered / removeProfileLine for the same
+    // ownerId — would deadlock the per-user mutex.
     return this.withProfileMutex(ownerId, async () => {
       const lines = await this.listProfileLines(ownerId, tier);
       const targets = lines.filter((l) => l.hash === hash);

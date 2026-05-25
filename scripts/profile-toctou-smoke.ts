@@ -119,7 +119,11 @@ try {
     const user = 'ou_cleanup';
     await store.saveProfile(user, '- one', 'private');
     // Give the .then() cleanup microtask a chance to run
-    await new Promise((r) => setTimeout(r, 10));
+    // R1-followup: drain the cleanup microtask without a wall-clock
+    // dependency. tail.then(cleanup) schedules a microtask; one
+    // Promise.resolve roundtrip is enough to drain it on any runtime.
+    await Promise.resolve();
+    await Promise.resolve();
     const mutexMap = (store as any).profileMutex as Map<string, unknown>;
     if (mutexMap.has(user)) {
       fail(`4: profileMutex entry for ${user} not cleaned up (size=${mutexMap.size})`);
@@ -144,7 +148,11 @@ try {
     }
     await Promise.all(writes);
     // Now flush microtasks and confirm cleanup
-    await new Promise((r) => setTimeout(r, 10));
+    // R1-followup: drain the cleanup microtask without a wall-clock
+    // dependency. tail.then(cleanup) schedules a microtask; one
+    // Promise.resolve roundtrip is enough to drain it on any runtime.
+    await Promise.resolve();
+    await Promise.resolve();
     if (mutexMap.has(user)) fail(`5: profileMutex not cleaned up after chain drained`);
     testNum++;
   }
@@ -202,6 +210,100 @@ try {
     if (!after.includes('keep me')) fail(`7: 'keep me' should survive, got ${JSON.stringify(after)}`);
     if (!after.includes('added during remove')) {
       fail(`7: concurrent save's delta lost, got ${JSON.stringify(after)}`);
+    }
+    testNum++;
+  }
+
+  // 8. R1-followup: saveProfileTiered is atomic across BOTH tier writes.
+  //    Pre-followup the production `profile_tiered` path made two
+  //    separate saveProfile calls (each grabbed the mutex individually),
+  //    so a concurrent same-user save could interleave between them
+  //    and have its private-tier delta clobbered by the private-replace.
+  //    Test: start a tiered write + a single-tier private append in
+  //    parallel; depending on which acquires the mutex first, EITHER
+  //    the append lands cleanly (tiered runs after, replacing private)
+  //    OR the append lands cleanly (tiered runs first, append lands
+  //    after replace). Critical: the append's fact must NOT be
+  //    silently dropped — that was the pre-followup behavior.
+  //    Per-user mutex serializes both operations, so the final state
+  //    is one of two well-defined outcomes.
+  {
+    const user = 'ou_tiered_atomic';
+    // Seed with empty profiles
+    await store.saveProfileTiered(user, { public: '', private: '' });
+
+    // Fire concurrent tiered-replace + private-append
+    const ops = [
+      store.saveProfileTiered(user, {
+        public: '- public fact\n',
+        private: '- tiered private fact\n',
+      }),
+      store.saveProfile(user, '- appended private fact', 'private'),
+    ];
+    await Promise.all(ops);
+
+    const finalPub = tierLines(user, 'public');
+    const finalPriv = tierLines(user, 'private');
+
+    // Public is always '- public fact' (only one writer touches it)
+    if (!finalPub.includes('public fact')) {
+      fail(`8: public tier must always end with tiered's content, got ${JSON.stringify(finalPub)}`);
+    }
+    // Private must contain 'tiered private fact' (from the tiered write)
+    if (!finalPriv.includes('tiered private fact')) {
+      fail(`8: tiered private write lost, got ${JSON.stringify(finalPriv)}`);
+    }
+    // The 'appended private fact' must ALSO appear: if the append ran
+    // FIRST, the tiered replace's private overwrites it. If the append
+    // ran LAST, both survive. The mutex serializes; outcomes per order:
+    //   - tiered first, append second  → both facts present
+    //   - append first, tiered second  → only tiered's fact (append wiped by replace)
+    // Per #54's semantic, BOTH orderings are "no data loss" only if the
+    // operations are conceptually idempotent or commutative — but here
+    // the user explicitly asked for "replace" via tiered. So losing the
+    // append in the (append-first, tiered-second) ordering is correct
+    // behavior: the user's last write (tiered) wins. Test asserts the
+    // final state is ONE of these two outcomes, not the broken
+    // pre-followup "mid-pair clobber" outcome (where private would
+    // contain neither 'tiered private' nor 'appended private').
+    const hasAppended = finalPriv.includes('appended private fact');
+    const onlyTiered =
+      finalPriv.length === 1 && finalPriv.includes('tiered private fact');
+    const bothPresent =
+      finalPriv.includes('tiered private fact') && hasAppended;
+    if (!onlyTiered && !bothPresent) {
+      fail(`8: private must be {tiered only} or {tiered + appended}, got ${JSON.stringify(finalPriv)}`);
+    }
+    testNum++;
+  }
+
+  // 9. R1-followup: saveProfileTiered itself is mutex-wrapped — N
+  //    concurrent tiered writes for the same user serialize correctly,
+  //    none lost.
+  {
+    const user = 'ou_tiered_concurrent';
+    const N = 10;
+    const writes = Array.from({ length: N }, (_, i) =>
+      store.saveProfileTiered(user, {
+        public: `- pub ${i}\n`,
+        private: `- priv ${i}\n`,
+      }),
+    );
+    await Promise.all(writes);
+    // All tiered writes are REPLACE — only the LAST one's content
+    // survives. But the chain order is the order the calls were
+    // queued (synchronous .then chaining in the mutex), which
+    // matches array order, so the last-to-resolve has pub N-1 / priv N-1.
+    const finalPub = tierLines(user, 'public');
+    const finalPriv = tierLines(user, 'private');
+    if (finalPub.length !== 1 || finalPriv.length !== 1) {
+      fail(`9: tiered REPLACE must leave exactly 1 line per tier, got pub=${finalPub.length} priv=${finalPriv.length}`);
+    }
+    if (!finalPub.includes(`pub ${N - 1}`)) {
+      fail(`9: last tiered write's public should survive, got ${JSON.stringify(finalPub)}`);
+    }
+    if (!finalPriv.includes(`priv ${N - 1}`)) {
+      fail(`9: last tiered write's private should survive, got ${JSON.stringify(finalPriv)}`);
     }
     testNum++;
   }

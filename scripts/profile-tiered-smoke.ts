@@ -73,8 +73,14 @@ async function applyTieredProfile(store: MemoryStore, userId: string, json: stri
       .map((line) => (line.startsWith('-') ? line : `- ${line}`))
       .join('\n') +
     (arr.some((s) => oneLine(s).length > 0) ? '\n' : '');
-  await store.saveProfile(userId, fmt(tiered.public), 'public', 'replace');
-  await store.saveProfile(userId, fmt(tiered.private), 'private', 'replace');
+  // v1.0.34 (R1-followup on #54): mirror tools.ts's switch to
+  // saveProfileTiered for the atomic-pair write. Pre-followup these
+  // were two separate saveProfile calls; the test still exercises the
+  // same end-to-end behavior, now under one mutex acquisition.
+  await store.saveProfileTiered(userId, {
+    public: fmt(tiered.public),
+    private: fmt(tiered.private),
+  });
   return {};
 }
 
