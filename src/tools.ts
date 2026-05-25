@@ -342,13 +342,30 @@ export function registerTools(
    * #85 invariant preserved: silent no-op on no-exact-match with a
    * stderr breadcrumb (NOT bulk-wipe; that was the original #85 bug).
    *
-   * #136 fix: when no entry is found, also `markPendingAckRevoke` on
-   * the channel so the deferred ack-create `.then()` handler — if
-   * still in flight — deletes the reaction immediately instead of
-   * recording it. Closes the set-vs-revoke race for fast bots
-   * whose reply turn outpaces the ack-create HTTP round-trip.
+   * #136 fix: when no entry is found AND `markIfMissing` is true,
+   * `markPendingAckRevoke` on the channel so the deferred ack-create
+   * `.then()` handler — if still in flight — deletes the reaction
+   * immediately instead of recording it. Closes the set-vs-revoke
+   * race for fast bots whose reply turn outpaces the ack-create HTTP
+   * round-trip.
+   *
+   * `markIfMissing` is FALSE by default and is opted into ONLY by
+   * `reply` (where `reply_to` is guaranteed to be the inbound user
+   * message id — race protection is correctly targeted). React and
+   * download_attachment leave it OFF: their `message_id` parameter
+   * can legitimately point at a BOT message (Claude reacting to its
+   * own previous card) or any other id, and marking those pending
+   * would leak entries into the FIFO-capped Set — under sustained
+   * react-to-bot workload the legit reply-side marks would get
+   * evicted before their ack-create `.then()` lands, re-opening
+   * the original #136 stuck-MeMeMe symptom. R1-followup tracked in
+   * #159 for a smarter inbound-id-aware variant.
    */
-  function revokeAckFor(messageId: string, callerLabel: string = 'reply'): void {
+  function revokeAckFor(
+    messageId: string,
+    callerLabel: string = 'reply',
+    markIfMissing: boolean = false,
+  ): void {
     if (!ackReactions) return;
     if (!messageId) {
       // No id to target. Pre-#136 this was an early return when the
@@ -364,12 +381,20 @@ export function registerTools(
     }
     const entry = ackReactions.get(messageId);
     if (!entry) {
-      // #136: mark as pending so a deferred ack lands → delete, not store.
-      channel.markPendingAckRevoke(messageId);
-      console.error(
-        `[${callerLabel}] revokeAckFor: no ack for message_id=${messageId} yet ` +
-        `(marked pending-revoke; ${ackReactions.size} other ack(s) left intact)`,
-      );
+      if (markIfMissing) {
+        // #136: mark as pending so a deferred ack lands → delete, not store.
+        // Only fires when caller has high confidence that `messageId` IS
+        // the inbound user message id (currently: reply only).
+        channel.markPendingAckRevoke(messageId);
+        console.error(
+          `[${callerLabel}] revokeAckFor: no ack for message_id=${messageId} yet ` +
+          `(marked pending-revoke; ${ackReactions.size} other ack(s) left intact)`,
+        );
+      } else {
+        // Quiet: react/download_attachment may legitimately pass a
+        // non-inbound id (Claude reacting to a bot message; download
+        // for a file in some prior message). No mark, no log.
+      }
       return;
     }
     ackReactions.delete(messageId);
@@ -779,7 +804,11 @@ export function registerTools(
         // (reply called without reply_to); revokeAckFor logs and
         // no-ops in that case, deferring orphan cleanup to the TTL
         // backstop in channel.pruneStaleAcks.
-        revokeAckFor(effectiveReplyTo || '');
+        // `markIfMissing=true`: reply.reply_to IS the inbound user
+        // message id, so pending-revoke marking is correctly targeted
+        // (closes #136 race). react/download default to false because
+        // their `message_id` parameter is not guaranteed to be inbound.
+        revokeAckFor(effectiveReplyTo || '', 'reply', true);
       }
     }
   );

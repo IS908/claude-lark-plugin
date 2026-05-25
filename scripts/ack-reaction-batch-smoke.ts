@@ -208,19 +208,22 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
   passed++;
 }
 
-// 7. react with NO matching ack → revoke marks pending (race-mode)
-//    instead of silent no-op.
+// 7. react with NO matching ack → must NOT mark pending (R1-followup:
+//    react's message_id parameter is not guaranteed to be the inbound
+//    user message id — Claude can react to bot messages too. Marking
+//    pending on arbitrary ids would leak Set entries and evict
+//    legitimate reply-side marks under sustained workload, re-opening
+//    the #136 stuck-MeMeMe bug. Tracked at #159 for a smarter
+//    inbound-id-aware variant).
 {
   const { channel } = setupHandlers();
   const react = handlers.get('react');
   if (!react) fail(`7: react handler missing`);
 
-  // No ack pre-set. After react, the in-flight ack-create may still
-  // be pending — revoke must mark pending so the .then() will delete.
   await react({ message_id: 'om_no_ack_react', emoji: 'HEART' });
 
-  if (!channel.consumePendingAckRevoke('om_no_ack_react')) {
-    fail(`7: react with no matching ack should mark pending-revoke`);
+  if (channel.consumePendingAckRevoke('om_no_ack_react')) {
+    fail(`7: react with no matching ack must NOT mark pending-revoke (would leak Set on bot-id reacts)`);
   }
   passed++;
 }
@@ -255,7 +258,9 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
   passed++;
 }
 
-// 9. download_attachment with NO matching ack → marks pending.
+// 9. download_attachment with NO matching ack → must NOT mark pending
+//    (same R1-followup rationale as react above — message_id parameter
+//    isn't guaranteed to be inbound).
 {
   const { channel } = setupHandlers();
   const download = handlers.get('download_attachment');
@@ -267,8 +272,27 @@ function setupHandlers(opts: { failOnMethod?: string } = {}) {
     file_name: 'test.txt',
   }).catch(() => {});
 
-  if (!channel.consumePendingAckRevoke('om_no_ack_dl')) {
-    fail(`9: download_attachment with no matching ack should mark pending-revoke`);
+  if (channel.consumePendingAckRevoke('om_no_ack_dl')) {
+    fail(`9: download_attachment with no matching ack must NOT mark pending-revoke`);
+  }
+  passed++;
+}
+
+// 10. Positive control: reply DOES mark pending (race protection
+//     correctly opted in via markIfMissing=true).
+{
+  const { channel } = setupHandlers();
+  const reply = handlers.get('reply');
+  if (!reply) fail(`10: reply handler missing`);
+
+  await reply({
+    chat_id: 'chat_test',
+    text: 'race-test',
+    reply_to: 'om_race_target',
+  });
+
+  if (!channel.consumePendingAckRevoke('om_race_target')) {
+    fail(`10: reply with no matching ack MUST mark pending-revoke (race protection)`);
   }
   passed++;
 }
