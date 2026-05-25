@@ -198,6 +198,13 @@ export class BotMessageTracker {
    * bind identity. Callers that don't have a chatId (cronjob and
    * edit_message historically) should be migrated to pass one — tracked
    * separately as #81.
+   *
+   * First-add-wins semantic on duplicate `messageId` — matches the
+   * pre-#80 `Set.has()` semantic. Feishu message_ids are globally
+   * unique per the SDK contract, so the first chatId IS the only true
+   * chatId; a duplicate `add` with a different chatId would indicate a
+   * caller bug rather than a legitimate update, and silently ignoring
+   * it is safer than letting bad state replace good.
    */
   add(messageId: string, chatId: string, threadId?: string): void {
     if (this.meta.has(messageId)) return;
@@ -977,7 +984,18 @@ export class LarkChannel {
     // payload omits — we need both for whitelist evaluation and identity
     // binding below.
     const target = this.botMessageTracker.get(messageId);
-    if (!target) return;
+    if (!target) {
+      // R1-followup on this PR: emit a breadcrumb so an operator
+      // debugging "why didn't my reaction register on the old bot
+      // card" doesn't have to guess at the silent return. Tracker is
+      // bounded at LARK_BOT_MESSAGE_TRACKER_SIZE (default 500); a
+      // reaction on an evicted or pre-tracker-startup bot message
+      // ends up here.
+      debugLog(
+        `[channel] Reaction dropped: bot message ${messageId} not in tracker (stale, evicted, or sent before tracker started)`,
+      );
+      return;
+    }
     const { chatId: targetChatId, threadId: targetThreadId } = target;
 
     // Whitelist filtering — now with the REAL chatId from the tracker.
@@ -992,15 +1010,11 @@ export class LarkChannel {
       return;
     }
 
-    // Identity binding — same shape as handleMessageEvent (line 697).
-    // Pre-#80 fix this was missing, so any sensitive MCP tool Claude
-    // called from the reaction's turn would `resolveCaller('','')` →
-    // null → "No active identity session" error. The reaction is just
-    // another caller-action in the chat; bind it under the same key
-    // shape (chatId#threadId) so downstream tools resolve to the user
-    // who reacted.
-    this.identitySession?.setCaller(targetChatId, targetThreadId, operatorId);
-
+    // Resolve sender name BEFORE queuing — name resolution is async I/O
+    // (Feishu contact API + name cache) and isn't part of the per-chat
+    // serialized work. Pre-queue keeps the queued task itself short and
+    // CPU-bound; same shape as the reply-handler's text formatting
+    // happening before the in-flight send.
     const senderName = await this.resolveUserName(operatorId);
 
     const larkMessage: LarkMessage = {
@@ -1015,9 +1029,28 @@ export class LarkChannel {
       rawContent: JSON.stringify(data),
     };
 
-    if (this.messageHandler) {
-      await this.messageHandler(larkMessage);
-    }
+    // R1-followup on this PR: route the reaction through the per-chat
+    // MessageQueue (instead of dispatching directly). Pre-fix, an
+    // inbound message and a reaction in the SAME chat could be processed
+    // in parallel — both called `setCaller(chatId, undefined, ...)`,
+    // racing on the chat-level identity entry. If user A's in-flight
+    // Claude turn (multi-second tool calls) was still pending when user
+    // B's reaction landed, B's `setCaller` would overwrite A's, and A's
+    // subsequent `save_memory(chat_id, thread_id=undefined)` would
+    // resolve to B → misattributed write.
+    //
+    // Queueing makes the reaction wait its turn in the same per-chat
+    // chain `handleMessageEvent` uses (queue.enqueue at line 730), so
+    // setCaller / messageHandler run serially with any pending inbound
+    // message work for that chat. setCaller runs INSIDE the queued task
+    // so the identity binding happens at the moment of dispatch, not
+    // at event-receive time.
+    this.queue.enqueue(targetChatId, targetThreadId, async () => {
+      this.identitySession?.setCaller(targetChatId, targetThreadId, operatorId);
+      if (this.messageHandler) {
+        await this.messageHandler(larkMessage);
+      }
+    });
   }
 
   /**
