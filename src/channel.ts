@@ -334,6 +334,17 @@ export class LarkChannel {
   private ackPruneTimer: NodeJS.Timeout | null = null;
   /** Guards `start()` against double-invocation (R1-followup on #85). */
   private started = false;
+  /**
+   * Dedupe + cap for the stale-tracker breadcrumb (R2-followup on #80).
+   * An adversarial user in any chat the bot is in can spam reactions on
+   * old bot messages (the ones that aged out of `botMessageTracker`'s
+   * 500-entry FIFO). Without this guard each reaction wrote a line to
+   * `debug.log` via unbounded `appendFileSync` — gigabytes of growth
+   * over hours of sustained adversarial pressure. With this guard the
+   * breadcrumb fires AT MOST 100 times per process lifetime (one per
+   * unique stale messageId), then silently drops further occurrences.
+   */
+  private loggedStaleAcks = new Set<string>();
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
   private latestMessageTracker = new LatestMessageTracker();
 
@@ -991,9 +1002,22 @@ export class LarkChannel {
       // bounded at LARK_BOT_MESSAGE_TRACKER_SIZE (default 500); a
       // reaction on an evicted or pre-tracker-startup bot message
       // ends up here.
-      debugLog(
-        `[channel] Reaction dropped: bot message ${messageId} not in tracker (stale, evicted, or sent before tracker started)`,
-      );
+      //
+      // R2-followup: dedupe + cap to defeat the log-flood vector. An
+      // adversarial user in any chat the bot is in can repeatedly
+      // react to old bot cards (which Feishu still renders even after
+      // they've aged out of the bot's in-memory tracker). Without
+      // dedupe each event wrote a line to debug.log; with this guard
+      // we emit at most one breadcrumb per unique messageId, capped
+      // at 100 entries per process lifetime. Past the cap, additional
+      // stale hits silently drop — operator can still diagnose via
+      // event-console / packet capture if needed.
+      if (!this.loggedStaleAcks.has(messageId) && this.loggedStaleAcks.size < 100) {
+        this.loggedStaleAcks.add(messageId);
+        debugLog(
+          `[channel] Reaction dropped: bot message ${messageId} not in tracker (stale, evicted, or sent before tracker started)`,
+        );
+      }
       return;
     }
     const { chatId: targetChatId, threadId: targetThreadId } = target;
@@ -1015,6 +1039,17 @@ export class LarkChannel {
     // serialized work. Pre-queue keeps the queued task itself short and
     // CPU-bound; same shape as the reply-handler's text formatting
     // happening before the in-flight send.
+    //
+    // R2-followup observation: a pre-queue `await` reorders concurrent
+    // reactions whose name-resolution latency differs (cached user
+    // resolves in 0ms, uncached takes ~100–500ms via contact API).
+    // The wire-order from Feishu is lost — two reactions arriving at
+    // T=0 and T=10ms can enqueue in either order depending on cache
+    // state. Same shape exists in `handleMessageEvent`; we accept it
+    // here for the same reason — reaction order is rarely semantically
+    // meaningful (every reaction triggers a fresh Claude turn) and
+    // moving name resolution into the queued task would block the
+    // chat's serial chain on Feishu's contact API.
     const senderName = await this.resolveUserName(operatorId);
 
     const larkMessage: LarkMessage = {
