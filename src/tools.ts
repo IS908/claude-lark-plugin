@@ -455,6 +455,32 @@ export function registerTools(
       // re-emission, but storing the sanitized form is cleaner and
       // avoids audit-trail confusion (R2-audit followup on #96).
       function recordReply(replyText: string) {
+        // #110 fix: skip buffer recording for cronjob-originated replies.
+        // Pre-fix, every reply (including those produced by prompt-type
+        // cronjobs) was unconditionally recorded into the per-chat
+        // ConversationBuffer. A cronjob targeting an active chat
+        // (e.g. hourly "status update") reset the buffer's inactivity
+        // timer on every fire — auto-flush (default 3h) NEVER fired
+        // as long as the cron kept hitting. Buffer grew unboundedly
+        // AND cron output got mixed with real user dialogue, so when
+        // a flush did eventually happen the distillation was garbage.
+        //
+        // Semantically: cron output is NOT user dialogue. Distillation
+        // shouldn't summarize "the bot's hourly cron status update"
+        // as part of the user's conversation history.
+        //
+        // Alias the `isSyntheticThread` flag (R1-followup): it's load-
+        // bearing for TWO unrelated decisions in this handler — thread
+        // routing (line ~411) and buffer skip (here). If a future
+        // change narrows the routing flag (e.g. "only treat as
+        // synthetic if also has reply_to"), the buffer-skip behavior
+        // would silently change too. The local alias signals "this
+        // value is consumed here for a different reason — preserve
+        // semantics or split the flag if either consumer's intent
+        // changes."
+        const isCronOriginated = isSyntheticThread;
+        if (isCronOriginated) return;
+
         conversationBuffer?.record(chat_id, {
           role: 'assistant',
           senderId: 'bot',
