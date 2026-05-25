@@ -41,7 +41,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Operator notes
 - Pre-#89 deployments: on first startup after upgrade, the GC will sweep accumulated files older than 7 days AND evict to the 500MB cap. A long-running deployment with GBs of accumulated images will see a large one-shot cleanup in the startup log (`[inbox-gc] removed N file(s), freed XYZ MB ...`). This is intentional. If you want to preserve everything for one-time archival, set `LARK_INBOX_GC_DISABLED=true` for the first run, move what you need out of the inbox, then re-enable.
 - The startup line `[index] Inbox GC enabled (maxAge=7d, maxSize=500MB, interval=60min)` is the operator's confirmation that the GC is active and visible into the configuration.
-- Mid-turn safety: the 7-day age threshold is intentionally far larger than any reasonable Claude turn. A turn that opens an `image_path` from inbox WILL find its file. If you have unusual long-running turns (research agents, large prompts), tune `LARK_INBOX_MAX_AGE_DAYS` UP, never down.
+- Mid-turn safety: the 7-day age threshold is intentionally far larger than any reasonable Claude turn. A turn that opens an `image_path` from inbox WILL find its file. If you have unusual long-running turns (research agents, large prompts), tune `LARK_INBOX_MAX_AGE_DAYS` UP, never down — there is NO reference-counting layer between the GC and in-flight turns; if you lower below the longest expected turn duration, a Read can race the GC and fail with ENOENT.
+- **Env footgun (R1-followup)**: `LARK_INBOX_MAX_AGE_DAYS=0` and `LARK_INBOX_MAX_SIZE_MB=0` are NOT safe "disable" knobs — they are "delete essentially everything on the next tick." The actual disable is `LARK_INBOX_GC_DISABLED=true`.
 - Future improvement filed as a scope-note: month-subdirectory rotation (`inbox/2026-05/`) would make manual archival easier; not in this PR (keeps the flat-directory invariant the call sites assume).
 
 ## [1.0.34] - 2026-05-25

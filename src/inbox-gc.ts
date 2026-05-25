@@ -12,9 +12,9 @@
  *
  * Two complementary policies (both apply on each run):
  *   1. **Age expiry**: files whose mtime is older than `maxAgeMs`
- *      are deleted. 7 days by default — comfortably exceeds any
- *      reasonable Claude turn so a mid-turn Read of `image_path`
- *      always finds its file.
+ *      are deleted. 7 days by default — the threshold is intentionally
+ *      far larger than any reasonable Claude turn so a mid-turn `Read`
+ *      of `image_path` notification meta always finds its file.
  *   2. **Size cap**: if total directory size exceeds `maxSizeBytes`,
  *      oldest-first LRU eviction continues until under cap.
  *
@@ -22,6 +22,21 @@
  * to the size check, so an operator who configured a small age + large
  * size cap (rotate quickly, keep recent burst) gets predictable
  * behavior.
+ *
+ * **Mid-turn race warning (R1-followup)**: there is NO reference-counting
+ * layer between the GC and in-flight Claude turns. If an operator
+ * lowers `LARK_INBOX_MAX_AGE_DAYS` below the longest expected turn
+ * duration (e.g. setting it to 1 day with a multi-hour research-agent
+ * turn pending), the GC can unlink a file the turn is about to `Read`,
+ * causing the Read to fail with ENOENT. The 7-day default makes this
+ * effectively unreachable for normal operation; the env exists for
+ * operators tightening disk usage, who must keep age > worst-turn-time.
+ *
+ * **Safety invariant**: this module assumes writers
+ * (`downloadImage`, `download_attachment`) use unique filenames per
+ * call (both do — `${Date.now()}-${imageKey}.png` / `${file_key}-...`).
+ * Without uniqueness, a GC unlink could race a writer's open — but
+ * uniqueness makes the race structurally impossible.
  *
  * Best-effort throughout: `unlink` failures (file vanished concurrently,
  * permission revoked) are swallowed so one bad file doesn't abort
