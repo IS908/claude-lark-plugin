@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [1.0.40] - 2026-05-25
 
 ### Fixed
-- **Vulnerable transitive deps via `@larksuiteoapi/node-sdk` — 22 CVEs covering SSRF / prototype pollution / DoS** (#94 — **HIGH supply-chain risk, persistent-daemon amplification**). `npm audit --omit=dev` showed 11 active vulns (1 CRITICAL, 3 HIGH, 7 MOD) across 9 transitive packages, all reachable via the Lark SDK's dep tree:
+- **Vulnerable transitive deps — 22 CVEs covering SSRF / prototype pollution / DoS** (#94 — **HIGH supply-chain risk, persistent-daemon amplification**). `npm audit --omit=dev` showed 11 active vulns (1 CRITICAL, 3 HIGH, 7 MOD) across 9 transitive packages. **Source SDK varies** (R2-followup correction): 5 come via `@larksuiteoapi/node-sdk` (axios, protobufjs, @protobufjs/utf8, qs, ws), 4 via `@modelcontextprotocol/sdk` through its own transitive chain (`hono` via `@hono/node-server`, `fast-uri` via `ajv`, `ip-address` via `express-rate-limit`, `follow-redirects`). When tracking upstream bumps for unpinning, check which SDK actually shipped the fix.
 
   | Package | Pre-fix | Post-fix | Worst CVE |
   |---|---|---|---|
@@ -33,8 +33,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `package.json` `overrides` block with 9 pinned versions. Adjacent `//overrides` comment field documents the rationale + the "stay within SDK's declared major" constraint.
 
 ### R1-audit followups (closed in this PR)
-- **Axios tilde→caret widening documented**. R1 caught that the SDK declares `axios: ~1.13.3` (tilde — locked to 1.13.x), but the `^1.15.2` override resolves to `axios@1.16.1`. The SDK doesn't touch the 1.13→1.16 API changes (`parseProtocol` stricter, `unescape()` replacement, basic-auth URL decoding, fetch-adapter limit enforcement) — verified via grep of the SDK's `lib/index.js` — so the risk is low. Updated the `//overrides` rationale comment to call this out explicitly so a future SDK bump doesn't surprise the next maintainer.
-- The other 8 overrides match the SDK's caret-style ranges (e.g. SDK declares `protobufjs: ^7.2.6`, override `^7.5.8` stays within the same caret), so no widening concern there.
+- **Axios tilde→caret widening documented**. R1 caught that Lark SDK declares `axios: ~1.13.3` (tilde — locked to 1.13.x), but the `^1.15.2` override resolves to `axios@1.16.1`. The SDK doesn't touch the 1.13→1.16 API changes (`parseProtocol` stricter, `unescape()` replacement, basic-auth URL decoding, fetch-adapter limit enforcement) — verified via grep of the SDK's `lib/index.js` — so the risk is low. Updated the `//overrides` rationale comment to call this out explicitly so a future SDK bump doesn't surprise the next maintainer.
+
+### R2-audit followups (closed in this PR)
+- **CHANGELOG + `//overrides` doc inaccuracy on dep provenance** — initial PR wording said "all 9 come in via Lark SDK's dep tree." R2 confirmed via `npm ls` that 4 actually come via `@modelcontextprotocol/sdk` (`hono` through `@hono/node-server`, `fast-uri` through `ajv`, `ip-address` through `express-rate-limit`, plus `follow-redirects`). Misleading: an operator tracking SDK-upstream bumps to know when to unpin would have looked at the wrong SDK for 4 of 9 entries. Corrected the wording to enumerate both SDKs and tell the operator to check which one shipped the fix.
+- **CHANGELOG R1-followup over-claim corrected** — R1 followup said "other 8 overrides match the SDK's caret-style ranges." R2 noted Lark SDK only DECLARES 4 of the 9 (axios, protobufjs, qs, ws); the other 5 are nested transitives the SDK never directly references. Of the 4 declared: 3 match caret-style (protobufjs ^7.2.6 → override ^7.5.8; qs ^6.14.2 → ^6.15.2; ws ^8.19.0 → ^8.20.1), only axios is the documented tilde-widening exception. Tightened both the comment and CHANGELOG to reflect reality.
 
 ### Operator notes
 - No code changes; no env vars added. The override block only changes which version of each package npm resolves to. SDK API surface is unchanged — same `client.im.v1.message.*` calls work as before.
