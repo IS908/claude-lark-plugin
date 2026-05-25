@@ -747,6 +747,31 @@ async function run() {
     }
   }
 
+  // ── Test 18: #105 R1-followup — footer path also sanitized ──
+  // buildCards embeds `footer` in its OWN tag:'markdown' element. Pre-
+  // followup, only the body `text` was sanitized — `footer` was an
+  // identical-shape vector that bypassed the fix entirely. R1 caught
+  // this; in-PR fix sanitizes `footer` before passing into buildCards.
+  {
+    apiCalls.length = 0;
+    await replyHandler({
+      chat_id: 'chat_footer_at',
+      text: 'safe body text',
+      footer: 'note: <at user_id="all">all</at> please review',
+      format: 'card',  // force card path
+    });
+    const sent = apiCalls.find((c) => c.method === 'message.create');
+    if (!sent) fail('Test 18: message.create not called');
+    const allContent = JSON.stringify(JSON.parse(sent!.args.data.content));
+    if (allContent.includes('<at user_id')) {
+      fail(`Test 18: footer <at> not sanitized; full JSON: ${allContent.slice(0, 200)}`);
+    }
+    // Legit footer label "all" preserved
+    if (!allContent.includes('note: all please review')) {
+      fail(`Test 18: footer legit content lost during sanitization`);
+    }
+  }
+
   console.log('PASS');
 }
 

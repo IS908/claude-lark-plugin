@@ -779,7 +779,15 @@ export function registerTools(
         // render <at> as a Feishu mention. Pre-fix the heuristic card
         // path (text auto-detected as markdown-rich or long) had the
         // same exposure as the raw-card path.
-        const cards = buildCards(sanitizeOutboundText(text), { footer });
+        //
+        // R1-followup: also sanitize `footer`. buildCards embeds the
+        // footer in its own `{tag:'markdown'}` element (see
+        // feishu-card.ts L52-58) — same identical-shape vector as
+        // the body text. Pre-followup an adversarial Claude could
+        // smuggle `<at user_id="all">` via `footer` and bypass the
+        // body-text sanitizer entirely.
+        const safeFooter = footer ? sanitizeOutboundText(footer) : footer;
+        const cards = buildCards(sanitizeOutboundText(text), { footer: safeFooter });
         sentCount = cards.length;
         for (let i = 0; i < cards.length; i++) {
           const content = JSON.stringify(cards[i]);

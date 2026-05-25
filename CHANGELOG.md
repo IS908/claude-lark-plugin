@@ -19,6 +19,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **Heuristic card path**: `buildCards(sanitizeOutboundText(text), { footer })` — sanitize at the boundary into `buildCards` so all generated markdown elements are clean.
   - **`sanitizeOutboundText` docstring corrected**: the pre-fix "card paths are NOT sanitized — Feishu's Schema 2.0 card renderer does NOT interpret `<at>`" claim was wrong. Updated to reflect both paths are now sanitized via the appropriate boundary.
 
+### R1-audit followup (closed in this PR)
+- **`footer` parameter was an identical-shape vector that bypassed the initial fix.** R1 caught that `buildCards(text, { footer })` embeds `footer` in its OWN `tag: 'markdown'` Schema 2.0 element (`src/feishu-card.ts:52-58`) — same renderer that processes the body text. Pre-followup the initial fix only sanitized `text`; an adversarial Claude could smuggle `<at user_id="all">` via `footer` and bypass it entirely. Patched in-PR per discipline rule #4 (R1 trivial defect → in-PR fix): added `const safeFooter = footer ? sanitizeOutboundText(footer) : footer;` before `buildCards`. New test 18 in `reply-card-smoke.ts` exercises the footer-injection vector end-to-end.
+
 ### Added
 - New `sanitizeCardJson(obj): unknown` exported helper in `src/tools.ts`. Pure, in-place walker. Exported for direct unit testing.
 - `scripts/at-tag-sanitization-smoke.ts` grows from 18 → 26 cases:
