@@ -674,12 +674,19 @@ export class MemoryStore {
         const content = await fs.readFile(filePath, 'utf-8');
         const stat = await fs.stat(filePath);
 
-        // Score: keyword match on first two lines + filename
-        const firstLines = content.split('\n').slice(0, 3).join(' ').toLowerCase();
-        const filenameLower = file.toLowerCase();
+        // Score: keyword match on first two lines only. #102 fix
+        // (Fix C): drop filename — episode filenames are timestamps
+        // (`2026-05-25T14-30-00-000Z.md`) which can't meaningfully
+        // match human keywords; including them just adds noise tokens.
+        //
+        // R2-followup: normalize `_` → ` ` (same rationale as
+        // searchSkills) so underscore-separated identifiers in
+        // LLM-distilled episode prose surface correctly.
+        const firstLines = content.split('\n').slice(0, 3).join(' ').toLowerCase().replace(/_/g, ' ');
         let keywordScore = 0;
         for (const kw of keywords) {
-          if (firstLines.includes(kw) || filenameLower.includes(kw)) {
+          // #102 fix (Fix A): word-boundary aware via matchKeyword.
+          if (MemoryStore.matchKeyword(firstLines, kw)) {
             keywordScore++;
           }
         }
@@ -868,9 +875,25 @@ export class MemoryStore {
         const description = (lines[1] ?? '').trim();
 
         let score = 0;
-        const searchText = `${name} ${description} ${file}`.toLowerCase();
+        // #102 fix (Fix C): drop `file` from haystack. `file` is
+        // sanitizeSkillSlug(name) + ".md" — a derivative of `name`
+        // that just doubles the surface for spurious substring hits
+        // and adds the literal token "md". `name` + `description`
+        // carry all the user-meaningful signal.
+        //
+        // R2-followup: normalize `_` → ` ` so identifier-style words
+        // like `api_gateway_setup` match keyword `api` the same way
+        // `api-gateway-setup` does. Pre-followup `\b` treated `_` as
+        // a word char (no boundary inside `api_gateway`), so the
+        // hyphen-vs-underscore asymmetry silently dropped recall on
+        // underscore-separated identifiers (common in Python/Go/
+        // config code that LLM-distilled skill descriptions often
+        // contain).
+        const searchText = `${name} ${description}`.toLowerCase().replace(/_/g, ' ');
         for (const kw of keywords) {
-          if (searchText.includes(kw)) score++;
+          // #102 fix (Fix A): word-boundary aware via matchKeyword.
+          // Pre-fix `searchText.includes(kw)` matched any substring.
+          if (MemoryStore.matchKeyword(searchText, kw)) score++;
         }
 
         if (score > 0) {
@@ -1216,6 +1239,64 @@ export class MemoryStore {
   }
 
   // ── Helpers ──
+
+  /**
+   * Decide whether a single keyword matches the haystack with the
+   * precision required for memory recall (#102).
+   *
+   * Pre-fix, `searchSkills` and `searchEpisodes` used bare
+   * `haystack.includes(kw)`. That fired on any substring — keyword
+   * "pi" matched skill "pipeline-deploy", "api-gateway", "apiary";
+   * keyword "go" matched "google", "argo"; etc. Result: irrelevant
+   * skills/episodes injected into Claude's enrichment, polluting
+   * context and wasting tokens.
+   *
+   * Threading the needle between "too lenient" (substring) and
+   * "too strict" (token-equal — would lose legitimate prefix matches
+   * like "deploy" → "deployment-script"):
+   *
+   *   - ASCII keyword, length ≤ 3 → require word boundaries on BOTH
+   *     sides (\b...\b). Short tokens are noise-prone; demand exact
+   *     word match.
+   *   - ASCII keyword, length ≥ 4 → require word boundary at start
+   *     only (\b...). Allows stem/prefix matches: "deploy" matches
+   *     "deployment", "deployable", "deployment-script".
+   *   - Non-ASCII keyword (CJK etc.) → substring match preserves
+   *     existing behavior. `\b` is ASCII-defined; using it on
+   *     Chinese characters would produce surprising results
+   *     (every char position is or isn't a boundary depending on
+   *     neighbor's script).
+   *
+   * Exported `static` so the search smoke test can pin the contract
+   * directly without round-tripping through searchSkills/Episodes.
+   */
+  static matchKeyword(haystack: string, kw: string): boolean {
+    // R2-followup defense-in-depth: extractKeywords filters length>1,
+    // so production never passes empty kw. But matchKeyword is
+    // exported as a static API contract — an external caller passing
+    // empty string would otherwise match everything (`/\b/i.test()`
+    // succeeds on any haystack with a word boundary, OR
+    // `haystack.includes('')` is always true). Reject explicitly.
+    if (!kw) return false;
+    // ASCII word-like (alphanumeric + underscore + hyphen) → use
+    // word-boundary regex. The kw was already lowercased by
+    // extractKeywords; the haystack is lowercased at the search site.
+    if (/^[a-z0-9_-]+$/i.test(kw)) {
+      const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (kw.length <= 3) {
+        // Short keyword: require both-sides boundary (exact word match).
+        // Catches the "pi" vs "pipeline" case the issue cited.
+        return new RegExp(`\\b${escaped}\\b`, 'i').test(haystack);
+      }
+      // Longer keyword: prefix match. \b at start, no end boundary.
+      // Preserves legitimate stem matches like "deploy" → "deployment".
+      return new RegExp(`\\b${escaped}`, 'i').test(haystack);
+    }
+    // Non-ASCII (CJK / cyrillic / etc.): substring preserves current
+    // behavior. `\b` boundaries are ASCII-defined and would produce
+    // surprising results on these scripts.
+    return haystack.includes(kw);
+  }
 
   private extractKeywords(query: string): string[] {
     const stopWords = new Set([

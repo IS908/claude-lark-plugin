@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.41] - 2026-05-25
+
+### Fixed
+- **`searchSkills` / `searchEpisodes` matched keywords via bare substring → spurious recall** (#102 — **MEDIUM context pollution, invisible to user**). Both functions scored a hit via `haystack.includes(kw)` with no word-boundary check. Short keywords like `pi` matched `pipeline-deploy`, `api-gateway`, `apiary`; `go` matched `google`, `argo`; `api` matched `rapid-fix`. Result: unrelated skills/episodes injected into Claude's memory enrichment, wasting tokens AND misdirecting Claude's reasoning. Users couldn't see this — they only saw Claude reference a workflow that had no relation to their question.
+
+  Fix (length-threshold word-boundary, threading "too lenient" vs "too strict"):
+  - **ASCII keyword length ≤ 3** → require word boundary on BOTH sides (`\b...\b`). Catches the "pi vs pipeline" case the issue cited. Short tokens are noise-prone; demand exact word match.
+  - **ASCII keyword length ≥ 4** → require word boundary at start only (`\b...`). Preserves legitimate stem/prefix matches: `deploy` still matches `deployment-script`, `config` still matches `configuration`. Without this, the fix would have regressed user-meaningful stems.
+  - **Non-ASCII keyword (CJK, Cyrillic, etc.)** → substring match preserves existing behavior. `\b` is ASCII-defined; using it on Chinese chars would produce surprising results (no inter-character boundaries the way English has).
+
+  Also (Fix C in the issue's suggested approach): drop `file` / `filename` from the search haystack. `searchSkills` was scoring against `name + description + file` where `file` is just `sanitizeSkillSlug(name) + ".md"` — a derivative of `name` that doubles the surface and adds the literal token `md`. `searchEpisodes` was scoring against `firstLines + filename` where `filename` is a timestamp like `2026-05-25T14-30-00-000Z.md` — pure noise for keyword matching. Both surfaces now use semantic fields only.
+
+  Implemented as a new `MemoryStore.matchKeyword(haystack, kw): boolean` static method (pure, no `this` dependency) so tests can pin the contract directly. Both `searchSkills` and `searchEpisodes` call it instead of inlining `includes`.
+
+### Added
+- New `MemoryStore.matchKeyword` static method — pure word-boundary-aware keyword matcher with the length-threshold + ASCII/CJK split documented above.
+- New `scripts/search-precision-smoke.ts` (13 tests, wired into `scripts/test.sh`):
+  - Part A (4): short ASCII keywords no longer false-match (the bug — `pi` ≠ `pipeline`, `go` ≠ `google`, `api` ≠ `apiary`), but DO match genuine word boundaries (`raspberry pi`, `go programming`, `api-gateway`, `rapid-api`).
+  - Part B (2): long ASCII keywords PRESERVE prefix/stem match (`deploy` matches `deployment-script` / `deployable` / `deployment`; `config` matches `configuration` / `configurable` / `configfile`). Plus negative guards: no boundary-leading prefix match (`deploy` ≠ `redeploy`, `config` ≠ `misconfig`).
+  - Part C (3): non-ASCII (CJK + Cyrillic) keywords preserve substring semantics.
+  - Part D (4): edge cases — empty haystack, case-insensitivity, regex-metachar escape, end-to-end "Raspberry Pi vs pipeline-deploy" scenario from the issue.
+
+### R2-audit followups (closed in this PR)
+- **`matchKeyword('', '')` empty-kw guard** — pre-followup, empty kw matched everything (`\b` regex matches at any word boundary; `''.includes('')` is always true). Production-unreachable via `extractKeywords` (filters `length > 1`), but the static API is exported. Added explicit `if (!kw) return false;` at the top — trivial cost, eliminates the failure mode regardless of caller hygiene. Test 14 codifies.
+- **Underscore-as-separator asymmetry** — `\b` treats `_` as a word char in regex, so `\bapi\b` matched `api-gateway` but NOT `api_gateway`. Skill slugs are sanitized to hyphens, but LLM-distilled episode prose often contains underscore-separated identifiers (`api_gateway_setup`, `my_var`). Fixed by pre-normalizing `_` → ` ` at both search sites (NOT in `matchKeyword` — keeps the static-API contract pure). Test 15 codifies both layers.
+
+### Known limitations / forward links
+- **`searchEpisodes` has no `score > 0` gate** (pre-existing): all scored episodes are pushed, sorted, sliced. With `recencyScore = max(0, 1 - ageDays/30)`, a 9-day-old episode scores 0.7 on recency — clearing `LARK_MIN_SEARCH_SCORE` (default 0.3) **with zero keyword overlap**. Post-#102 this is materially more pronounced because the stricter matcher zeros out more keyword scores, leaving recency to dominate. This is the symptom tracked by **#100** (memory enrichment empty-keyword recency-only injection + no per-episode size cap); #102 amplifies it without introducing the underlying bug. #100 is the natural next target.
+
+### Operator notes
+- No data-format or config changes; the cache/storage shape is identical. Only the search-time scoring changes.
+- Pre-#102 behavior: a chat where the user asks technical questions sees more skill/episode recalls because of the loose substring match. Post-fix: fewer false-positives → cleaner enrichment context → less token waste → less Claude misdirection.
+- If a previously-recalled skill stops being recalled after upgrade, check whether the keyword overlap was actually meaningful or was a spurious substring hit. Operators with legitimate stem-matching needs (keyword `deploy`, want to match `deployment-*`) keep working because the length-≥4 path preserves prefix matching.
+- **Underscore identifiers**: search-site normalization makes `api_gateway` searchable as `api gateway`. If you had skills relying on the OLD `\b`-blocked-by-underscore behavior (rare — would require deliberately wanting `api` to NOT match `api_gateway`), they'll surface differently.
+
 ## [1.0.40] - 2026-05-25
 
 ### Fixed
