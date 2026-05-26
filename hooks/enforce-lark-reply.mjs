@@ -242,45 +242,148 @@ function loadTranscript(path) {
     .filter(Boolean);
 }
 
-// Find boundary of the current turn. Scans from the end, collecting ALL
-// CONTIGUOUS non-tool_result user entries up to the previous assistant
-// entry — Lark's per-chat queue (src/queue.ts) can deliver multiple inbound
-// notifications back-to-back before Claude reacts, so the latest user entry
-// alone is not enough (fix for finding #2).
+// Find boundary of the current turn. Scans from the end.
+//
+// Primary discriminator: `promptId`. Every entry within one Claude turn
+// (user prompt + tool_use + tool_result + Skill outputs + any intermediate
+// user-role entry) shares one promptId; a NEW user prompt introduces a new
+// promptId. So we collect all user entries whose promptId matches the latest
+// turn's promptId and break the moment we hit a different one.
+//
+// #178 fix: the prior version used "assistant boundary" as the only stop
+// signal. That misclassified Skill tool outputs (delivered as user-role
+// entries with `[{type:"text", text:"..."}]` content — NOT tool_result
+// blocks) as fresh user prompts. The back-scan then broke at the assistant
+// entry between the Skill output and the REAL user prompt, leaving the
+// real prompt's `<channel source="plugin:lark:lark">` tag undetected and
+// the hook reporting `pending=0  reason=no-lark-channel` on a turn that
+// actually owed a reply.
+//
+// promptId is preferred because it's the discriminator Claude Code itself
+// uses to group entries per prompt cycle — no need to enumerate possible
+// shapes of "intermediate user-role entry" (Skill outputs today, sub-agent
+// outputs tomorrow, ...). Skill outputs collected this way are harmless:
+// they carry no channel tag, so scanChannelTags() yields nothing for them.
+//
+// Backward-compat: very old transcripts (or future entry shapes) may
+// lack promptId on either user or assistant entries. The fallback below
+// preserves the original assistant-boundary heuristic so legacy fixtures
+// still behave the same:
+//   - If we never saw a promptId, we never set `currentPromptId`, and the
+//     `pid !== currentPromptId` branch never fires. The fallback flag
+//     `crossedAssistantAfterCollection` then governs the break — same as
+//     the pre-#178 logic.
+//   - If a Lark "queue batch" (two contiguous user notifications with no
+//     assistant between them) ever arrives with different promptIds, the
+//     missing assistant separator keeps `crossedAssistantAfterCollection`
+//     false, so we still collect both (preserves the documented intent
+//     of the pre-#178 multi-notification branch even though no transcript
+//     in the corpus has actually exhibited it).
+//
 // Returns { realUserIndices: number[], scanFromIndex: number } where:
 //   realUserIndices: indices of all genuine user-prompt entries in the turn
-//   scanFromIndex: where to start scanning for reply tool_uses
+//                    (plus any same-promptId intermediate user entries,
+//                    which are harmless — scanChannelTags drops them)
+//   scanFromIndex: where to start scanning for reply tool_uses (= earliest
+//                  collected user-index)
 // Returns null when no user entries exist at all (assistant-only transcript).
+//
+// promptId field shape: verified at top-level on user entries in real
+// transcripts (assistant entries do NOT carry it — they're matched by
+// position relative to user entries). The historical `message?.promptId`
+// fallback was speculative; kept here as a defensive read because the
+// cost of an extra optional chain is zero and a future Claude Code
+// version COULD migrate the field. If we ever observe it there, this
+// fallback becomes load-bearing.
+function getPromptId(entry) {
+  return entry?.promptId || entry?.message?.promptId || null;
+}
+
 function findCurrentTurn(entries) {
   const realUserIndices = [];
   let scanFromIndex = entries.length;
+  let currentPromptId = null;
+  // R1-followup (D1): use an explicit "have we collected anything yet?"
+  // flag instead of `currentPromptId === null`. Pre-fix, when the very
+  // first collected user entry had `promptId=null` (legacy transcript
+  // shape OR a future entry shape missing the field), `currentPromptId`
+  // stayed null and the `currentPromptId === null` gate re-fired on
+  // every subsequent user entry — letting prior-turn user entries get
+  // absorbed into `realUserIndices` AND silently resetting
+  // `crossedAssistantAfterCollection` to false. The downstream effect
+  // was that a prior-turn `[LARK_DEFER]` in assistant text between
+  // turns could swallow a current-turn pending reply (silent false-
+  // negative). Test 53 below pins this.
+  let firstCollectionDone = false;
+  let crossedAssistantAfterCollection = false;
+
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
     if (!entry) continue;
     if (entry.type === 'assistant') {
-      // First assistant we hit (scanning backward) marks where this turn's
-      // assistant work BEGINS. We've already passed all assistant entries
-      // belonging to this turn going backward, but for the FIRST assistant
-      // we encounter on our way back, that's actually the start of assistant
-      // activity for the current turn (or end of previous turn). If we
-      // haven't found any real user entries yet, keep scanning back.
+      // Mark that an assistant boundary has been crossed AFTER we started
+      // collecting users. Used by the legacy fallback path below.
       if (realUserIndices.length > 0) {
-        // We've collected user entries; assistant boundary = end of previous turn
-        break;
+        crossedAssistantAfterCollection = true;
       }
       continue;
     }
-    if (entry.type === 'user') {
-      const content = entry.message?.content;
-      // tool_result-only synthesized messages are part of assistant flow,
-      // not new user prompts
-      if (Array.isArray(content) && content.every((b) => b?.type === 'tool_result')) {
-        continue;
-      }
+    if (entry.type !== 'user') continue;
+
+    const content = entry.message?.content;
+    // tool_result-only synthesized messages skip regardless of promptId
+    if (Array.isArray(content) && content.every((b) => b?.type === 'tool_result')) {
+      continue;
+    }
+
+    const pid = getPromptId(entry);
+
+    // First collection establishes the current turn's promptId (which may
+    // be null for legacy entries — that's fine, we never use `null === null`
+    // to make collection decisions thanks to `firstCollectionDone`).
+    if (!firstCollectionDone) {
+      currentPromptId = pid;
       realUserIndices.unshift(i);
       scanFromIndex = i;
+      crossedAssistantAfterCollection = false;
+      firstCollectionDone = true;
+      continue;
     }
+
+    // Subsequent collections: same promptId → collect; different → previous turn.
+    // R2-followup (D2): resetting `crossedAssistantAfterCollection = false`
+    // here is correct ONLY because promptId is a UUID — two prior-turn
+    // entries cannot legitimately collide with the current turn's promptId.
+    // If a future Claude Code version reuses promptIds (it doesn't today),
+    // the legacy fallback could re-enable across a real turn boundary.
+    if (pid && currentPromptId && pid === currentPromptId) {
+      realUserIndices.unshift(i);
+      scanFromIndex = i;
+      crossedAssistantAfterCollection = false;
+      continue;
+    }
+
+    if (pid && currentPromptId && pid !== currentPromptId) {
+      // Different promptId AND both sides carry one — unambiguous boundary
+      break;
+    }
+
+    // Ambiguous (one or both promptIds missing) → legacy fallback. The
+    // pre-#178 hook relied on the assistant-boundary heuristic alone, so
+    // legacy transcripts (no promptId anywhere) must keep behaving the
+    // same. R1-followup (D4): the "batched-notification heuristic" line
+    // below is reachable in theory but no real transcript in the corpus
+    // exhibits it — `src/queue.ts` serializes per chat, so adjacent
+    // user entries with different promptIds and no assistant between
+    // them aren't a production shape. Kept for defense; flagged so a
+    // future contributor doesn't assume it's load-bearing.
+    if (crossedAssistantAfterCollection) {
+      break;
+    }
+    realUserIndices.unshift(i);
+    scanFromIndex = i;
   }
+
   if (realUserIndices.length === 0) return null;
   return { realUserIndices, scanFromIndex };
 }

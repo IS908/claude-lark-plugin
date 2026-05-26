@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.59] - 2026-05-26
+
+### Fixed
+- **Stop hook missed unreplied Lark messages when `Skill` tool output appeared between the user prompt and turn end** (#178). The hook's `findCurrentTurn` in `hooks/enforce-lark-reply.mjs` used "assistant boundary" as its only stop signal — but Skill tool output is delivered as a user-role entry with `[{type:"text", text:"..."}]` content (NOT a `tool_result` block). Pre-fix, that text entry was collected as a fresh user prompt; the back-scan then broke at the assistant `tool_use(Skill)` entry above it and never reached the real upstream user message. The hook reported `pending=0  reason=no-lark-channel` on a turn that genuinely owed a reply, and the user only noticed when they manually re-asked ("没回我？"). Discovered in session `7abd1f3d` lines 23-28.
+
+  Post-fix: `findCurrentTurn` uses `promptId` as the primary discriminator. Every entry in one Claude turn (user prompt + tool_use + tool_result + Skill outputs + any intermediate user-role entry) shares one `promptId`; a genuinely new user prompt is the only thing that introduces a new one. The back-scan now collects all user entries whose `promptId` matches the latest turn's `promptId` and breaks only on a different `promptId` — assistant entries no longer terminate the scan. Skill outputs are still collected but contribute nothing (`scanChannelTags` yields no tags for them).
+
+### Implementation
+- `hooks/enforce-lark-reply.mjs`: rewrote `findCurrentTurn` (~50 LOC). Added `getPromptId(entry)` helper that reads `entry.promptId` or `entry.message.promptId`. The legacy assistant-boundary heuristic is preserved as the fallback when **both** entries being compared lack a `promptId` (older transcript shapes, ambiguous cases) — guarded by `crossedAssistantAfterCollection`. This keeps all 49 pre-existing tests passing without modification.
+- `hooks/test-enforce-lark-reply.mjs`: +4 tests (91 → 102, +11 assertions). Test 50 is the bug repro — Skill output between user prompt and turn end must STILL block. Test 51 positive control — same shape with a real reply passes. Test 52 pins the legacy no-`promptId` fallback so the assistant-boundary heuristic continues to work for old fixtures and doesn't leak prior-turn message_ids into the current-turn pending list. Test 53 pins the R1-followup D1 fix below.
+
+### R1-audit followups (closed in this PR)
+- **MED — cross-turn defer leak when promptId absent (D1).** The first version used `currentPromptId === null` as the "first collection not done yet" gate. When the latest user entry had `promptId=null` (legacy transcript OR a future entry shape missing the field), `currentPromptId` stayed null and that gate re-fired on every subsequent user entry — letting prior-turn user entries get absorbed into `realUserIndices` AND silently resetting `crossedAssistantAfterCollection` to false. Downstream: `scanFromIndex` rolled back to the prior turn's user-idx, so `collectAssistantText` picked up the prior turn's `[LARK_DEFER]` sentinel in between-turn assistant text — making the hook silently exit 0 on the current turn's unanswered message. Fix: use an explicit `firstCollectionDone` boolean. Test 53 pins it.
+- **LOW — test fixture fidelity (D2).** Real transcripts (verified at session `7abd1f3d` lines 24-26) show assistant entries do NOT carry `promptId` — only user entries do. Fixture helpers `makeAssistantToolUseWithPid` / `makeAssistantTextWithPid` were setting `promptId` on the assistant entry, so tests 50/51 could in theory pass via an assistant-side promptId match rather than the production user-only match. Fix: helpers now ignore the `_promptId` parameter for assistant entries.
+- **LOW — comment overstated batched-notification guarantee (D4).** `src/queue.ts` serializes per-chat, so adjacent user entries with different `promptId` and no assistant between them aren't a production shape. The ambiguous-branch fallback is reachable only via contrived fixtures (test 52 builds one). Comment tightened to reflect "defensive, not load-bearing."
+- **LOW — `getPromptId` `message?.promptId` fallback (D3).** Verified no entry in inspected transcripts carries `promptId` under `message`. Kept as a zero-cost defensive read in case a future Claude Code version migrates the field; comment now documents it as speculative.
+
 ## [1.0.58] - 2026-05-26
 
 ### Added
