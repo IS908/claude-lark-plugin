@@ -1280,10 +1280,17 @@ function makeUserMsgWithPid(content, promptId) {
   };
 }
 
-function makeAssistantToolUseWithPid(name, id, input, promptId) {
+// R1-followup (D2): real-transcript assistant entries DO NOT carry a
+// top-level promptId — only user entries do (verified at session
+// 7abd1f3d lines 24-26: assistant.thinking / assistant.text /
+// assistant.tool_use all have promptId=undefined). The test fixture
+// helpers below intentionally OMIT promptId from assistant entries
+// to mirror that — otherwise tests 50/51 could pass for the wrong
+// reason (e.g. by establishing currentPromptId via an assistant
+// match, masking a regression in the user-only promptId logic).
+function makeAssistantToolUseWithPid(name, id, input, _promptId) {
   return {
     type: 'assistant',
-    promptId,
     message: {
       role: 'assistant',
       content: [{ type: 'tool_use', id, name, input }],
@@ -1313,10 +1320,10 @@ function makeUserSkillOutput(text, promptId) {
   };
 }
 
-function makeAssistantTextWithPid(text, promptId) {
+function makeAssistantTextWithPid(text, _promptId) {
+  // See note on makeAssistantToolUseWithPid — promptId omitted to mirror real shape.
   return {
     type: 'assistant',
-    promptId,
     message: { role: 'assistant', content: [{ type: 'text', text }] },
   };
 }
@@ -1413,6 +1420,50 @@ console.log('\n[52] Legacy transcript without promptId → assistant-boundary fa
     failed++;
   } else {
     console.log(`  ${GREEN}✓${RESET} prior-turn message_id correctly excluded (assistant boundary works in legacy mode)`);
+    passed++;
+  }
+}
+
+// --- Test 53: #178 R1-followup (D1) — legacy turns without promptId must NOT cross-contaminate ---
+console.log('\n[53] R1-D1 regression: prior-turn defer must NOT swallow current-turn pending when both turns lack promptId');
+{
+  // Pre-R1-followup, `currentPromptId === null` was the "first collection
+  // not done yet" gate. When the latest user entry had promptId=null
+  // (legacy shape OR a future entry shape missing the field), currentPromptId
+  // stayed null forever and that gate re-fired on every subsequent user
+  // entry — letting prior-turn user entries get absorbed into
+  // realUserIndices AND silently resetting crossedAssistantAfterCollection
+  // to false. The downstream impact: scanFromIndex rolled back to the
+  // prior turn's user-idx, so collectAssistantText picked up the prior
+  // turn's [LARK_DEFER] sentinel in between-turn assistant text — making
+  // the hook silently exit 0 on the current turn's unanswered message.
+  // Post-fix uses an explicit `firstCollectionDone` boolean; this test
+  // pins the behavior.
+  const priorUser =
+    '<channel source="plugin:lark:lark" chat_id="oc_53" message_id="om_prior53" user="kk" chat_type="p2p">\nold async question\n</channel>';
+  const currentUser =
+    '<channel source="plugin:lark:lark" chat_id="oc_53" message_id="om_curr53" user="kk" chat_type="p2p">\nnew question\n</channel>';
+  const path = writeTranscript('178-r1-d1-cross-turn-defer-leak', [
+    // Prior turn: user asked async, bot deferred with [LARK_DEFER] sentinel
+    makeUserMsg(priorUser),
+    makeAssistantText(
+      'I will follow up async — running in background.\n\n[LARK_DEFER]\n\nReporting later.',
+    ),
+    // Current turn: real user follow-up, bot did NOT defer (and did NOT reply)
+    makeUserMsg(currentUser),
+    makeAssistantText('Thinking about the new question. Did not call reply.'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(
+    r.exitCode, 2,
+    'prior-turn [LARK_DEFER] must NOT satisfy current-turn pending → still blocks',
+  );
+  assertContains(r.stderr, 'om_curr53', 'block names current-turn message_id');
+  if (r.stderr.includes('om_prior53')) {
+    console.log(`  ${RED}✗${RESET} prior-turn id leaked into current block list`);
+    failed++;
+  } else {
+    console.log(`  ${GREEN}✓${RESET} prior-turn id correctly excluded from current pending`);
     passed++;
   }
 }

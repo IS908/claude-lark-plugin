@@ -287,6 +287,14 @@ function loadTranscript(path) {
 //   scanFromIndex: where to start scanning for reply tool_uses (= earliest
 //                  collected user-index)
 // Returns null when no user entries exist at all (assistant-only transcript).
+//
+// promptId field shape: verified at top-level on user entries in real
+// transcripts (assistant entries do NOT carry it — they're matched by
+// position relative to user entries). The historical `message?.promptId`
+// fallback was speculative; kept here as a defensive read because the
+// cost of an extra optional chain is zero and a future Claude Code
+// version COULD migrate the field. If we ever observe it there, this
+// fallback becomes load-bearing.
 function getPromptId(entry) {
   return entry?.promptId || entry?.message?.promptId || null;
 }
@@ -295,6 +303,18 @@ function findCurrentTurn(entries) {
   const realUserIndices = [];
   let scanFromIndex = entries.length;
   let currentPromptId = null;
+  // R1-followup (D1): use an explicit "have we collected anything yet?"
+  // flag instead of `currentPromptId === null`. Pre-fix, when the very
+  // first collected user entry had `promptId=null` (legacy transcript
+  // shape OR a future entry shape missing the field), `currentPromptId`
+  // stayed null and the `currentPromptId === null` gate re-fired on
+  // every subsequent user entry — letting prior-turn user entries get
+  // absorbed into `realUserIndices` AND silently resetting
+  // `crossedAssistantAfterCollection` to false. The downstream effect
+  // was that a prior-turn `[LARK_DEFER]` in assistant text between
+  // turns could swallow a current-turn pending reply (silent false-
+  // negative). Test 53 below pins this.
+  let firstCollectionDone = false;
   let crossedAssistantAfterCollection = false;
 
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -318,12 +338,15 @@ function findCurrentTurn(entries) {
 
     const pid = getPromptId(entry);
 
-    // First collection establishes the current turn's promptId
-    if (currentPromptId === null) {
-      currentPromptId = pid; // may stay null if entry has no promptId (legacy)
+    // First collection establishes the current turn's promptId (which may
+    // be null for legacy entries — that's fine, we never use `null === null`
+    // to make collection decisions thanks to `firstCollectionDone`).
+    if (!firstCollectionDone) {
+      currentPromptId = pid;
       realUserIndices.unshift(i);
       scanFromIndex = i;
       crossedAssistantAfterCollection = false;
+      firstCollectionDone = true;
       continue;
     }
 
@@ -340,9 +363,15 @@ function findCurrentTurn(entries) {
       break;
     }
 
-    // Ambiguous (one or both promptIds missing) → legacy fallback:
-    //   crossed an assistant since we started collecting? → boundary
-    //   otherwise → batched-notification heuristic, collect
+    // Ambiguous (one or both promptIds missing) → legacy fallback. The
+    // pre-#178 hook relied on the assistant-boundary heuristic alone, so
+    // legacy transcripts (no promptId anywhere) must keep behaving the
+    // same. R1-followup (D4): the "batched-notification heuristic" line
+    // below is reachable in theory but no real transcript in the corpus
+    // exhibits it — `src/queue.ts` serializes per chat, so adjacent
+    // user entries with different promptIds and no assistant between
+    // them aren't a production shape. Kept for defense; flagged so a
+    // future contributor doesn't assume it's load-bearing.
     if (crossedAssistantAfterCollection) {
       break;
     }
