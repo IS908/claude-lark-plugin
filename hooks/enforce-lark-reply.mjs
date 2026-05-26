@@ -350,7 +350,12 @@ function findCurrentTurn(entries) {
       continue;
     }
 
-    // Subsequent collections: same promptId → collect; different → previous turn
+    // Subsequent collections: same promptId → collect; different → previous turn.
+    // R2-followup (D2): resetting `crossedAssistantAfterCollection = false`
+    // here is correct ONLY because promptId is a UUID — two prior-turn
+    // entries cannot legitimately collide with the current turn's promptId.
+    // If a future Claude Code version reuses promptIds (it doesn't today),
+    // the legacy fallback could re-enable across a real turn boundary.
     if (pid && currentPromptId && pid === currentPromptId) {
       realUserIndices.unshift(i);
       scanFromIndex = i;
