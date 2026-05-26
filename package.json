@@ -1,6 +1,6 @@
 {
   "name": "claude-lark-plugin",
-  "version": "1.0.58",
+  "version": "1.0.59",
   "description": "Claude Code channel plugin for Feishu/Lark — chat with Claude through Feishu with local-file memory and scheduled jobs",
   "type": "module",
   "main": "src/index.ts",

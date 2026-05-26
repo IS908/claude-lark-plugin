@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.59] - 2026-05-26
+
+### Fixed
+- **Stop hook missed unreplied Lark messages when `Skill` tool output appeared between the user prompt and turn end** (#178). The hook's `findCurrentTurn` in `hooks/enforce-lark-reply.mjs` used "assistant boundary" as its only stop signal — but Skill tool output is delivered as a user-role entry with `[{type:"text", text:"..."}]` content (NOT a `tool_result` block). Pre-fix, that text entry was collected as a fresh user prompt; the back-scan then broke at the assistant `tool_use(Skill)` entry above it and never reached the real upstream user message. The hook reported `pending=0  reason=no-lark-channel` on a turn that genuinely owed a reply, and the user only noticed when they manually re-asked ("没回我？"). Discovered in session `7abd1f3d` lines 23-28.
+
+  Post-fix: `findCurrentTurn` uses `promptId` as the primary discriminator. Every entry in one Claude turn (user prompt + tool_use + tool_result + Skill outputs + any intermediate user-role entry) shares one `promptId`; a genuinely new user prompt is the only thing that introduces a new one. The back-scan now collects all user entries whose `promptId` matches the latest turn's `promptId` and breaks only on a different `promptId` — assistant entries no longer terminate the scan. Skill outputs are still collected but contribute nothing (`scanChannelTags` yields no tags for them).
+
+### Implementation
+- `hooks/enforce-lark-reply.mjs`: rewrote `findCurrentTurn` (~50 LOC). Added `getPromptId(entry)` helper that reads `entry.promptId` or `entry.message.promptId`. The legacy assistant-boundary heuristic is preserved as the fallback when **both** entries being compared lack a `promptId` (older transcript shapes, ambiguous cases) — guarded by `crossedAssistantAfterCollection`. This keeps all 49 pre-existing tests passing without modification.
+- `hooks/test-enforce-lark-reply.mjs`: +3 tests (91 → 99, +8 assertions). Test 50 is the bug repro — Skill output between user prompt and turn end must STILL block. Test 51 positive control — same shape with a real reply passes. Test 52 pins the legacy no-`promptId` fallback so the assistant-boundary heuristic continues to work for old fixtures and doesn't leak prior-turn message_ids into the current-turn pending list.
+
 ## [1.0.58] - 2026-05-26
 
 ### Added

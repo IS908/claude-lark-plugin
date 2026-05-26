@@ -1268,6 +1268,155 @@ console.log('\n[44] prose with ``` mid-line + legit defer + correct reply → st
   assertEq(r.exitCode, 0, 'real sentinel after prose-embedded ``` STILL honored (test 40 preserved)');
 }
 
+// --- #178 helpers — promptId-aware fixtures ---
+// Skill outputs surface as user-role entries with `[{type:'text', text:'...'}]`
+// content (NOT tool_result blocks) and share the same promptId as the user
+// prompt that triggered the turn.
+function makeUserMsgWithPid(content, promptId) {
+  return {
+    type: 'user',
+    promptId,
+    message: { role: 'user', content },
+  };
+}
+
+function makeAssistantToolUseWithPid(name, id, input, promptId) {
+  return {
+    type: 'assistant',
+    promptId,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id, name, input }],
+    },
+  };
+}
+
+function makeUserToolResultWithPid(toolUseId, text, promptId) {
+  return {
+    type: 'user',
+    promptId,
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: toolUseId, content: text }],
+    },
+  };
+}
+
+function makeUserSkillOutput(text, promptId) {
+  // Skill output is shaped like a normal user message: text content blocks.
+  // Critically, NOT tool_result — that's why the pre-#178 hook collected it
+  // as a fresh user prompt and lost the real one above.
+  return {
+    type: 'user',
+    promptId,
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  };
+}
+
+function makeAssistantTextWithPid(text, promptId) {
+  return {
+    type: 'assistant',
+    promptId,
+    message: { role: 'assistant', content: [{ type: 'text', text }] },
+  };
+}
+
+// --- Test 50: #178 Skill-output user entry between user prompt and turn end → must STILL block ---
+console.log('\n[50] Skill tool output (user-role text entry) between Lark inbound and turn end → still blocks (#178)');
+{
+  // Repro from issue #178 — session 7abd1f3d, lines 23-28 of the transcript.
+  // Pre-fix: findCurrentTurn collected line 28 (Skill output) as the "real
+  // user prompt" then broke at the assistant tool_use_Skill above it, never
+  // reaching line 23's <channel> tag → hook reported pending=0/no-lark-channel
+  // and the actual user message went unanswered. Post-fix the promptId scope
+  // crosses the assistant entries so line 23 IS reached and pending=1.
+  const promptId = 'a81ea7d3-af20-4ded-8bb5-aef38dbfc1de';
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_178" message_id="om_178" user="kk" chat_type="group">\nbuy HOOD CC?\n</channel>';
+  const skillToolUseId = 'tu_skill_178';
+  const bashToolUseId = 'tu_bash_178';
+  const path = writeTranscript('178-skill-output-misclassified', [
+    makeUserMsgWithPid(userContent, promptId),
+    makeAssistantToolUseWithPid('Skill', skillToolUseId, { skill: 'optix' }, promptId),
+    makeUserToolResultWithPid(skillToolUseId, 'Skill invoked', promptId),
+    // The bug-triggering entry: Skill output text shows up as a user-role
+    // entry with text blocks (NOT tool_result). Same promptId as the prompt.
+    makeUserSkillOutput(
+      'Base directory for this skill: /Users/kevin/.claude/skills/optix\n\n# Optix skill content...',
+      promptId,
+    ),
+    makeAssistantToolUseWithPid('Bash', bashToolUseId, { command: 'optix quote HOOD' }, promptId),
+    makeUserToolResultWithPid(bashToolUseId, 'HOOD: $50.12', promptId),
+    makeAssistantTextWithPid('HOOD is at $50.12; will analyze CC options next.', promptId),
+    // NO reply tool_use anywhere — the bug is the hook letting this through.
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'Skill output must not hide the upstream user prompt → block');
+  assertContains(r.stderr, 'om_178', 'block message names the missed message_id');
+  assertContains(r.auditLine, 'status=blocked', 'audit records blocked outcome');
+  assertContains(r.auditLine, 'pending=1', 'audit shows pending=1 (the real prompt was found)');
+}
+
+// --- Test 51: #178 same shape but WITH a correct reply → must PASS (positive control) ---
+console.log('\n[51] Same #178 shape with matching reply → exit 0 (positive control)');
+{
+  const promptId = 'a81ea7d3-af20-4ded-8bb5-aef38dbfc1de';
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_178b" message_id="om_178b" user="kk" chat_type="group">\nbuy HOOD CC?\n</channel>';
+  const skillToolUseId = 'tu_skill_178b';
+  const path = writeTranscript('178-skill-output-with-reply', [
+    makeUserMsgWithPid(userContent, promptId),
+    makeAssistantToolUseWithPid('Skill', skillToolUseId, { skill: 'optix' }, promptId),
+    makeUserToolResultWithPid(skillToolUseId, 'Skill invoked', promptId),
+    makeUserSkillOutput('Base directory for this skill: /Users/kevin/.claude/skills/optix', promptId),
+    makeAssistantToolUseWithPid(
+      'mcp__plugin_lark_lark__reply',
+      'tu_reply_178b',
+      { chat_id: 'oc_178b', reply_to: 'om_178b', text: 'HOOD CC analysis...' },
+      promptId,
+    ),
+    makeAssistantTextWithPid('Done.', promptId),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, 'real reply present → exit 0');
+}
+
+// --- Test 52: legacy transcript (no promptId on any entry) → assistant-boundary fallback works ---
+console.log('\n[52] Legacy transcript without promptId → assistant-boundary fallback preserved (backward compat)');
+{
+  // All existing tests 1-49 use this shape (no promptId field). The fix
+  // must NOT regress them. This explicit test pins the fallback path that
+  // findCurrentTurn takes when promptId is absent — assistant boundary
+  // still terminates the scan (since `pid && currentPromptId` is false on
+  // both sides, the ambiguous branch fires and falls back to the
+  // crossedAssistantAfterCollection heuristic).
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_leg" message_id="om_leg" user="kk" chat_type="p2p">\nq\n</channel>';
+  const priorTurnUser =
+    '<channel source="plugin:lark:lark" chat_id="oc_leg" message_id="om_prior" user="kk" chat_type="p2p">\nold question\n</channel>';
+  const path = writeTranscript('178-legacy-no-promptid', [
+    // Prior turn (already replied)
+    makeUserMsg(priorTurnUser),
+    makeAssistantToolUse('mcp__plugin_lark_lark__reply', {
+      chat_id: 'oc_leg', reply_to: 'om_prior', text: 'old answer',
+    }),
+    makeAssistantText('prior turn done'),
+    // Current turn — no reply, must block on om_leg only (not on om_prior)
+    makeUserMsg(userContent),
+    makeAssistantText('thinking, did not reply'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'legacy current-turn miss → blocks');
+  assertContains(r.stderr, 'om_leg', 'current-turn message_id named');
+  if (r.stderr.includes('om_prior')) {
+    console.log(`  ${RED}✗${RESET} prior-turn message_id leaked into block list`);
+    failed++;
+  } else {
+    console.log(`  ${GREEN}✓${RESET} prior-turn message_id correctly excluded (assistant boundary works in legacy mode)`);
+    passed++;
+  }
+}
+
 // --- Summary ---
 console.log(`\n${'─'.repeat(50)}`);
 if (failed === 0) {
