@@ -84,6 +84,13 @@ export class IdentitySession {
     if (chatId === TERMINAL_CHAT_ID) {
       return this.ownerFallback();
     }
+    // Doc-comment events route through synthetic chat_id `doc:<file_token>`.
+    // v1: all events processed under owner identity, mirroring TERMINAL_CHAT_ID.
+    // Future: if multi-user routing is added, replace this short-circuit with
+    // an event-derived caller (e.g. from notice_meta.from_user_id).
+    if (chatId.startsWith('doc:')) {
+      return this.ownerFallback();
+    }
     if (threadId) {
       const entry = this.map.get(this.key(chatId, threadId));
       if (entry && !this.isStale(entry)) return entry.userId;

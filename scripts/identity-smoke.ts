@@ -85,4 +85,25 @@ function fail(msg: string): never {
   if (s.getOwner() !== null) fail('getOwner null when ownerFallback returns null');
 }
 
-console.log('identity smoke: 10/10 PASS');
+// 11. doc:<token> prefix routes to owner fallback
+{
+  const s = new IdentitySession(() => 'ou_owner');
+  if (s.getCaller('doc:doxcnXXX') !== 'ou_owner') fail('doc: prefix should return owner');
+}
+
+// 12. doc:<token> with no owner configured → null
+{
+  const s = new IdentitySession(() => null);
+  if (s.getCaller('doc:doxcnXXX') !== null) fail('doc: prefix should null when owner unset');
+}
+
+// 13. doc: prefix takes precedence over any chat/thread entry
+{
+  const s = new IdentitySession(() => 'ou_owner');
+  s.setCaller('doc:doxcnXXX', 't1', 'ou_someone_else');
+  if (s.getCaller('doc:doxcnXXX', 't1') !== 'ou_owner') {
+    fail('doc: prefix must short-circuit before chat/thread lookup');
+  }
+}
+
+console.log('identity smoke: 13/13 PASS');
