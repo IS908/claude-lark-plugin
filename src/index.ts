@@ -18,6 +18,19 @@ import { mcpServerInstructions } from './prompts.js';
 
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
 
+function extractDocCommentMeta(envelope: string): Record<string, string> {
+  // Parse the <doc_comment ...> opening tag to extract structured fields.
+  const m = envelope.match(/<doc_comment\s+([^>]+)>/);
+  if (!m) return {};
+  const out: Record<string, string> = {};
+  const attrRe = /(\w+)="([^"]*)"/g;
+  let attr: RegExpExecArray | null;
+  while ((attr = attrRe.exec(m[1])) !== null) {
+    out[attr[1]] = attr[2];
+  }
+  return out;
+}
+
 async function acquireLock(): Promise<void> {
   const myToken = buildLockToken(process.pid);
   try {
@@ -403,6 +416,9 @@ async function main() {
               : message.attachments && message.attachments.length > 1
                 ? { attachments: JSON.stringify(message.attachments) }
                 : {}),
+            ...(message.chatType === 'doc_comment'
+              ? extractDocCommentMeta(message.text)
+              : {}),
           },
         },
       });
