@@ -229,4 +229,70 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (!text.includes('<body unknown="true">')) fail(`14: body should be marked unknown: ${text.slice(0,300)}`);
 }
 
-console.error(`PASS: 11 cases (filters + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body)`);
+// 9. enqueue called with chatKey = "doc:<file_token>"
+{
+  const enqueueCalls: any[] = [];
+  const deps = makeDeps();
+  deps.queue = {
+    enqueue: (chatId: string, threadId: any, task: () => Promise<void>) => {
+      enqueueCalls.push({ chatId, threadId });
+      return task();
+    },
+  } as any;
+  await handleCommentEvent(makeEvent({ file_token: 'dox_specific' }), deps);
+  if (enqueueCalls.length !== 1) fail(`9: expected 1 enqueue`);
+  if (enqueueCalls[0].chatId !== 'doc:dox_specific') fail(`9: chatId wrong: ${enqueueCalls[0].chatId}`);
+  if (enqueueCalls[0].threadId !== undefined) fail(`9: threadId should be undefined`);
+}
+
+// 10. setCaller invoked inside queue task with synthetic chat_id and operator
+{
+  const calls: any[] = [];
+  const deps = makeDeps();
+  const orig = deps.identitySession.setCaller.bind(deps.identitySession);
+  deps.identitySession.setCaller = (chatId, threadId, userId) => {
+    calls.push({ chatId, threadId, userId });
+    return orig(chatId, threadId, userId);
+  };
+  await handleCommentEvent(makeEvent({ file_token: 'dox_X', from_open_id: 'ou_op' }), deps);
+  if (calls.length !== 1) fail(`10: expected 1 setCaller`);
+  if (calls[0].chatId !== 'doc:dox_X') fail(`10: chatId wrong`);
+  if (calls[0].userId !== 'ou_op') fail(`10: userId wrong`);
+}
+
+// 11. handler receives LarkMessage with chatType === 'doc_comment'
+{
+  const deps = makeDeps();
+  await handleCommentEvent(makeEvent(), deps);
+  const msg = deps.handlerCalls[0];
+  if (msg.chatType !== 'doc_comment') fail(`11: chatType: ${msg.chatType}`);
+  if (msg.messageType !== 'doc_comment') fail(`11: messageType: ${msg.messageType}`);
+  if (msg.chatId !== 'doc:dox_test') fail(`11: chatId on LarkMessage wrong`);
+}
+
+// 12. quote === '' → no <selected_text> tag
+{
+  const noQuote = {
+    drive: {
+      fileComment: { get: async () => ({ data: { quote: '', reply_list: { items: [{ reply_id: 'cmt_001', content: { text: 'x' } }] } } }) },
+      metas: { batchQuery: async () => ({ data: { metas: [] } }) },
+    },
+  };
+  const deps = makeDeps({ client: noQuote as any });
+  await handleCommentEvent(makeEvent(), deps);
+  const text = deps.handlerCalls[0].text;
+  if (text.includes('<selected_text')) fail(`12: empty quote should omit tag, got: ${text.slice(0,200)}`);
+}
+
+// 13. operator name with markup chars is escaped in envelope attrs
+{
+  const deps = makeDeps({
+    resolveUserName: async () => '<script>alert(1)</script>',
+  });
+  await handleCommentEvent(makeEvent(), deps);
+  const text = deps.handlerCalls[0].text;
+  if (text.includes('<script>')) fail(`13: operator name not escaped: ${text.slice(0,300)}`);
+  if (!text.includes('&lt;script&gt;')) fail(`13: expected escaped marker missing`);
+}
+
+console.error(`PASS: 16 cases (filters + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape)`);
