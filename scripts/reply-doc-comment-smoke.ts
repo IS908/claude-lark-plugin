@@ -199,4 +199,64 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   if (!denyR?.isError) fail(`9b: non-owner must deny`);
 }
 
-console.error(`PASS: 10 cases (owner gate + error paths + create + doc: security regression)`);
+// 10. SECURITY: chat_id=doc:A but doc_token=B → denied (cross-doc binding violation)
+{
+  const h = makeHarness();
+  h.session.setCaller('doc:dox_A', undefined, 'ou_owner_test');
+  const r = await h.registered.reply_doc_comment({
+    chat_id: 'doc:dox_A',
+    doc_token: 'dox_B',         // wrong doc!
+    comment_id: 'cmt_x',
+    content: 'malicious',
+    file_type: 'docx',
+  });
+  if (!r?.isError) fail(`10: SECURITY: cross-doc binding violation must be denied`);
+  if (!/mismatch/i.test(r.content[0].text)) fail(`10: error msg should mention mismatch: ${r.content[0].text}`);
+  if (h.fileCommentReplyCalls.length !== 0) fail(`10: API must not be called`);
+}
+
+// 11. SECURITY: same check for create_doc_comment
+{
+  const h = makeHarness();
+  h.session.setCaller('doc:dox_A', undefined, 'ou_owner_test');
+  const r = await h.registered.create_doc_comment({
+    chat_id: 'doc:dox_A',
+    doc_token: 'dox_B',         // wrong doc!
+    content: 'malicious top-level',
+    file_type: 'docx',
+  });
+  if (!r?.isError) fail(`11: SECURITY: create_doc_comment cross-doc binding must be denied`);
+  if (!/mismatch/i.test(r.content[0].text)) fail(`11: error msg should mention mismatch: ${r.content[0].text}`);
+  if (h.fileCommentCreateCalls.length !== 0) fail(`11: API must not be called`);
+}
+
+// 12. terminal chat_id allows arbitrary doc_token (operator escape hatch)
+{
+  const h = makeHarness();
+  const r = await h.registered.reply_doc_comment({
+    chat_id: '__terminal__',
+    doc_token: 'dox_arbitrary',  // any doc — owner is in CLI context
+    comment_id: 'cmt_x',
+    content: 'cli-driven reply',
+    file_type: 'docx',
+  });
+  if (r?.isError) fail(`12: terminal must allow arbitrary doc_token: ${JSON.stringify(r)}`);
+  if (h.fileCommentReplyCalls.length !== 1) fail(`12: expected 1 API call`);
+}
+
+// 13. matching binding passes (regression — make sure we didn't break the happy path)
+{
+  const h = makeHarness();
+  h.session.setCaller('doc:dox_real', undefined, 'ou_owner_test');
+  const r = await h.registered.reply_doc_comment({
+    chat_id: 'doc:dox_real',
+    doc_token: 'dox_real',       // matches
+    comment_id: 'cmt_x',
+    content: 'happy path',
+    file_type: 'docx',
+  });
+  if (r?.isError) fail(`13: matching doc: binding must pass: ${JSON.stringify(r)}`);
+  if (h.fileCommentReplyCalls.length !== 1) fail(`13: expected 1 API call`);
+}
+
+console.error(`PASS: 14 cases (owner gate + error paths + create + doc: security regression + doc_token binding)`);
