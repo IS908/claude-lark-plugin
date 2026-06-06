@@ -460,12 +460,21 @@ function extractText(content: any): string | undefined {
 
 function escapeAttr(s: string | undefined): string {
   if (!s) return '';
-  return s.replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;');
+  // & MUST be escaped first; otherwise the &-prefix from later substitutions
+  // (&quot;, &lt;, &gt;) gets double-escaped to &amp;quot;, etc.
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function escapeBody(s: string | undefined): string {
   if (!s) return '';
-  return s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 interface DocCommentEnvelopeArgs {

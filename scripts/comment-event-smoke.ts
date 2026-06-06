@@ -160,4 +160,26 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (deps.handlerCalls[0].text.includes('doc_title=')) fail(`8: doc_title must be omitted on failure`);
 }
 
-console.error(`PASS: 7 cases (filters + pre-fetch happy + fetch errors)`);
+// 7a. ampersand in operator name escaped exactly once
+{
+  const deps = makeDeps({ resolveUserName: async () => 'AT&T Engineering' });
+  await handleCommentEvent(makeEvent({ comment_id: 'cmt_7a' }), deps);
+  const text = deps.handlerCalls[0].text;
+  if (!text.includes('operator="AT&amp;T Engineering"')) {
+    fail(`7a: ampersand not escaped exactly once: ${text.slice(0, 300)}`);
+  }
+  if (text.includes('&amp;amp;')) fail(`7a: double-escaped: ${text.slice(0, 300)}`);
+}
+
+// 7b. quote char in operator escaped without &-double-encoding
+{
+  const deps = makeDeps({ resolveUserName: async () => 'Bob "the builder"' });
+  await handleCommentEvent(makeEvent({ comment_id: 'cmt_7b' }), deps);
+  const text = deps.handlerCalls[0].text;
+  if (!text.includes('operator="Bob &quot;the builder&quot;"')) {
+    fail(`7b: quote not escaped correctly: ${text.slice(0, 300)}`);
+  }
+  if (text.includes('&amp;quot;')) fail(`7b: quote re-escaped: ${text.slice(0, 300)}`);
+}
+
+console.error(`PASS: 9 cases (filters + pre-fetch happy + fetch errors + escape ordering)`);
