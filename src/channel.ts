@@ -12,7 +12,7 @@ import { withFeishuRetry } from './feishu-retry.js';
 import { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
-import { TERMINAL_CHAT_ID } from './identity-session.js';
+import { TERMINAL_CHAT_ID, DOC_CHAT_ID_PREFIX } from './identity-session.js';
 import { writeSdkResource } from './sdk-resource.js';
 
 const DEBUG_LOG = path.join(os.homedir(), '.claude', 'channels', 'lark', 'debug.log');
@@ -378,20 +378,121 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
   // Loop prevention: don't process the bot's own comments.
   if (meta.from_user_id?.open_id === deps.botOpenId) return;
 
-  // Pre-fetch and envelope build land in Tasks 7–9.
-  // For now, dispatch a minimal placeholder message so dedup + filters are
-  // observable via the messageHandler. This intentionally builds nothing of
-  // substance — Task 9 replaces this with the real envelope after pre-fetch.
-  const minimal: LarkMessage = {
-    messageId: `doc_comment:${meta.file_token ?? ''}:${meta.comment_id ?? ''}`,
-    chatId: `doc:${meta.file_token ?? ''}`,
-    chatType: 'p2p',
-    senderId: meta?.from_user_id?.open_id ?? '',
-    text: '',
+  const fileToken: string = meta.file_token;
+  const commentId: string = meta.comment_id;
+  const replyId: string | undefined = meta.reply_id;
+  const fileType: string = meta.file_type;
+  const fromOpenId: string = meta.from_user_id.open_id;
+
+  // Pre-fetch comment body. We swallow errors but flag them in the envelope
+  // so Claude can decide whether to defer or surface to the user.
+  let parentBody: string | undefined;
+  let body: string | undefined;
+  let quote: string | undefined;
+  let fetchError: string | undefined;
+  try {
+    const resp = await deps.client.drive.fileComment.get({
+      path: { file_token: fileToken, comment_id: commentId },
+      params: { file_type: fileType },
+    });
+    const c = resp?.data ?? {};
+    quote = typeof c.quote === 'string' && c.quote.length > 0 ? c.quote : undefined;
+    const replies: any[] = c.reply_list?.items ?? c.reply_list ?? [];
+    if (replyId) {
+      // add_reply: parent = reply_list[0] (the comment itself), body = the reply_id one
+      // Task 8 fleshes out the missing-reply_id case; for now, leave body undefined when not found.
+      parentBody = extractText(replies[0]?.content);
+      const target = replies.find((r: any) => r.reply_id === replyId);
+      body = target ? extractText(target.content) : undefined;
+    } else {
+      // add_comment: body = the comment itself
+      body = extractText(replies[0]?.content);
+    }
+  } catch (e: any) {
+    fetchError = e?.message || String(e);
+  }
+
+  let docTitle: string | undefined;
+  try {
+    const metaResp = await deps.client.drive.metas.batchQuery({
+      data: { request_docs: [{ doc_token: fileToken, doc_type: fileType }] },
+    });
+    docTitle = metaResp?.data?.metas?.[0]?.title;
+  } catch {
+    docTitle = undefined;
+  }
+
+  const senderName = await deps.resolveUserName(fromOpenId);
+  const envelope = buildDocCommentEnvelope({
+    fileToken, commentId, replyId, fileType,
+    operator: senderName, isMentioned: true,
+    docTitle, quote, parentBody, body, fetchError,
+  });
+
+  const synthetic: LarkMessage = {
+    messageId: replyId ?? commentId,
+    chatId: `${DOC_CHAT_ID_PREFIX}${fileToken}`,
+    chatType: 'doc_comment',
+    senderId: fromOpenId,
+    senderName,
+    text: envelope,
     messageType: 'doc_comment',
-    rawContent: '',
+    rawContent: JSON.stringify(data),
   };
-  await deps.messageHandler(minimal);
+
+  deps.queue.enqueue(`${DOC_CHAT_ID_PREFIX}${fileToken}`, undefined, async () => {
+    deps.identitySession.setCaller(`${DOC_CHAT_ID_PREFIX}${fileToken}`, undefined, fromOpenId);
+    await deps.messageHandler(synthetic);
+  });
+}
+
+function extractText(content: any): string | undefined {
+  if (!content) return undefined;
+  // Feishu comment content is either { text: "..." } or { elements: [...] }
+  if (typeof content.text === 'string') return content.text;
+  if (Array.isArray(content.elements)) {
+    return content.elements
+      .map((el: any) => el?.text_run?.text ?? el?.docs_link?.url ?? '')
+      .join('');
+  }
+  return undefined;
+}
+
+function escapeAttr(s: string | undefined): string {
+  if (!s) return '';
+  return s.replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;');
+}
+
+function escapeBody(s: string | undefined): string {
+  if (!s) return '';
+  return s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+interface DocCommentEnvelopeArgs {
+  fileToken: string; commentId: string; replyId?: string; fileType: string;
+  operator: string; isMentioned: boolean;
+  docTitle?: string; quote?: string; parentBody?: string; body?: string; fetchError?: string;
+}
+
+function buildDocCommentEnvelope(a: DocCommentEnvelopeArgs): string {
+  const kind = a.replyId ? 'reply' : 'comment';
+  const attrs = [
+    `doc_token="${escapeAttr(a.fileToken)}"`,
+    `comment_id="${escapeAttr(a.commentId)}"`,
+    a.replyId ? `reply_id="${escapeAttr(a.replyId)}"` : '',
+    `kind="${kind}"`,
+    `operator="${escapeAttr(a.operator)}"`,
+    a.docTitle ? `doc_title="${escapeAttr(a.docTitle)}"` : '',
+    `file_type="${escapeAttr(a.fileType)}"`,
+    `is_mentioned="${a.isMentioned}"`,
+  ].filter(Boolean).join(' ');
+
+  const inner: string[] = [];
+  if (a.fetchError) inner.push(`  <fetch_error>${escapeBody(a.fetchError)}</fetch_error>`);
+  if (a.quote) inner.push(`  <selected_text>${escapeBody(a.quote)}</selected_text>`);
+  if (a.parentBody) inner.push(`  <parent>${escapeBody(a.parentBody)}</parent>`);
+  inner.push(`  <body>${escapeBody(a.body)}</body>`);
+  return `<doc_comment ${attrs}>\n${inner.join('\n')}\n</doc_comment>`;
 }
 
 export class LarkChannel {

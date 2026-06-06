@@ -114,4 +114,50 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (deps.handlerCalls.length !== 0) fail(`4: bot's own comment must be dropped`);
 }
 
-console.error(`PASS: 4 cases (dedup + filters)`);
+// 5. add_comment (no reply_id): pre-fetch + envelope has <body> not <parent>
+{
+  const deps = makeDeps();
+  await handleCommentEvent(makeEvent({ comment_id: 'cmt_5', reply_id: undefined }), deps);
+  if (deps.commentGetCalls.length !== 1) fail(`5: expected 1 fileComment.get call`);
+  const call = deps.commentGetCalls[0];
+  if (call.path?.comment_id !== 'cmt_5') fail(`5: comment_id not passed`);
+  if (call.path?.file_token !== 'dox_test') fail(`5: file_token not passed`);
+  if (deps.handlerCalls.length !== 1) fail(`5: expected 1 handler call`);
+  const msg = deps.handlerCalls[0];
+  if (!msg.text.includes('<body>')) fail(`5: envelope missing <body>: ${msg.text.slice(0, 200)}`);
+  if (msg.text.includes('<parent>')) fail(`5: add_comment must not have <parent>`);
+}
+
+// 7. pre-fetch throws → handler still called with <fetch_error>, event not dropped
+{
+  const failingClient = {
+    drive: {
+      fileComment: { get: async () => { throw new Error('feishu boom'); } },
+      metas: { batchQuery: async () => ({ data: { metas: [] } }) },
+    },
+  };
+  const deps = makeDeps({ client: failingClient as any });
+  await handleCommentEvent(makeEvent({ comment_id: 'cmt_7' }), deps);
+  if (deps.handlerCalls.length !== 1) fail(`7: handler should still fire on fetch error`);
+  if (!deps.handlerCalls[0].text.includes('<fetch_error>')) fail(`7: envelope missing <fetch_error>`);
+}
+
+// 8. doc_title fetch failure → no doc_title attribute, handler still called
+{
+  const noTitleClient = {
+    drive: {
+      fileComment: {
+        get: async (params: any) => ({
+          data: { quote: '', reply_list: { items: [{ reply_id: params.path.comment_id, content: { text: 'b' } }] } },
+        }),
+      },
+      metas: { batchQuery: async () => { throw new Error('meta boom'); } },
+    },
+  };
+  const deps = makeDeps({ client: noTitleClient as any });
+  await handleCommentEvent(makeEvent({ comment_id: 'cmt_8' }), deps);
+  if (deps.handlerCalls.length !== 1) fail(`8: handler should fire even when title fetch fails`);
+  if (deps.handlerCalls[0].text.includes('doc_title=')) fail(`8: doc_title must be omitted on failure`);
+}
+
+console.error(`PASS: 7 cases (filters + pre-fetch happy + fetch errors)`);
