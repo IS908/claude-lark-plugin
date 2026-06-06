@@ -22,7 +22,7 @@ npm start -- --dry-run # Validate config and module loading without connecting
 src/index.ts        – Entry point: wires MCP server, LarkChannel, memory, and buffer together
 src/config.ts       – Loads config from ~/.claude/channels/lark/.env (dotenv)
 src/channel.ts      – LarkChannel: Feishu WebSocket client, message parsing, memory enrichment pipeline
-src/tools.ts        – Registers 12 MCP tools: reply, edit_message, react, download_attachment, save_memory, save_skill, create_job, list_jobs, update_job, delete_job, what_do_you_know, forget_memory
+src/tools.ts        – Registers 14 MCP tools: reply, edit_message, react, download_attachment, save_memory, save_skill, create_job, list_jobs, update_job, delete_job, what_do_you_know, forget_memory, reply_doc_comment, create_doc_comment
 src/audit-log.ts    – Append-only audit log for sensitive tool invocations
 src/feishu-card.ts  – Card builder: markdown optimization, Schema 2.0 card assembly
 src/job-store.ts    – Job CRUD: read/write JSON files, sanitizeJobId, expandScheduleAlias
@@ -40,6 +40,8 @@ src/privacy-rules.ts  – L1 hardcoded regex + keyword rules; L2 user-rules file
 **Reaction flow:** Feishu reaction event → `handleReactionEvent` → filter (bot self, bot messages only, whitelists) → forward to Claude via channel notification.
 
 **CronJob flow:** `JobScheduler.tick()` every 60s → read all job files → for each active job where `next_run_at <= now` → execute (message: direct Feishu API / prompt: inject via `notifications/claude/channel` under a unique `thread_id` + bind session identity to `job.created_by`) → update `runtime` in job file. On startup, `recoverMissedJobs()` runs the same check once for crash recovery.
+
+**Doc-comment flow:** Feishu doc comment event `drive.notice.comment_add_v1` → `handleCommentEvent` (pure function in `src/channel.ts`) → filter (`is_mentioned=true` AND `from_user_id != bot`) → pre-fetch comment / parent body via `drive.fileComment.get` + doc title via `drive.meta.batchQuery` → enqueue per `chatKey = "doc:<file_token>"` → forward to Claude with envelope `<doc_comment ...>` and `meta.chat_id = "doc:<file_token>"`. Outgoing reply via `reply_doc_comment` tool (owner-only, bot identity via `tenant_access_token`). Stop hook satisfies on `reply_doc_comment` with matching `comment_id` + `doc_token`; `reply` / `react` / `edit_message` / `create_doc_comment` do not satisfy a pending doc_comment.
 
 **Identity flow (v0.9.0+):** Every inbound message calls `identitySession.setCaller(chatId, threadId, senderId)` before enqueue. Sensitive MCP tools (`save_memory`, `save_skill`, `create_job`, `list_jobs`, `update_job`, `delete_job`, `what_do_you_know`, `forget_memory`) derive the caller from the session via `resolveCaller(chat_id, thread_id)` — they never trust Claude-declared identity parameters. Terminal skills use the reserved `chat_id = "__terminal__"` which resolves to `LARK_OWNER_OPEN_ID`.
 
@@ -67,6 +69,14 @@ Required env vars: `LARK_APP_ID`, `LARK_APP_SECRET` (in `~/.claude/channels/lark
 
 Optional but recommended: `LARK_OWNER_OPEN_ID` — enables terminal-side skills (e.g. `/lark:jobs`) to act as the operator. Without it, terminal tool calls are denied.
 
+For doc-comment support, the Feishu app must have these scopes enabled in the dev console:
+- `docs:document.comment:read` — pre-fetch comment bodies
+- `docs:document.comment:create` — post replies / new top-level comments
+- `drive:drive.metadata:readonly` — fetch doc titles
+- `docx:document:readonly` — read docx contents when Claude wants context
+
+The event `drive.notice.comment_add_v1` must be enabled in the dev console (事件与回调 → 添加事件). Bot identity provides tenant-wide coverage — no per-file subscribe needed.
+
 The `/lark:configure` skill (in `skills/configure/SKILL.md`) provides interactive setup within Claude Code.
 
 ## Important Conventions
@@ -78,6 +88,7 @@ The `/lark:configure` skill (in `skills/configure/SKILL.md`) provides interactiv
 - **Group chat filtering**: Only messages with @bot mentions are processed (precise match via bot open_id fetched at startup). P2P messages are always processed.
 - **Reaction events**: Subscribed to `im.message.reaction.created_v1`. Filtered: ignores bot's own reactions, non-bot messages, and respects whitelists.
 - **Stop hook enforces reply (v1.0.10+)**: `hooks/enforce-lark-reply.mjs` runs on every Claude `Stop` event. If a `<channel source="plugin:lark:lark">` message in the current turn was not answered by `reply` or `react` targeting the same `message_id`, the hook exits `2` and Claude is forced to remediate before ending the turn. (`edit_message` is intentionally excluded — its `message_id` targets the bot's previous card, not the user's inbound id, so it cannot satisfy a pending reply obligation.) To intentionally bypass (async handling / non-actionable event), put the literal sentinel `[LARK_DEFER]` or `[LARK_NO_REPLY]` on **its own line** in the turn's text output (inline echo is rejected — the line-only requirement guards against user-content echo attacks). Audit trail at `~/.claude/channels/lark/hook-audit.log` (override path with `LARK_HOOK_AUDIT_LOG`). Fail-safe: any hook error exits `0`, never blocks.
+- **Doc-comment events (v1.0.60+)**: subscribed via `drive.notice.comment_add_v1` in `src/channel.ts` (handler registration around line 843; dispatch via the pure `handleCommentEvent`). Bot must be a doc collaborator AND `is_mentioned=true` to trigger; the bot is automatically added as collaborator when @-mentioned in a comment. `reply_doc_comment` posts replies as the bot's app identity (tenant_access_token); requires "可评论" permission on the doc.
 
 ## Debugging
 
