@@ -428,13 +428,15 @@ export interface DocCommentToolsDeps {
  *     'denied' line and a clear error.
  *   - The `doc:<file_token>` chat_id prefix is the synthetic chat used by
  *     comment events. `handleCommentEvent` binds the event's
- *     `from_user_id.open_id` via `setCaller("doc:<file_token>", undefined,
- *     ...)` before dispatch, so `getCaller` resolves to the REAL inbound user
- *     — not the owner. The owner gate below then compares that resolved
- *     caller to `getOwner()` explicitly; non-owners are denied. (Earlier
- *     drafts of this PR had a `doc:` prefix shortcut to ownerFallback;
- *     removed in PR #182 review — it would have let any non-owner
- *     @-mentioning the bot in a doc comment escalate to owner identity.)
+ *     `from_user_id.open_id` via `setCaller("doc:<file_token>", comment_id,
+ *     ...)` — keyed per-comment to avoid cross-event session races on the
+ *     same doc (PR #182 round 4 I1, commit `b87657c`). `getCaller` resolves
+ *     to the REAL inbound user — not the owner. The owner gate below then
+ *     compares that resolved caller to `getOwner()` explicitly; non-owners
+ *     are denied. (Earlier drafts of this PR had a `doc:` prefix shortcut
+ *     to ownerFallback; removed in PR #182 review — it would have let any
+ *     non-owner @-mentioning the bot in a doc comment escalate to owner
+ *     identity.)
  *
  * Identity used to call Feishu: tenant_access_token (bot). The reply is
  * authored as the bot's app name. No user-impersonation path (spec §4.3).
@@ -488,7 +490,7 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
       inputSchema: z.object({
         chat_id: z
           .string()
-          .describe('Caller chat_id from notification meta (e.g. doc:<file_token> or __terminal__).'),
+          .describe('Caller chat_id from notification meta. MUST start with "doc:" — these tools are only callable from doc-comment-triggered turns.'),
         thread_id: z
           .string()
           .optional()
@@ -611,7 +613,9 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
       description:
         'Post a new top-level comment on a Feishu doc (owner-only). Use to start a fresh comment thread rather than reply to an existing one.',
       inputSchema: z.object({
-        chat_id: z.string(),
+        chat_id: z
+          .string()
+          .describe('Caller chat_id from notification meta. MUST start with "doc:" — these tools are only callable from doc-comment-triggered turns.'),
         thread_id: z
           .string()
           .optional()

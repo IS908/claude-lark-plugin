@@ -60,11 +60,12 @@ export const SYSTEM_FLUSH_CALLER = '__system_flush__';
  *
  * IMPORTANT: this is a naming convention only — there is NO short-circuit
  * in `getCaller` that maps `doc:` prefix to a specific identity. The caller
- * is bound at event-time by `setCaller("doc:<file_token>", undefined,
- * from_user_id.open_id)` in `handleCommentEvent`, and resolved through the
- * normal session-map lookup. Tools that require owner identity (e.g.
- * `reply_doc_comment`) check the resolved caller against `getOwner()`
- * explicitly.
+ * is bound at event-time by `setCaller("doc:<file_token>", comment_id,
+ * from_user_id.open_id)` in `handleCommentEvent` — keyed per-comment to
+ * avoid cross-event session races on the same doc (PR #182 round 4 I1,
+ * commit `b87657c`). Resolved through the normal session-map lookup.
+ * Tools that require owner identity (e.g. `reply_doc_comment`) check the
+ * resolved caller against `getOwner()` explicitly.
  *
  * An earlier version of this PR had a `chatId.startsWith(DOC_CHAT_ID_PREFIX)
  * → ownerFallback()` shortcut. That shortcut bypassed the server-derived
