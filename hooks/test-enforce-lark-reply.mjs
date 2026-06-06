@@ -1468,6 +1468,120 @@ console.log('\n[53] R1-D1 regression: prior-turn defer must NOT swallow current-
   }
 }
 
+// ─── doc_comment satisfy cases (#181, Task 15) ──────────────────────────────
+// The doc_comment channel surfaces inbound notifications as
+// <channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y" ...>
+// (in real transcripts the discriminator is `chat_type="doc_comment"`; the
+// hook accepts either marker). Satisfying these requires `reply_doc_comment`
+// with matching doc_token + comment_id — plain `reply` / `react` / `edit_message`
+// targeting message_id do NOT satisfy, and `create_doc_comment` is a sibling
+// write that creates a NEW thread rather than answering the pending one.
+
+// --- Test 54: doc_comment with no satisfy → exit 2 ---
+console.log('\n[54] doc_comment with no satisfying tool_use → exit 2');
+{
+  const userContent =
+    'Earlier inbound\n<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const path = writeTranscript('doc-comment-empty-turn', [
+    makeUserMsg(userContent),
+    makeAssistantText('thinking but did not reply'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'doc_comment empty turn must exit 2');
+}
+
+// --- Test 55: reply_doc_comment with matching ids → exit 0 ---
+console.log('\n[55] reply_doc_comment with matching doc_token+comment_id → exit 0');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const path = writeTranscript('doc-comment-satisfied', [
+    makeUserMsg(userContent),
+    makeAssistantToolUse('mcp__plugin_lark_lark__reply_doc_comment', {
+      doc_token: 'X', comment_id: 'Y', content: 'ok', file_type: 'docx',
+    }),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, 'matching reply_doc_comment satisfies');
+}
+
+// --- Test 56: plain `reply` does NOT satisfy a doc_comment obligation ---
+console.log('\n[56] plain reply with matching message_id does NOT satisfy doc_comment → exit 2');
+{
+  // The doc_comment notification still carries a synthetic message_id
+  // (commentId / replyId). A plain `reply` targeting that id would have
+  // satisfied an IM tag — but doc_comment requires the dedicated tool.
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y" message_id="Y">stuff</channel>';
+  const path = writeTranscript('doc-comment-plain-reply-noop', [
+    makeUserMsg(userContent),
+    makeAssistantToolUse('mcp__plugin_lark_lark__reply', { message_id: 'Y', text: 'ok' }),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'plain reply must NOT satisfy doc_comment');
+}
+
+// --- Test 57: comment_id mismatch on reply_doc_comment → exit 2 ---
+console.log('\n[57] reply_doc_comment with comment_id mismatch → exit 2');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const path = writeTranscript('doc-comment-comment-mismatch', [
+    makeUserMsg(userContent),
+    makeAssistantToolUse('mcp__plugin_lark_lark__reply_doc_comment', {
+      doc_token: 'X', comment_id: 'WRONG', content: 'ok', file_type: 'docx',
+    }),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'comment_id mismatch does NOT satisfy');
+}
+
+// --- Test 58: doc_token mismatch on reply_doc_comment → exit 2 ---
+console.log('\n[58] reply_doc_comment with doc_token mismatch → exit 2');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const path = writeTranscript('doc-comment-token-mismatch', [
+    makeUserMsg(userContent),
+    makeAssistantToolUse('mcp__plugin_lark_lark__reply_doc_comment', {
+      doc_token: 'OTHER', comment_id: 'Y', content: 'ok', file_type: 'docx',
+    }),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'doc_token mismatch does NOT satisfy');
+}
+
+// --- Test 59: [LARK_DEFER] sentinel satisfies doc_comment (parity with IM) ---
+console.log('\n[59] [LARK_DEFER] on its own line satisfies doc_comment → exit 0');
+{
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const path = writeTranscript('doc-comment-defer', [
+    makeUserMsg(userContent),
+    makeAssistantText('Async handling needed.\n[LARK_DEFER]\nWill follow up later.'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, '[LARK_DEFER] sentinel satisfies doc_comment');
+}
+
+// --- Test 60: create_doc_comment does NOT satisfy a pending doc_comment ---
+console.log('\n[60] create_doc_comment (sibling create, not reply) → exit 2');
+{
+  // create_doc_comment opens a NEW comment thread; it doesn't answer
+  // an existing one. A pending doc_comment notification expects a
+  // reply on the SAME thread.
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const path = writeTranscript('doc-comment-create-does-not-satisfy', [
+    makeUserMsg(userContent),
+    makeAssistantToolUse('mcp__plugin_lark_lark__create_doc_comment', {
+      doc_token: 'X', content: 'fyi', file_type: 'docx',
+    }),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'create_doc_comment does NOT satisfy a comment reply obligation');
+}
+
 // --- Summary ---
 console.log(`\n${'─'.repeat(50)}`);
 if (failed === 0) {

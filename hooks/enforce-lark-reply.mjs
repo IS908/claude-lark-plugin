@@ -31,7 +31,7 @@ const LOG_MAX_BYTES = (() => {
   return Number.isFinite(n) && n > 0 ? n : 50 * 1024 * 1024;
 })();
 
-// Tools that count as fulfilling a reply obligation for an inbound message.
+// Tools that count as fulfilling a reply obligation for an inbound IM message.
 // - reply: standard answer; reply.reply_to → user's inbound message_id
 // - react: emoji ack on the user's message; react.message_id → user's id
 //
@@ -46,6 +46,14 @@ const REPLY_TOOLS = new Set([
   'mcp__plugin_lark_lark__reply',
   'mcp__plugin_lark_lark__react',
 ]);
+// Doc-comment satisfy tool (#181). A pending <channel kind="doc_comment"
+// doc_token="X" comment_id="Y"> is satisfied ONLY by reply_doc_comment with
+// the SAME doc_token + comment_id. Plain reply / react / edit_message do NOT
+// satisfy — they target a different transport (IM message_id) and cannot
+// reach the doc-comment thread. create_doc_comment is a sibling write that
+// opens a new thread, not a reply on the pending one, so it doesn't satisfy
+// either.
+const DOC_COMMENT_REPLY_TOOL = 'mcp__plugin_lark_lark__reply_doc_comment';
 const DEFER_SENTINELS = ['[LARK_DEFER]', '[LARK_NO_REPLY]'];
 
 // Tag opener anchor — we then parse attributes manually to handle quoted
@@ -388,6 +396,14 @@ function findCurrentTurn(entries) {
   return { realUserIndices, scanFromIndex };
 }
 
+// Doc-comment tags are identified by either explicit `kind="doc_comment"`
+// (used in spec / test fixtures) or `chat_type="doc_comment"` (set by
+// src/channel.ts:435 in real notifications). Either marker routes the tag
+// through the doc-comment satisfy path instead of the IM message_id path.
+function isDocCommentTag(attrs) {
+  return attrs.kind === 'doc_comment' || attrs.chat_type === 'doc_comment';
+}
+
 function shouldSkipChannelTag(attrs) {
   // Reaction events: chat_type === "reaction" → no reply expected
   // (verified: src/channel.ts:287 sets chat_type from inbound event)
@@ -407,6 +423,12 @@ function shouldSkipChannelTag(attrs) {
   // with the outer source='plugin:lark:lark'). The unambiguous marker is
   // meta.job_id (also set by scheduler.ts:438) — use that instead.
   if (attrs.job_id) return true;
+  // Doc-comment tags (#181) use doc_token + comment_id as the satisfy keys
+  // instead of message_id. Don't apply the no-message_id skip below; the
+  // doc-comment satisfy path takes over.
+  if (isDocCommentTag(attrs)) {
+    return !attrs.doc_token || !attrs.comment_id;
+  }
   // No message_id means we cannot match a reply anyway — skip
   if (!attrs.message_id) return true;
   return false;
@@ -420,10 +442,27 @@ function collectPendingLarkMessages(entries, realUserIndices) {
     const text = extractTextFromContent(entry.message?.content);
     for (const attrs of scanChannelTags(text)) {
       if (shouldSkipChannelTag(attrs)) continue;
-      // Dedup by message_id in case the same notification appears twice
+      if (isDocCommentTag(attrs)) {
+        // Doc-comment pending key is (doc_token, comment_id). Dedup on the
+        // composite key — same pair appearing twice in a turn (queue race
+        // shouldn't happen for doc_comment, but defensive parity with IM).
+        const key = `doc:${attrs.doc_token}:${attrs.comment_id}`;
+        if (seenIds.has(key)) continue;
+        seenIds.add(key);
+        pending.push({
+          kind: 'doc_comment',
+          doc_token: attrs.doc_token,
+          comment_id: attrs.comment_id,
+          chat_id: attrs.chat_id || '',
+          user: attrs.operator || attrs.user || '',
+        });
+        continue;
+      }
+      // IM path: dedup by message_id in case the same notification appears twice
       if (seenIds.has(attrs.message_id)) continue;
       seenIds.add(attrs.message_id);
       pending.push({
+        kind: 'im',
         message_id: attrs.message_id,
         chat_id: attrs.chat_id || '',
         thread_id: attrs.thread_id || '',
@@ -436,27 +475,42 @@ function collectPendingLarkMessages(entries, realUserIndices) {
 
 function collectReplies(entries, fromIndex) {
   const replies = [];
+  const docCommentReplies = [];
   for (let i = fromIndex; i < entries.length; i++) {
     const entry = entries[i];
     if (entry?.type !== 'assistant') continue;
     const tools = extractToolUses(entry.message?.content);
     for (const t of tools) {
-      if (!REPLY_TOOLS.has(t.name)) continue;
       const input = t.input || {};
-      // For react the target message_id is in `message_id` (the user's
-      // message being reacted to), not `reply_to` — both fields are accepted
-      // as the target. (edit_message is excluded from REPLY_TOOLS above —
-      // its message_id targets the BOT's previous message, not the user's
-      // inbound id, so it cannot satisfy a pending reply obligation.)
-      const targetMessageId = input.reply_to || input.message_id || '';
-      replies.push({
-        tool: t.name,
-        reply_to: targetMessageId,
-        chat_id: input.chat_id || '',
-      });
+      if (REPLY_TOOLS.has(t.name)) {
+        // For react the target message_id is in `message_id` (the user's
+        // message being reacted to), not `reply_to` — both fields are accepted
+        // as the target. (edit_message is excluded from REPLY_TOOLS above —
+        // its message_id targets the BOT's previous message, not the user's
+        // inbound id, so it cannot satisfy a pending reply obligation.)
+        const targetMessageId = input.reply_to || input.message_id || '';
+        replies.push({
+          tool: t.name,
+          reply_to: targetMessageId,
+          chat_id: input.chat_id || '',
+        });
+        continue;
+      }
+      if (t.name === DOC_COMMENT_REPLY_TOOL) {
+        // Doc-comment satisfy keys are doc_token + comment_id. We collect
+        // every call here; the satisfy check (computeUnanswered) matches
+        // against pending doc_comment records by composite key.
+        // create_doc_comment is INTENTIONALLY excluded — it opens a new
+        // thread rather than replying to the pending comment.
+        docCommentReplies.push({
+          tool: t.name,
+          doc_token: input.doc_token || '',
+          comment_id: input.comment_id || '',
+        });
+      }
     }
   }
-  return replies;
+  return { replies, docCommentReplies };
 }
 
 // Collect text the model emitted in this turn — assistant text blocks AND
@@ -678,13 +732,20 @@ function hasDeferSentinel(text) {
 // current turn's chat coverage), and (b) the per-chat reply count covers
 // the per-chat pending count (Round 1 fix #3 — prevents one reply from
 // silently satisfying multiple distinct @-mentions in a group chat).
-function computeUnanswered(pending, replies) {
-  const inTurnIds = new Set(pending.map((p) => p.message_id));
+function computeUnanswered(pending, replies, docCommentReplies) {
+  // Partition pending by kind so the IM chat-coverage heuristic doesn't
+  // see doc_comment pseudo chats (chat_id = "doc:<token>") and doc_comment
+  // doesn't get confused by IM message_ids.
+  const imPending = pending.filter((p) => p.kind !== 'doc_comment');
+  const docPending = pending.filter((p) => p.kind === 'doc_comment');
+
+  // ── IM path (existing logic, untouched semantics) ──
+  const inTurnIds = new Set(imPending.map((p) => p.message_id));
   const repliedIds = new Set(replies.map((r) => r.reply_to).filter(Boolean));
 
   // Count pending per chat
   const pendingByChat = new Map();
-  for (const p of pending) {
+  for (const p of imPending) {
     if (p.chat_id) pendingByChat.set(p.chat_id, (pendingByChat.get(p.chat_id) || 0) + 1);
   }
   // Count replies per chat — but only those that could plausibly belong to
@@ -699,7 +760,7 @@ function computeUnanswered(pending, replies) {
     repliesByChat.set(r.chat_id, (repliesByChat.get(r.chat_id) || 0) + 1);
   }
 
-  return pending.filter((p) => {
+  const unansweredIm = imPending.filter((p) => {
     // 1) Direct match by message_id always satisfies
     if (repliedIds.has(p.message_id)) return false;
     // 2) Heuristic: chat covered if replies-in-chat >= pending-in-chat
@@ -710,6 +771,21 @@ function computeUnanswered(pending, replies) {
     }
     return true;
   });
+
+  // ── doc_comment path (#181) ──
+  // Strict pair-key match only — no chat-coverage heuristic here. Each
+  // doc_comment thread is independent; partial overlap (e.g. same doc_token
+  // but different comment_ids) must not silently satisfy.
+  const docReplyKeys = new Set(
+    docCommentReplies
+      .filter((r) => r.doc_token && r.comment_id)
+      .map((r) => `${r.doc_token}\x00${r.comment_id}`),
+  );
+  const unansweredDoc = docPending.filter(
+    (p) => !docReplyKeys.has(`${p.doc_token}\x00${p.comment_id}`),
+  );
+
+  return [...unansweredIm, ...unansweredDoc];
 }
 
 function buildBlockMessage(unanswered) {
@@ -717,14 +793,33 @@ function buildBlockMessage(unanswered) {
     '[LARK Stop Hook] Unreplied Lark message(s) detected:',
     '',
   ];
+  let hasIm = false;
+  let hasDoc = false;
   for (const u of unanswered) {
+    if (u.kind === 'doc_comment') {
+      hasDoc = true;
+      lines.push(
+        `  - kind=doc_comment doc_token=${u.doc_token} comment_id=${u.comment_id} chat_id=${u.chat_id || '?'} user=${u.user || '?'}`
+      );
+    } else {
+      hasIm = true;
+      lines.push(
+        `  - message_id=${u.message_id} chat_id=${u.chat_id || '?'} thread_id=${u.thread_id || '(none)'} user=${u.user || '?'}`
+      );
+    }
+  }
+  lines.push('');
+  if (hasIm) {
     lines.push(
-      `  - message_id=${u.message_id} chat_id=${u.chat_id || '?'} thread_id=${u.thread_id || '(none)'} user=${u.user || '?'}`
+      'For IM messages: call mcp__plugin_lark_lark__reply (or react targeting the same message_id) for each pending message before ending the turn. Note: edit_message does NOT satisfy this — its message_id targets the bot\'s own card, not the user\'s inbound id, so calling edit_message will leave the user unaddressed and re-trigger this block.',
+    );
+  }
+  if (hasDoc) {
+    lines.push(
+      'For doc_comment items (#181): call mcp__plugin_lark_lark__reply_doc_comment with the SAME doc_token and comment_id. Plain reply / react / edit_message do NOT satisfy a doc_comment obligation (different transport). create_doc_comment opens a new thread and also does not satisfy.',
     );
   }
   lines.push(
-    '',
-    'Call mcp__plugin_lark_lark__reply (or react targeting the same message_id) for each pending message before ending the turn. Note: edit_message does NOT satisfy this — its message_id targets the bot\'s own card, not the user\'s inbound id, so calling edit_message will leave the user unaddressed and re-trigger this block.',
     'If you intentionally do NOT want to reply (async handling / non-actionable event),',
     'put the literal sentinel [LARK_DEFER] or [LARK_NO_REPLY] on its OWN LINE in your text output for this turn.'
   );
@@ -774,10 +869,10 @@ function main() {
     process.exit(0);
   }
 
-  let pending, replies, assistantText, larkToolUseIds, toolResultText;
+  let pending, replies, docCommentReplies, assistantText, larkToolUseIds, toolResultText;
   try {
     pending = collectPendingLarkMessages(entries, turn.realUserIndices);
-    replies = collectReplies(entries, turn.scanFromIndex);
+    ({ replies, docCommentReplies } = collectReplies(entries, turn.scanFromIndex));
     assistantText = collectAssistantText(entries, turn.scanFromIndex);
     // #122 fix: also gather tool_result text from lark-plugin tools.
     // Lets the defer signal be mechanical (the tool itself emits the
@@ -789,15 +884,20 @@ function main() {
     process.exit(0);
   }
 
+  // Count pending by kind for diagnostic audit lines (#181).
+  const pendingIm = pending.filter((p) => p.kind !== 'doc_comment').length;
+  const pendingDoc = pending.filter((p) => p.kind === 'doc_comment').length;
+  const replyCount = replies.length + docCommentReplies.length;
+
   if (pending.length === 0) {
-    audit(`Stop  status=ok  pending=0  replied=${replies.length}  reason=no-lark-channel`);
+    audit(`Stop  status=ok  pending=0  replied=${replyCount}  reason=no-lark-channel`);
     process.exit(0);
   }
 
-  const unanswered = computeUnanswered(pending, replies);
+  const unanswered = computeUnanswered(pending, replies, docCommentReplies);
 
   if (unanswered.length === 0) {
-    audit(`Stop  status=ok  pending=${pending.length}  replied=${replies.length}`);
+    audit(`Stop  status=ok  pending=${pending.length}  pending_im=${pendingIm}  pending_doc=${pendingDoc}  replied=${replyCount}`);
     process.exit(0);
   }
 
@@ -815,10 +915,15 @@ function main() {
     process.exit(0);
   }
 
-  // Normal block path
+  // Normal block path. IDs in the audit line surface either the IM
+  // message_id or the doc_comment composite key for diagnostic grep-ability.
   const msg = buildBlockMessage(unanswered);
-  const idList = unanswered.map((u) => u.message_id).join(',');
-  audit(`Stop  status=blocked  pending=${pending.length}  unanswered=${unanswered.length}  ids=${idList}`);
+  const idList = unanswered
+    .map((u) => (u.kind === 'doc_comment' ? `doc:${u.doc_token}:${u.comment_id}` : u.message_id))
+    .join(',');
+  audit(
+    `Stop  status=blocked  pending=${pending.length}  pending_im=${pendingIm}  pending_doc=${pendingDoc}  unanswered=${unanswered.length}  ids=${idList}`,
+  );
   process.stderr.write(msg + '\n');
   process.exit(2);
 }
