@@ -15,6 +15,7 @@ import { parseTieredProfile } from './memory/distiller.js';
 import { JOB_THREAD_PREFIX, PERMANENT_TARGET_CODES, getFeishuApiCode, getFeishuApiMsg } from './scheduler.js';
 import { withFeishuRetry } from './feishu-retry.js';
 import { writeSdkResource, WriteSdkResourceTooLargeError } from './sdk-resource.js';
+import { buildCommentElements } from './feishu-comment.js';
 
 /**
  * Strip Feishu `<at>` tags from outbound text to block prompt-injected
@@ -354,6 +355,198 @@ import {
   type JobFile,
 } from './job-store.js';
 
+// ── doc_comment channel (#181) ───────────────────────────────────────────────
+
+/**
+ * Structural subset of `Lark.Client` used by the doc-comment tools. Mirrors
+ * the channel.ts pattern (#181 task 5 onward): keep deps narrow so smoke tests
+ * can stub without faking the entire SDK surface.
+ *
+ * `fileCommentReply.create` and `fileComment.create` are the two reply/comment
+ * endpoints the spec calls out (§4.3, §4.4). Typed as `any` payloads here
+ * because the SDK shapes are long and the smoke-test mocks would have to
+ * mirror them otherwise — the real wire shape is enforced by Feishu, and our
+ * input is constructed inside the handlers anyway.
+ */
+interface DocCommentClient {
+  drive: {
+    fileCommentReply: {
+      create: (req: {
+        path: { file_token: string; comment_id: string };
+        params: { file_type: string; user_id_type?: string };
+        data: { content: { elements: unknown[] } };
+      }) => Promise<{ data?: { reply_id?: string } }>;
+    };
+    fileComment: {
+      create: (req: {
+        path: { file_token: string };
+        params: { file_type: string; user_id_type?: string };
+        data: { reply_list: { replies: Array<{ content: { elements: unknown[] } }> } };
+      }) => Promise<{ data?: { comment_id?: string } }>;
+    };
+  };
+}
+
+/**
+ * Structural subset of `McpServer` used by registerDocCommentTools — just the
+ * deprecated `.tool(name, paramsSchema, cb)` overload. Kept structural so the
+ * smoke test can pass a `{ tool }` stub without instantiating the full server.
+ */
+interface DocCommentServer {
+  tool: (
+    name: string,
+    paramsSchema: Record<string, z.ZodTypeAny>,
+    cb: (args: any) => Promise<{
+      isError?: boolean;
+      content: { type: 'text'; text: string }[];
+    }>,
+  ) => unknown;
+}
+
+export interface DocCommentToolsDeps {
+  server: DocCommentServer;
+  client: DocCommentClient;
+  identitySession: IdentitySession;
+}
+
+/**
+ * Register the doc_comment-channel MCP tools (`reply_doc_comment` and, in a
+ * later task, `create_doc_comment`). Extracted from `registerTools` so the
+ * smoke harness can wire just 3 deps instead of mocking all 9 positional args
+ * to `registerTools` (spec §10.2).
+ *
+ * Authorization model:
+ *   - caller is resolved via `IdentitySession.getCaller` (chat_id +
+ *     thread_id), then enforced to equal `identitySession.getOwner()` — these
+ *     tools are owner-only in v1 (spec §5.2). Non-owners get an audit
+ *     'denied' line and a clear error.
+ *   - The `doc:<file_token>` chat_id prefix is the synthetic chat used by
+ *     comment events; `getCaller` short-circuits it to `ownerFallback()`,
+ *     letting Claude inherit owner identity for the duration of the turn.
+ *
+ * Identity used to call Feishu: tenant_access_token (bot). The reply is
+ * authored as the bot's app name. No user-impersonation path (spec §4.3).
+ */
+export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
+  const { server, client, identitySession } = deps;
+
+  // Local resolveCaller — narrower than the one inside registerTools because
+  // these tools never authorize the SYSTEM_FLUSH_CALLER sentinel. Same shape
+  // for the caller though: audit-log denials here, callers only log 'ok'.
+  function resolveCaller(
+    toolName: string,
+    chat_id: string | undefined,
+    thread_id: string | undefined,
+    args: Record<string, unknown>,
+  ):
+    | { caller: string }
+    | { error: { isError: true; content: { type: 'text'; text: string }[] } } {
+    if (!chat_id) {
+      void audit(toolName, null, args, 'denied');
+      return {
+        error: {
+          isError: true,
+          content: [{ type: 'text' as const, text: 'chat_id is required for this tool' }],
+        },
+      };
+    }
+    const caller = identitySession.getCaller(chat_id, thread_id);
+    if (!caller) {
+      void audit(toolName, null, args, 'denied');
+      return {
+        error: {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `No active identity session for chat ${chat_id}.`,
+            },
+          ],
+        },
+      };
+    }
+    return { caller };
+  }
+
+  server.tool(
+    'reply_doc_comment',
+    {
+      chat_id: z
+        .string()
+        .describe('Caller chat_id from notification meta (e.g. doc:<file_token> or __terminal__).'),
+      thread_id: z.string().optional(),
+      doc_token: z
+        .string()
+        .describe('Target document token (file_token from the doc_comment notification).'),
+      comment_id: z
+        .string()
+        .describe('Comment to reply under (from notification meta).'),
+      content: z
+        .string()
+        .describe('Reply body in plain text + optional inline URLs; max 1000 chars.'),
+      file_type: z.enum(['docx', 'doc', 'sheet', 'file', 'slides', 'bitable']),
+    },
+    async ({ chat_id, thread_id, doc_token, comment_id, content, file_type }) => {
+      const auditArgs = { doc_token, comment_id, content, file_type };
+      const auth = resolveCaller('reply_doc_comment', chat_id, thread_id, auditArgs);
+      if ('error' in auth) return auth.error;
+      const owner = identitySession.getOwner();
+      if (auth.caller !== owner) {
+        void audit('reply_doc_comment', auth.caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: 'reply_doc_comment is owner-only.' }],
+        };
+      }
+      let elements;
+      try {
+        elements = buildCommentElements(content);
+      } catch (e: any) {
+        void audit('reply_doc_comment', auth.caller, auditArgs, 'error');
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: e?.message || 'invalid content' }],
+        };
+      }
+      try {
+        const resp = await client.drive.fileCommentReply.create({
+          path: { file_token: doc_token, comment_id },
+          params: { file_type, user_id_type: 'open_id' },
+          data: { content: { elements } },
+        });
+        void audit('reply_doc_comment', auth.caller, auditArgs, 'ok');
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Reply posted. reply_id=${resp?.data?.reply_id ?? '<unknown>'}`,
+            },
+          ],
+        };
+      } catch (e: any) {
+        void audit('reply_doc_comment', auth.caller, auditArgs, 'error');
+        // 1069302 = "collaborator comments disabled" per Feishu drive API.
+        // Surfaced as a separate hint so the owner can flip the doc switch
+        // instead of guessing why the bot can read but not write.
+        const code = e?.code ?? e?.response?.code;
+        const hint =
+          code === 1069302
+            ? 'The document has collaborator comments disabled. Ask the doc owner to enable "allow collaborators to comment".'
+            : '';
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `Feishu API rejected the reply: ${e?.message || String(e)}. ${hint}`.trim(),
+            },
+          ],
+        };
+      }
+    },
+  );
+}
+
 /**
  * Register all MCP tools on the server.
  */
@@ -533,6 +726,47 @@ export function registerTools(
       { label: `${callerLabel}.ack.revoke` },
     ).catch(() => {});
   }
+
+  // ── doc_comment channel tools (#181) ──
+  // Wired as a helper for smoke-test isolation: the doc-comment smoke can
+  // call `registerDocCommentTools` with just 3 deps instead of mocking all
+  // 9 positional args this function takes.
+  //
+  // SDK gap: as of @larksuiteoapi/node-sdk current pin, `drive.fileCommentReply`
+  // exposes only delete/list/update — not `create`. The Feishu HTTP endpoint
+  // `POST /open-apis/drive/v1/files/:file_token/comments/:comment_id/replies`
+  // exists, so we shim `create` on top of `client.request`. Same for
+  // `fileComment.create` — only the `docx`/`doc` file_types are typed; `file`
+  // / `sheet` / `slides` / `bitable` work at the HTTP layer per Feishu docs
+  // and we surface them via the shim. The structural client type stays
+  // honest: handlers see exactly the calls listed in DocCommentClient.
+  const docCommentClient: DocCommentClient = {
+    drive: {
+      fileCommentReply: {
+        create: async (req) => {
+          const { file_token, comment_id } = req.path;
+          return (await client.request({
+            method: 'POST',
+            url: `https://open.feishu.cn/open-apis/drive/v1/files/${encodeURIComponent(file_token)}/comments/${encodeURIComponent(comment_id)}/replies`,
+            params: req.params,
+            data: req.data,
+          })) as { data?: { reply_id?: string } };
+        },
+      },
+      fileComment: {
+        create: async (req) => {
+          const { file_token } = req.path;
+          return (await client.request({
+            method: 'POST',
+            url: `https://open.feishu.cn/open-apis/drive/v1/files/${encodeURIComponent(file_token)}/comments`,
+            params: req.params,
+            data: req.data,
+          })) as { data?: { comment_id?: string } };
+        },
+      },
+    },
+  };
+  registerDocCommentTools({ server, client: docCommentClient, identitySession });
 
   // ── 1. reply ──
   server.registerTool(
