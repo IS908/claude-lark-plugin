@@ -54,6 +54,16 @@ export const TERMINAL_CHAT_ID = '__terminal__';
  */
 export const SYSTEM_FLUSH_CALLER = '__system_flush__';
 
+/**
+ * Synthetic chat_id prefix used to route doc-comment events through the
+ * IdentitySession to the owner fallback. The format is `doc:<file_token>`.
+ * `getCaller` short-circuits any chat_id with this prefix to `ownerFallback()`.
+ *
+ * Audit before adding sibling prefixes — `startsWith` matches `doc:`, `docs:`,
+ * `doc-comment:`, etc. would all collide and incorrectly route to owner.
+ */
+export const DOC_CHAT_ID_PREFIX = 'doc:';
+
 interface SessionEntry {
   userId: string;
   updatedAt: number;
@@ -88,7 +98,7 @@ export class IdentitySession {
     // v1: all events processed under owner identity, mirroring TERMINAL_CHAT_ID.
     // Future: if multi-user routing is added, replace this short-circuit with
     // an event-derived caller (e.g. from notice_meta.from_user_id).
-    if (chatId.startsWith('doc:')) {
+    if (chatId.startsWith(DOC_CHAT_ID_PREFIX)) {
       return this.ownerFallback();
     }
     if (threadId) {
