@@ -624,6 +624,14 @@ export class LarkChannel {
   private loggedStaleAcks = new Set<string>();
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
   private latestMessageTracker = new LatestMessageTracker();
+  /**
+   * #181: dedup state for `drive.notice.comment_add_v1` events. Feishu may
+   * deliver the same event_id more than once (retries, edge cases); the
+   * cache short-circuits duplicates in `handleCommentEvent`. 500 entries
+   * × 60 min TTL matches the order-of-magnitude of `recentInboundIds` and
+   * is well above any realistic comment-event rate.
+   */
+  private commentEventIdSeen = new TTLCache<string, true>({ maxSize: 500, ttlMs: 60 * 60_000 });
 
   constructor() {
     this.client = new Lark.Client({
@@ -829,6 +837,30 @@ export class LarkChannel {
           await this.handleReactionEvent(data);
         } catch (err) {
           console.error('[channel] Error handling reaction event:', err);
+        }
+      },
+    }).register({
+      'drive.notice.comment_add_v1': async (data: any) => {
+        debugLog(`[channel] Event received: drive.notice.comment_add_v1`);
+        try {
+          await handleCommentEvent(data, {
+            botOpenId: this.botOpenId,
+            seenEventIds: this.commentEventIdSeen,
+            identitySession: this.identitySession!,
+            queue: this.queue,
+            messageHandler: this.messageHandler!,
+            resolveUserName: this.resolveUserName.bind(this),
+            // Structural cast: Lark.Client's typed drive surface and our
+            // minimal CommentEventDeps.client (file_comment.get + the
+            // meta/metas batch_query call) overlap functionally but the
+            // SDK's generated d.ts names the singular `meta` while
+            // handleCommentEvent + smoke mocks use `metas`. The runtime
+            // call goes through the SDK's permissive proxy either way;
+            // structurally narrowing this is harmless here.
+            client: this.client as unknown as CommentEventDeps['client'],
+          });
+        } catch (err) {
+          console.error('[channel] Error handling doc comment event:', err);
         }
       },
     });
