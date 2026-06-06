@@ -244,6 +244,8 @@ On every incoming message, the plugin injects relevant memory context in this or
 | `LARK_ALLOWED_CHAT_IDS` | (empty) | Comma-separated list of allowed chat IDs. Empty means all chats allowed. |
 
 > **Whitelist semantics:** when both lists are set, a message is accepted if **either** the sender is in `LARK_ALLOWED_USER_IDS` **or** the chat is in `LARK_ALLOWED_CHAT_IDS` (OR). Setting only one list gates on that list alone.
+>
+> Whitelist also gates `drive.notice.comment_add_v1` events: a doc-comment author whose `open_id` is not in `LARK_ALLOWED_USER_IDS` will be dropped before Claude processes it (v1.1.0+).
 
 ### Optional -- Messaging
 

@@ -9,6 +9,14 @@ import { handleCommentEvent, type CommentEventDeps } from '../src/channel.js';
 import { IdentitySession } from '../src/identity-session.js';
 import { MessageQueue } from '../src/queue.js';
 import { TTLCache } from '../src/ttl-cache.js';
+import { appConfig } from '../src/config.js';
+
+// Whitelist gate is now applied to doc-comment events (PR #182 round 4 C1).
+// ES module imports are hoisted — we cannot influence appConfig via process.env
+// before the config.ts module evaluates. Mutate the loaded list directly.
+// Include all the open_ids that existing cases (and new ones) use so they
+// continue to reach the handler; case 15 uses an explicitly-excluded one.
+appConfig.allowedUserIds.push('ou_bot', 'ou_sender', 'ou_op', 'ou_owner_for_test', 'ou_alice', 'ou_bob');
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -295,4 +303,15 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (!text.includes('&lt;script&gt;')) fail(`13: expected escaped marker missing`);
 }
 
-console.error(`PASS: 16 cases (filters + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape)`);
+// 15. SECURITY: doc-comment event from non-whitelisted user is dropped (PR #182 round 4 C1)
+{
+  const deps = makeDeps();
+  await handleCommentEvent(
+    makeEvent({ from_open_id: 'ou_excluded_outsider' }),  // not in LARK_ALLOWED_USER_IDS
+    deps,
+  );
+  if (deps.handlerCalls.length !== 0) fail(`15: SECURITY: non-whitelisted sender must be dropped`);
+  if (deps.commentGetCalls.length !== 0) fail(`15: SECURITY: pre-fetch must not run for whitelisted-out user`);
+}
+
+console.error(`PASS: 17 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape)`);

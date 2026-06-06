@@ -384,6 +384,19 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
   const fileType: string = meta.file_type;
   const fromOpenId: string = meta.from_user_id.open_id;
 
+  // Whitelist gate — applies to ALL inbound channels (IM, reactions, doc comments).
+  // Operators relying on LARK_ALLOWED_USER_IDS expect tenant-wide enforcement;
+  // skipping this here would let any tenant user prompt-inject Claude through
+  // any doc the bot has been @-mentioned in (which auto-adds bot as collaborator).
+  // Synthetic chat_id can't match LARK_ALLOWED_CHAT_IDS by design; operator
+  // semantic for doc-comment is "users I trust", and that's the meaningful gate.
+  if (!passesWhitelist(fromOpenId, `${DOC_CHAT_ID_PREFIX}${fileToken}`)) {
+    debugLog(
+      `[channel] Doc comment from ${fromOpenId} on doc ${fileToken} rejected by whitelist`,
+    );
+    return;
+  }
+
   // Pre-fetch comment body. We swallow errors but flag them in the envelope
   // so Claude can decide whether to defer or surface to the user.
   let parentBody: string | undefined;

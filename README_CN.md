@@ -225,6 +225,8 @@ node -e "console.log(require('./package.json').version)"
 | `LARK_ALLOWED_CHAT_IDS` | （空） | 群聊 ID 白名单，逗号分隔 |
 
 > **白名单语义**：两个列表都设置时，发送者在 `LARK_ALLOWED_USER_IDS` 里**或**聊天在 `LARK_ALLOWED_CHAT_IDS` 里即允许（OR 关系）。只设置一个列表时，只用那个列表过滤。
+>
+> 白名单同时控制 `drive.notice.comment_add_v1` 事件：评论作者 `open_id` 不在 `LARK_ALLOWED_USER_IDS` 内时，事件在到达 Claude 前被丢弃（v1.1.0+）。
 
 ### 可选 —— 消息
 
