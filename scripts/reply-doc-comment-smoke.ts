@@ -46,17 +46,20 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   return { session, registered, fileCommentReplyCalls, fileCommentCreateCalls };
 }
 
-// 1. owner caller via terminal chat_id → reply succeeds
+// 1. owner caller via doc: chat_id → reply succeeds (PR #182 round 4 I2:
+// terminal escape hatch removed; the canonical happy-path is doc: + session).
 {
   const h = makeHarness();
+  h.session.setCaller('doc:dox_a', 'cmt_a', 'ou_owner_test');
   const r = await h.registered.reply_doc_comment({
-    chat_id: '__terminal__',
+    chat_id: 'doc:dox_a',
+    thread_id: 'cmt_a',
     doc_token: 'dox_a',
     comment_id: 'cmt_a',
     content: 'hello',
     file_type: 'docx',
   });
-  if (r?.isError) fail(`1: owner via terminal should pass, got error: ${JSON.stringify(r)}`);
+  if (r?.isError) fail(`1: owner via doc: chat_id should pass, got error: ${JSON.stringify(r)}`);
   if (h.fileCommentReplyCalls.length !== 1) fail(`1: expected 1 API call`);
   const call = h.fileCommentReplyCalls[0];
   if (call.path?.file_token !== 'dox_a') fail(`1: file_token wrong`);
@@ -114,7 +117,9 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   if (h.fileCommentReplyCalls.length !== 0) fail(`3a: API must not be called`);
 }
 
-// 4. terminal chat_id with no LARK_OWNER_OPEN_ID → denied
+// 4. doc: chat_id without LARK_OWNER_OPEN_ID + no session entry → "no active session"
+// (PR #182 round 4 I2: terminal removed; the equivalent failure mode now hits the
+// session-resolution path.)
 {
   const session = new IdentitySession(() => null);
   const registered: Record<string, any> = {};
@@ -122,14 +127,15 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   const dummyClient = { drive: { fileCommentReply: { create: async () => ({ data: {} }) }, fileComment: { create: async () => ({}) } } };
   registerDocCommentTools({ server: fakeServer as any, client: dummyClient as any, identitySession: session });
   const r = await registered.reply_doc_comment({
-    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
+    chat_id: 'doc:d', thread_id: 'c', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
   });
-  if (!r?.isError) fail(`4: terminal without owner must deny`);
+  if (!r?.isError) fail(`4: doc: chat_id without an established session must deny`);
 }
 
 // 5. Feishu API generic failure → error returned with message preserved
 {
   const session = new IdentitySession(() => 'ou_owner_test');
+  session.setCaller('doc:d', 'c', 'ou_owner_test');
   const registered: Record<string, any> = {};
   const fakeServer = { registerTool: (n: string, _c: any, h: any) => { registered[n] = h; } };
   const failingClient = { drive: {
@@ -138,7 +144,7 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   }};
   registerDocCommentTools({ server: fakeServer as any, client: failingClient as any, identitySession: session });
   const r = await registered.reply_doc_comment({
-    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
+    chat_id: 'doc:d', thread_id: 'c', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
   });
   if (!r?.isError) fail(`5: expected error`);
   if (!r.content[0].text.includes('feishu generic boom')) fail(`5: original error message lost`);
@@ -147,6 +153,7 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 // 6. permission_denied (code 1069302) → clear hint
 {
   const session = new IdentitySession(() => 'ou_owner_test');
+  session.setCaller('doc:d', 'c', 'ou_owner_test');
   const registered: Record<string, any> = {};
   const fakeServer = { registerTool: (n: string, _c: any, h: any) => { registered[n] = h; } };
   const deniedClient = { drive: {
@@ -155,7 +162,7 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   }};
   registerDocCommentTools({ server: fakeServer as any, client: deniedClient as any, identitySession: session });
   const r = await registered.reply_doc_comment({
-    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
+    chat_id: 'doc:d', thread_id: 'c', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
   });
   if (!r?.isError) fail(`6: expected error`);
   if (!/collaborator|allow.*comment/i.test(r.content[0].text)) fail(`6: hint missing: ${r.content[0].text}`);
@@ -164,8 +171,9 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 // 7. empty content → tool-level error
 {
   const h = makeHarness();
+  h.session.setCaller('doc:d', 'c', 'ou_owner_test');
   const r = await h.registered.reply_doc_comment({
-    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c', content: '', file_type: 'docx',
+    chat_id: 'doc:d', thread_id: 'c', doc_token: 'd', comment_id: 'c', content: '', file_type: 'docx',
   });
   if (!r?.isError) fail(`7: empty content must be rejected at tool layer`);
 }
@@ -173,8 +181,9 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 // 8. content >1000 chars → buildCommentElements throws, tool returns error
 {
   const h = makeHarness();
+  h.session.setCaller('doc:d', 'c', 'ou_owner_test');
   const r = await h.registered.reply_doc_comment({
-    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c',
+    chat_id: 'doc:d', thread_id: 'c', doc_token: 'd', comment_id: 'c',
     content: 'x'.repeat(1500), file_type: 'docx',
   });
   if (!r?.isError) fail(`8: oversized content must error`);
@@ -184,8 +193,10 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 // 9. create_doc_comment owner pass + non-owner deny
 {
   const h = makeHarness();
+  h.session.setCaller('doc:dox_new', 'cmt_new', 'ou_owner_test');
   const okR = await h.registered.create_doc_comment({
-    chat_id: '__terminal__',
+    chat_id: 'doc:dox_new',
+    thread_id: 'cmt_new',
     doc_token: 'dox_new',
     content: 'top-level comment',
     file_type: 'docx',
@@ -236,18 +247,37 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   if (h.fileCommentCreateCalls.length !== 0) fail(`11: API must not be called`);
 }
 
-// 12. terminal chat_id allows arbitrary doc_token (operator escape hatch)
+// 12. SECURITY: __terminal__ chat_id is rejected by reply_doc_comment (PR #182 round 4 I2).
+// Pre-fix this was the operator escape hatch — but combined with the (now-fixed)
+// whitelist bypass, it let a prompt-injected model substitute __terminal__ to
+// break out of the doc_token binding. No CLI workflow used this hatch.
 {
   const h = makeHarness();
   const r = await h.registered.reply_doc_comment({
     chat_id: '__terminal__',
-    doc_token: 'dox_arbitrary',  // any doc — owner is in CLI context
+    doc_token: 'dox_arbitrary',
     comment_id: 'cmt_x',
-    content: 'cli-driven reply',
+    content: 'should not post',
     file_type: 'docx',
   });
-  if (r?.isError) fail(`12: terminal must allow arbitrary doc_token: ${JSON.stringify(r)}`);
-  if (h.fileCommentReplyCalls.length !== 1) fail(`12: expected 1 API call`);
+  if (!r?.isError) fail(`12: SECURITY: __terminal__ must be rejected for reply_doc_comment`);
+  if (!/doc-comment-triggered|must start with.*doc:/i.test(r.content[0].text)) {
+    fail(`12: error msg should explain doc-comment-triggered scope: ${r.content[0].text}`);
+  }
+  if (h.fileCommentReplyCalls.length !== 0) fail(`12: API must not be called`);
+}
+
+// 12a. SECURITY: __terminal__ rejected by create_doc_comment too.
+{
+  const h = makeHarness();
+  const r = await h.registered.create_doc_comment({
+    chat_id: '__terminal__',
+    doc_token: 'dox_arbitrary',
+    content: 'should not post',
+    file_type: 'docx',
+  });
+  if (!r?.isError) fail(`12a: SECURITY: __terminal__ must be rejected for create_doc_comment`);
+  if (h.fileCommentCreateCalls.length !== 0) fail(`12a: API must not be called`);
 }
 
 // 13. matching binding passes (regression — make sure we didn't break the happy path)
@@ -266,4 +296,4 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   if (h.fileCommentReplyCalls.length !== 1) fail(`13: expected 1 API call`);
 }
 
-console.error(`PASS: 14 cases (owner gate + error paths + create + doc: security regression + doc_token binding)`);
+console.error(`PASS: 15 cases (owner gate + error paths + create + doc: security regression + doc_token binding + terminal-denial)`);

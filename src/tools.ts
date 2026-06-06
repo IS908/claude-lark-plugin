@@ -519,20 +519,34 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
           content: [{ type: 'text' as const, text: 'reply_doc_comment is owner-only.' }],
         };
       }
-      if (chat_id.startsWith(DOC_CHAT_ID_PREFIX)) {
-        const expectedToken = chat_id.slice(DOC_CHAT_ID_PREFIX.length);
-        if (doc_token !== expectedToken) {
-          void audit('reply_doc_comment', auth.caller, auditArgs, 'denied');
-          return {
-            isError: true,
-            content: [
-              {
-                type: 'text' as const,
-                text: `doc_token mismatch: the doc-comment notification was for ${expectedToken}, but reply_doc_comment was called with doc_token=${doc_token}. The reply must target the triggering document. (Use __terminal__ chat_id if you intend to comment on an arbitrary doc.)`,
-              },
-            ],
-          };
-        }
+      // Doc-comment tools are STRICTLY scoped to doc-comment-triggered turns.
+      // Reject __terminal__ and any non-doc: chat_id. Closes the prompt-injection
+      // surface where an adversarial doc comment tricks Claude into substituting
+      // __terminal__ to bypass the doc_token binding (PR #182 round 4 I2).
+      if (!chat_id.startsWith(DOC_CHAT_ID_PREFIX)) {
+        void audit('reply_doc_comment', auth.caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `reply_doc_comment is only callable from doc-comment-triggered turns (chat_id must start with "doc:"). Got chat_id=${chat_id}.`,
+            },
+          ],
+        };
+      }
+      const expectedToken = chat_id.slice(DOC_CHAT_ID_PREFIX.length);
+      if (doc_token !== expectedToken) {
+        void audit('reply_doc_comment', auth.caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `doc_token mismatch: the doc-comment notification was for ${expectedToken}, but reply_doc_comment was called with doc_token=${doc_token}. The reply must target the triggering document.`,
+            },
+          ],
+        };
       }
       if (!content || content.trim() === '') {
         void audit('reply_doc_comment', auth.caller, auditArgs, 'denied');
@@ -619,20 +633,34 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
           content: [{ type: 'text' as const, text: 'create_doc_comment is owner-only.' }],
         };
       }
-      if (chat_id.startsWith(DOC_CHAT_ID_PREFIX)) {
-        const expectedToken = chat_id.slice(DOC_CHAT_ID_PREFIX.length);
-        if (doc_token !== expectedToken) {
-          void audit('create_doc_comment', auth.caller, auditArgs, 'denied');
-          return {
-            isError: true,
-            content: [
-              {
-                type: 'text' as const,
-                text: `doc_token mismatch: the doc-comment notification was for ${expectedToken}, but create_doc_comment was called with doc_token=${doc_token}. The new comment must target the triggering document. (Use __terminal__ chat_id if you intend to comment on an arbitrary doc.)`,
-              },
-            ],
-          };
-        }
+      // Doc-comment tools are STRICTLY scoped to doc-comment-triggered turns.
+      // Reject __terminal__ and any non-doc: chat_id. Closes the prompt-injection
+      // surface where an adversarial doc comment tricks Claude into substituting
+      // __terminal__ to bypass the doc_token binding (PR #182 round 4 I2).
+      if (!chat_id.startsWith(DOC_CHAT_ID_PREFIX)) {
+        void audit('create_doc_comment', auth.caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `create_doc_comment is only callable from doc-comment-triggered turns (chat_id must start with "doc:"). Got chat_id=${chat_id}.`,
+            },
+          ],
+        };
+      }
+      const expectedToken = chat_id.slice(DOC_CHAT_ID_PREFIX.length);
+      if (doc_token !== expectedToken) {
+        void audit('create_doc_comment', auth.caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `doc_token mismatch: the doc-comment notification was for ${expectedToken}, but create_doc_comment was called with doc_token=${doc_token}. The new comment must target the triggering document.`,
+            },
+          ],
+        };
       }
       if (!content || content.trim() === '') {
         void audit('create_doc_comment', auth.caller, auditArgs, 'denied');
