@@ -500,7 +500,11 @@ function buildDocCommentEnvelope(a: DocCommentEnvelopeArgs): string {
   if (a.fetchError) inner.push(`  <fetch_error>${escapeBody(a.fetchError)}</fetch_error>`);
   if (a.quote) inner.push(`  <selected_text>${escapeBody(a.quote)}</selected_text>`);
   if (a.parentBody) inner.push(`  <parent>${escapeBody(a.parentBody)}</parent>`);
-  inner.push(`  <body>${escapeBody(a.body)}</body>`);
+  if (a.body !== undefined) {
+    inner.push(`  <body>${escapeBody(a.body)}</body>`);
+  } else {
+    inner.push(`  <body unknown="true"></body>`);
+  }
   return `<doc_comment ${attrs}>\n${inner.join('\n')}\n</doc_comment>`;
 }
 

@@ -182,4 +182,51 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (text.includes('&amp;quot;')) fail(`7b: quote re-escaped: ${text.slice(0, 300)}`);
 }
 
-console.error(`PASS: 9 cases (filters + pre-fetch happy + fetch errors + escape ordering)`);
+// 6. add_reply: <parent> = reply_list[0], <body> = matched reply
+{
+  const replyClient = {
+    drive: {
+      fileComment: {
+        get: async () => ({ data: {
+          quote: 'q',
+          reply_list: { items: [
+            { reply_id: 'cmt_6_parent', content: { text: 'parent body' } },
+            { reply_id: 'cmt_6_r1', content: { text: 'first reply body' } },
+            { reply_id: 'cmt_6_r2', content: { text: 'target reply body' } },
+          ]},
+        } }),
+      },
+      metas: { batchQuery: async () => ({ data: { metas: [{ title: 'D' }] } }) },
+    },
+  };
+  const deps = makeDeps({ client: replyClient as any });
+  await handleCommentEvent(makeEvent({
+    comment_id: 'cmt_6_parent', reply_id: 'cmt_6_r2',
+  }), deps);
+  const text = deps.handlerCalls[0]?.text ?? '';
+  if (!text.includes('<parent>parent body</parent>')) fail(`6: parent wrong: ${text.slice(0,300)}`);
+  if (!text.includes('<body>target reply body</body>')) fail(`6: body wrong: ${text.slice(0,300)}`);
+}
+
+// 14. reply_id not in reply_list → body marked unknown, no throw
+{
+  const partialClient = {
+    drive: {
+      fileComment: {
+        get: async () => ({ data: {
+          reply_list: { items: [{ reply_id: 'cmt_14_parent', content: { text: 'p' } }] },
+        } }),
+      },
+      metas: { batchQuery: async () => ({ data: { metas: [] } }) },
+    },
+  };
+  const deps = makeDeps({ client: partialClient as any });
+  await handleCommentEvent(makeEvent({
+    comment_id: 'cmt_14_parent', reply_id: 'cmt_14_missing',
+  }), deps);
+  if (deps.handlerCalls.length !== 1) fail(`14: handler should fire`);
+  const text = deps.handlerCalls[0].text;
+  if (!text.includes('<body unknown="true">')) fail(`14: body should be marked unknown: ${text.slice(0,300)}`);
+}
+
+console.error(`PASS: 11 cases (filters + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body)`);
