@@ -70,7 +70,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
             };
           },
         },
-        metas: {
+        meta: {
           batchQuery: async (params: any) => {
             metaCalls.push(params);
             return { data: { metas: [{ doc_token: 'dox_test', title: 'Test Doc' }] } };
@@ -133,7 +133,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   const failingClient = {
     drive: {
       fileComment: { get: async () => { throw new Error('feishu boom'); } },
-      metas: { batchQuery: async () => ({ data: { metas: [] } }) },
+      meta: { batchQuery: async () => ({ data: { metas: [] } }) },
     },
   };
   const deps = makeDeps({ client: failingClient as any });
@@ -151,7 +151,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
           data: { quote: '', reply_list: { items: [{ reply_id: params.path.comment_id, content: { text: 'b' } }] } },
         }),
       },
-      metas: { batchQuery: async () => { throw new Error('meta boom'); } },
+      meta: { batchQuery: async () => { throw new Error('meta boom'); } },
     },
   };
   const deps = makeDeps({ client: noTitleClient as any });
@@ -196,7 +196,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
           ]},
         } }),
       },
-      metas: { batchQuery: async () => ({ data: { metas: [{ title: 'D' }] } }) },
+      meta: { batchQuery: async () => ({ data: { metas: [{ title: 'D' }] } }) },
     },
   };
   const deps = makeDeps({ client: replyClient as any });
@@ -217,7 +217,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
           reply_list: { items: [{ reply_id: 'cmt_14_parent', content: { text: 'p' } }] },
         } }),
       },
-      metas: { batchQuery: async () => ({ data: { metas: [] } }) },
+      meta: { batchQuery: async () => ({ data: { metas: [] } }) },
     },
   };
   const deps = makeDeps({ client: partialClient as any });
@@ -275,7 +275,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   const noQuote = {
     drive: {
       fileComment: { get: async () => ({ data: { quote: '', reply_list: { items: [{ reply_id: 'cmt_001', content: { text: 'x' } }] } } }) },
-      metas: { batchQuery: async () => ({ data: { metas: [] } }) },
+      meta: { batchQuery: async () => ({ data: { metas: [] } }) },
     },
   };
   const deps = makeDeps({ client: noQuote as any });

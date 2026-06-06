@@ -331,7 +331,7 @@ export function computeBotMentioned(
  * Extracted as a standalone function (rather than a `LarkChannel` method)
  * so the smoke test can exercise dedup / filter / pre-fetch logic without
  * constructing a real Feishu SDK client. The `client` field declares only
- * the minimal API surface used (file_comment.get, drive.metas.batchQuery),
+ * the minimal API surface used (file_comment.get, drive.meta.batchQuery),
  * so mocks stay small.
  *
  * Subsequent tasks (#181 plan tasks 6–10) layer filters, pre-fetch, and
@@ -347,7 +347,7 @@ export interface CommentEventDeps {
   client: {
     drive: {
       fileComment: { get: (req: any) => Promise<any> };
-      metas: { batchQuery: (req: any) => Promise<any> };
+      meta: { batchQuery: (req: any) => Promise<any> };
     };
   };
 }
@@ -414,7 +414,7 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
 
   let docTitle: string | undefined;
   try {
-    const metaResp = await deps.client.drive.metas.batchQuery({
+    const metaResp = await deps.client.drive.meta.batchQuery({
       data: { request_docs: [{ doc_token: fileToken, doc_type: fileType }] },
     });
     docTitle = metaResp?.data?.metas?.[0]?.title;
@@ -850,14 +850,7 @@ export class LarkChannel {
             queue: this.queue,
             messageHandler: this.messageHandler!,
             resolveUserName: this.resolveUserName.bind(this),
-            // Structural cast: Lark.Client's typed drive surface and our
-            // minimal CommentEventDeps.client (file_comment.get + the
-            // meta/metas batch_query call) overlap functionally but the
-            // SDK's generated d.ts names the singular `meta` while
-            // handleCommentEvent + smoke mocks use `metas`. The runtime
-            // call goes through the SDK's permissive proxy either way;
-            // structurally narrowing this is harmless here.
-            client: this.client as unknown as CommentEventDeps['client'],
+            client: this.client,
           });
         } catch (err) {
           console.error('[channel] Error handling doc comment event:', err);
