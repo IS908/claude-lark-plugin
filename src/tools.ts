@@ -489,7 +489,12 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
         chat_id: z
           .string()
           .describe('Caller chat_id from notification meta (e.g. doc:<file_token> or __terminal__).'),
-        thread_id: z.string().optional(),
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            'Required when chat_id starts with `doc:`. Pass the comment_id from notification meta verbatim — this is how the server binds the doc-comment event to its caller identity. Omitting it for doc: chat_ids causes "No active identity session" error.',
+          ),
         doc_token: z
           .string()
           .describe('Target document token (file_token from the doc_comment notification).'),
@@ -591,7 +596,12 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
         'Post a new top-level comment on a Feishu doc (owner-only). Use to start a fresh comment thread rather than reply to an existing one.',
       inputSchema: z.object({
         chat_id: z.string(),
-        thread_id: z.string().optional(),
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            'Required when chat_id starts with `doc:`. Pass the comment_id from notification meta verbatim — this is how the server binds the doc-comment event to its caller identity. Omitting it for doc: chat_ids causes "No active identity session" error.',
+          ),
         doc_token: z.string(),
         content: z.string(),
         file_type: z.enum(['docx', 'doc', 'sheet', 'file', 'slides', 'bitable']),

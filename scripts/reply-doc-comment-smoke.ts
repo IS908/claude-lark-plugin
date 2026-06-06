@@ -82,11 +82,14 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 }
 
 // 3. doc:<token> route with owner bound via setCaller (simulates event-time flow when owner @-mentions bot)
+// PR #182 round 4 I1: session is keyed per comment_id, so the test sets up
+// the session at (doc:dox_test, cmt_a) and the tool call now passes thread_id.
 {
   const h = makeHarness();
-  h.session.setCaller('doc:dox_test', undefined, 'ou_owner_test');
+  h.session.setCaller('doc:dox_test', 'cmt_a', 'ou_owner_test');
   const r = await h.registered.reply_doc_comment({
     chat_id: 'doc:dox_test',
+    thread_id: 'cmt_a',
     doc_token: 'dox_test',
     comment_id: 'cmt_a',
     content: 'ok',
@@ -98,9 +101,10 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 // 3a. doc:<token> route with non-owner bound via setCaller → denied (security regression)
 {
   const h = makeHarness();
-  h.session.setCaller('doc:dox_test', undefined, 'ou_alice');
+  h.session.setCaller('doc:dox_test', 'cmt_a', 'ou_alice');
   const r = await h.registered.reply_doc_comment({
     chat_id: 'doc:dox_test',
+    thread_id: 'cmt_a',
     doc_token: 'dox_test',
     comment_id: 'cmt_a',
     content: 'ok',
@@ -202,9 +206,10 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 // 10. SECURITY: chat_id=doc:A but doc_token=B → denied (cross-doc binding violation)
 {
   const h = makeHarness();
-  h.session.setCaller('doc:dox_A', undefined, 'ou_owner_test');
+  h.session.setCaller('doc:dox_A', 'cmt_x', 'ou_owner_test');
   const r = await h.registered.reply_doc_comment({
     chat_id: 'doc:dox_A',
+    thread_id: 'cmt_x',
     doc_token: 'dox_B',         // wrong doc!
     comment_id: 'cmt_x',
     content: 'malicious',
@@ -218,9 +223,10 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 // 11. SECURITY: same check for create_doc_comment
 {
   const h = makeHarness();
-  h.session.setCaller('doc:dox_A', undefined, 'ou_owner_test');
+  h.session.setCaller('doc:dox_A', 'cmt_x', 'ou_owner_test');
   const r = await h.registered.create_doc_comment({
     chat_id: 'doc:dox_A',
+    thread_id: 'cmt_x',
     doc_token: 'dox_B',         // wrong doc!
     content: 'malicious top-level',
     file_type: 'docx',
@@ -247,9 +253,10 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 // 13. matching binding passes (regression — make sure we didn't break the happy path)
 {
   const h = makeHarness();
-  h.session.setCaller('doc:dox_real', undefined, 'ou_owner_test');
+  h.session.setCaller('doc:dox_real', 'cmt_x', 'ou_owner_test');
   const r = await h.registered.reply_doc_comment({
     chat_id: 'doc:dox_real',
+    thread_id: 'cmt_x',
     doc_token: 'dox_real',       // matches
     comment_id: 'cmt_x',
     content: 'happy path',

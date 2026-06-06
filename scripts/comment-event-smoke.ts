@@ -237,7 +237,9 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (!text.includes('<body unknown="true">')) fail(`14: body should be marked unknown: ${text.slice(0,300)}`);
 }
 
-// 9. enqueue called with chatKey = "doc:<file_token>"
+// 9. enqueue called with chatKey = "doc:<file_token>" and threadKey = comment_id
+// (PR #182 round 4 I1: per-comment keying lets concurrent comments on the same
+// doc process in parallel and avoids session overwrites.)
 {
   const enqueueCalls: any[] = [];
   const deps = makeDeps();
@@ -247,13 +249,16 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
       return task();
     },
   } as any;
-  await handleCommentEvent(makeEvent({ file_token: 'dox_specific' }), deps);
+  await handleCommentEvent(
+    makeEvent({ file_token: 'dox_specific', comment_id: 'cmt_specific' }),
+    deps,
+  );
   if (enqueueCalls.length !== 1) fail(`9: expected 1 enqueue`);
   if (enqueueCalls[0].chatId !== 'doc:dox_specific') fail(`9: chatId wrong: ${enqueueCalls[0].chatId}`);
-  if (enqueueCalls[0].threadId !== undefined) fail(`9: threadId should be undefined`);
+  if (enqueueCalls[0].threadId !== 'cmt_specific') fail(`9: threadId must be comment_id, got ${enqueueCalls[0].threadId}`);
 }
 
-// 10. setCaller invoked inside queue task with synthetic chat_id and operator
+// 10. setCaller invoked inside queue task with synthetic chat_id, comment_id, operator
 {
   const calls: any[] = [];
   const deps = makeDeps();
@@ -262,9 +267,13 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
     calls.push({ chatId, threadId, userId });
     return orig(chatId, threadId, userId);
   };
-  await handleCommentEvent(makeEvent({ file_token: 'dox_X', from_open_id: 'ou_op' }), deps);
+  await handleCommentEvent(
+    makeEvent({ file_token: 'dox_X', comment_id: 'cmt_10', from_open_id: 'ou_op' }),
+    deps,
+  );
   if (calls.length !== 1) fail(`10: expected 1 setCaller`);
   if (calls[0].chatId !== 'doc:dox_X') fail(`10: chatId wrong`);
+  if (calls[0].threadId !== 'cmt_10') fail(`10: threadId must be comment_id, got ${calls[0].threadId}`);
   if (calls[0].userId !== 'ou_op') fail(`10: userId wrong`);
 }
 
@@ -314,4 +323,26 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (deps.commentGetCalls.length !== 0) fail(`15: SECURITY: pre-fetch must not run for whitelisted-out user`);
 }
 
-console.error(`PASS: 17 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape)`);
+// 16. SECURITY: concurrent events on the same doc don't overwrite each other's
+// session entries (PR #182 round 4 I1). Pre-fix, both events shared the
+// (doc:<token>, undefined) session slot and the second event clobbered the first.
+{
+  const deps = makeDeps();
+  // Alice's event
+  await handleCommentEvent(
+    makeEvent({ file_token: 'dox_race', comment_id: 'cmt_alice', from_open_id: 'ou_alice' }),
+    deps,
+  );
+  // Bob's event for same doc, different comment
+  await handleCommentEvent(
+    makeEvent({ file_token: 'dox_race', comment_id: 'cmt_bob', from_open_id: 'ou_bob' }),
+    deps,
+  );
+  // Both should resolve independently
+  const aliceCaller = deps.identitySession.getCaller('doc:dox_race', 'cmt_alice');
+  const bobCaller = deps.identitySession.getCaller('doc:dox_race', 'cmt_bob');
+  if (aliceCaller !== 'ou_alice') fail(`16: alice's session lost (got ${aliceCaller})`);
+  if (bobCaller !== 'ou_bob') fail(`16: bob's session lost (got ${bobCaller})`);
+}
+
+console.error(`PASS: 18 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race)`);

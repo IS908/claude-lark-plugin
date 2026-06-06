@@ -447,6 +447,13 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
   const synthetic: LarkMessage = {
     messageId: replyId ?? commentId,
     chatId: `${DOC_CHAT_ID_PREFIX}${fileToken}`,
+    // PR #182 round 4 (I1): bind the session per-comment, not per-doc. setCaller
+    // used to write at chat-level (`(doc:<token>, undefined)`), so two concurrent
+    // events on the same doc overwrote each other — attacker @-mentioning bot
+    // in the same doc as owner's in-flight turn would flip identity. Per-comment
+    // keying via threadId also lets independent comments on the same doc
+    // process in parallel through the per-thread queue (good UX, no perf concern).
+    threadId: commentId,
     chatType: 'doc_comment',
     senderId: fromOpenId,
     senderName,
@@ -455,8 +462,8 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
     rawContent: JSON.stringify(data),
   };
 
-  deps.queue.enqueue(`${DOC_CHAT_ID_PREFIX}${fileToken}`, undefined, async () => {
-    deps.identitySession.setCaller(`${DOC_CHAT_ID_PREFIX}${fileToken}`, undefined, fromOpenId);
+  deps.queue.enqueue(`${DOC_CHAT_ID_PREFIX}${fileToken}`, commentId, async () => {
+    deps.identitySession.setCaller(`${DOC_CHAT_ID_PREFIX}${fileToken}`, commentId, fromOpenId);
     await deps.messageHandler(synthetic);
   });
 }
