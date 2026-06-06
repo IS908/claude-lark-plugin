@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1.0] - 2026-06-07
+
+### Added
+- **Feishu doc-comment @bot channel** (#181, #182). Closes the doc-comment collaboration loop: a user @-mentions the bot in a cloud-document comment → bot fetches the comment context → Claude reasons about it → bot replies in the same comment thread, attributed to the bot's app identity (`tenant_access_token`). Tenant-wide coverage with **zero per-file subscribe** — bot just needs the app scopes and event subscription enabled in the Feishu dev console; no `subscribe_doc` tool, no per-document state.
+
+  The plugin subscribes to `drive.notice.comment_add_v1` and filters events down to those where `is_mentioned=true` AND `from_user_id != bot` (loop prevention). When a qualifying event arrives, `handleCommentEvent` pre-fetches the comment body, the parent (for replies), and the doc title; assembles a `<doc_comment ...>` envelope; and routes via a synthetic `chat_id = "doc:<file_token>"` that `IdentitySession` resolves to the configured owner. Two new MCP tools — `reply_doc_comment` and `create_doc_comment` — wrap the Feishu reply/create-comment APIs with the existing owner-only + audit-log pattern. The Stop hook recognizes the new envelope kind and only accepts `reply_doc_comment` with matching `doc_token` + `comment_id` as a satisfier (or `[LARK_DEFER]` / `[LARK_NO_REPLY]` sentinels as before).
+
+### Implementation
+- `src/feishu-comment.ts` (new): `buildCommentElements(markdown)` converts plain text + inline http(s) URLs into Feishu's `text_run` / `docs_link` element array. 1000-char per-element ceiling enforced (loud throw, not silent truncation). Smoke at `scripts/comment-elements-smoke.ts` (10 cases).
+- `src/channel.ts`: new top-level `handleCommentEvent(data, deps)` pure function with `CommentEventDeps` dependency interface (testable without instantiating the SDK); third `.register({ 'drive.notice.comment_add_v1': ... })` chained on the existing `EventDispatcher`; private `commentEventIdSeen: TTLCache<string, true>` holds dedup state with a 60-minute TTL. New helpers `extractText`, `escapeAttr`, `escapeBody`, `buildDocCommentEnvelope` (escape `&` first to avoid double-encoding `&quot;` / `&lt;` / `&gt;`). Smoke at `scripts/comment-event-smoke.ts` (16 cases).
+- `src/identity-session.ts`: exports `DOC_CHAT_ID_PREFIX = 'doc:'` and adds a `getCaller` branch that short-circuits `doc:` prefix to `ownerFallback()` — same pattern as `TERMINAL_CHAT_ID`. Identity-smoke gains 3 cases (now 13/13).
+- `src/index.ts`: new `extractDocCommentMeta(envelope)` parses the `<doc_comment ...>` opening tag and spreads its attributes (`doc_token`, `comment_id`, `reply_id`, `kind`, `operator`, `doc_title`, `file_type`, `is_mentioned`) into the notification's `meta` so Claude sees them as first-class fields.
+- `src/tools.ts`: new exported `registerDocCommentTools({server, client, identitySession})` helper (split out of `registerTools` so smoke can exercise it without mocking the 9-positional dep surface); registers `reply_doc_comment` and `create_doc_comment` via `server.registerTool` with the owner-only gate + empty-content + length-limit + 1069302 ("collaborator comments disabled") hint paths. Because the `@larksuiteoapi/node-sdk` v1.x types only expose `delete`/`list`/`update`/`listWithIterator` on `drive.fileCommentReply` (no `create`), the wire-up site constructs a structurally-typed `DocCommentClient` adapter that calls the raw HTTP endpoints (`POST /open-apis/drive/v1/files/:file_token/comments/:comment_id/replies` and `POST .../comments`) via `client.request`. Smoke at `scripts/reply-doc-comment-smoke.ts` (9 cases).
+- `hooks/enforce-lark-reply.mjs`: new `DOC_COMMENT_REPLY_TOOL` constant and `isDocCommentTag` helper recognize both the `kind="doc_comment"` form (used in test fixtures) and the real-renderer `chat_type="doc_comment"` form. Pending IM messages and pending doc_comments are partitioned in `computeUnanswered` and require their respective satisfiers — `reply` / `react` / `edit_message` / `create_doc_comment` do NOT satisfy a pending doc_comment. Audit log records `pending_im` / `pending_doc` counts and `doc:<token>:<id>` keys for grep-ability. Test harness gains 7 cases (now 109 assertions).
+
+### Migration
+- New Feishu app scopes required (set in 飞书开放平台 → 权限管理):
+  - `docs:document.comment:read` — pre-fetch comment bodies
+  - `docs:document.comment:create` — post replies / new top-level comments
+  - `drive:drive.metadata:readonly` — fetch doc titles
+  - `docx:document:readonly` — read docx contents when Claude wants context
+- New event subscription: `drive.notice.comment_add_v1` (添加评论、回复通知事件) — enable in 事件与回调 → 添加事件.
+- Bot identity (`tenant_access_token`) provides tenant-wide event coverage — **no per-file subscription is needed**. A common confusion in the original issue spec was assuming `drive.file.subscribe` per-document; that's not the correct mechanism for @bot comments. See #181 for the corrected analysis.
+
+### Bug fixes uncovered during implementation
+- `src/channel.ts`: `escapeAttr` / `escapeBody` now escape `&` FIRST (was last) — pre-fix, `escapeAttr('has "quotes"')` produced `has &amp;quot;quotes&amp;quot;`. Smoke cases 7a/7b lock this in.
+- `src/channel.ts`, `scripts/comment-event-smoke.ts`: renamed `client.drive.metas.batchQuery` → `client.drive.meta.batchQuery` everywhere. The SDK exposes the property as singular `meta`; the plural form was a typo from the original design that would have thrown `TypeError: Cannot read property 'batchQuery' of undefined` at runtime — masked because the smoke mocks duplicated the misspelling.
+- `src/tools.ts`: `registerDocCommentTools` uses `server.registerTool` (the supported API), not the deprecated `server.tool` 3-arg form that an earlier draft used.
+
 ## [1.0.59] - 2026-05-26
 
 ### Fixed

@@ -93,10 +93,15 @@ Create a custom app at [Feishu Open Platform](https://open.feishu.cn/app) and en
 | `im:resource` | Download attachments |
 | `im:message.reactions:write` | Add emoji reactions |
 | `im:message.reactions:read` | Receive reaction events |
+| `docs:document.comment:read` | Pre-fetch comment bodies for doc-comment events |
+| `docs:document.comment:create` | Post doc-comment replies / new top-level comments |
+| `drive:drive.metadata:readonly` | Fetch doc titles for envelope |
+| `docx:document:readonly` | Read docx contents when Claude wants context |
 
 Enable the WebSocket mode under **Event Subscriptions** and subscribe to these events:
 - `im.message.receive_v1` -- receive messages
 - `im.message.reaction.created_v1` -- receive emoji reactions on bot messages
+- `drive.notice.comment_add_v1` -- receive doc-comment notifications when @-mentioned
 
 ### 2. Install the Plugin
 
@@ -353,6 +358,8 @@ The plugin registers the following MCP tools for Claude to use:
 | `delete_job` | Delete a cronjob. Owner-only. Requires `chat_id`. |
 | `what_do_you_know` | List what the bot has stored in the caller's profile. Filtered by rendering visibility (both tiers in p2p, public only in groups). Each line carries an 8-char hash for use with `forget_memory`. (v0.11.0+) |
 | `forget_memory` | Remove a specific line from the caller's profile by hash. Caller-scoped and idempotent. Optional `promote_to_rule` promotes the removal into a durable `## Always private` rule in `privacy-rules.md`. (v0.11.0+) |
+| `reply_doc_comment` | Reply to a Feishu doc comment thread. Owner-only. Posts as the bot's app identity. (v1.1.0+) |
+| `create_doc_comment` | Create a new top-level comment on a Feishu doc. Owner-only. (v1.1.0+) |
 
 ---
 
