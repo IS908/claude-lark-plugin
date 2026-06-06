@@ -427,8 +427,14 @@ export interface DocCommentToolsDeps {
  *     tools are owner-only in v1 (spec §5.2). Non-owners get an audit
  *     'denied' line and a clear error.
  *   - The `doc:<file_token>` chat_id prefix is the synthetic chat used by
- *     comment events; `getCaller` short-circuits it to `ownerFallback()`,
- *     letting Claude inherit owner identity for the duration of the turn.
+ *     comment events. `handleCommentEvent` binds the event's
+ *     `from_user_id.open_id` via `setCaller("doc:<file_token>", undefined,
+ *     ...)` before dispatch, so `getCaller` resolves to the REAL inbound user
+ *     — not the owner. The owner gate below then compares that resolved
+ *     caller to `getOwner()` explicitly; non-owners are denied. (Earlier
+ *     drafts of this PR had a `doc:` prefix shortcut to ownerFallback;
+ *     removed in PR #182 review — it would have let any non-owner
+ *     @-mentioning the bot in a doc comment escalate to owner identity.)
  *
  * Identity used to call Feishu: tenant_access_token (bot). The reply is
  * authored as the bot's app name. No user-impersonation path (spec §4.3).
