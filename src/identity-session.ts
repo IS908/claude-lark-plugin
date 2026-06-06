@@ -190,4 +190,9 @@ export class IdentitySession {
   _size(): number {
     return this.map.size;
   }
+
+  /** Test-only helper — exposes the post-clamp/post-fallback cap. */
+  _maxSize(): number {
+    return this.maxSize;
+  }
 }
