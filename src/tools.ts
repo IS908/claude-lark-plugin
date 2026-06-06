@@ -388,14 +388,20 @@ interface DocCommentClient {
 }
 
 /**
- * Structural subset of `McpServer` used by registerDocCommentTools — just the
- * deprecated `.tool(name, paramsSchema, cb)` overload. Kept structural so the
- * smoke test can pass a `{ tool }` stub without instantiating the full server.
+ * Structural subset of `McpServer` used by registerDocCommentTools — the modern
+ * `.registerTool(name, { description, inputSchema }, cb)` overload (matches the
+ * rest of `tools.ts`). Kept structural so the smoke test can pass a
+ * `{ registerTool }` stub without instantiating the full server. Also keeps
+ * the shared `registerTools()` mock servers in older smokes compatible (they
+ * all stub `registerTool`, not the deprecated `.tool`).
  */
 interface DocCommentServer {
-  tool: (
+  registerTool: (
     name: string,
-    paramsSchema: Record<string, z.ZodTypeAny>,
+    config: {
+      description?: string;
+      inputSchema: z.ZodTypeAny;
+    },
     cb: (args: any) => Promise<{
       isError?: boolean;
       content: { type: 'text'; text: string }[];
@@ -468,23 +474,27 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
     return { caller };
   }
 
-  server.tool(
+  server.registerTool(
     'reply_doc_comment',
     {
-      chat_id: z
-        .string()
-        .describe('Caller chat_id from notification meta (e.g. doc:<file_token> or __terminal__).'),
-      thread_id: z.string().optional(),
-      doc_token: z
-        .string()
-        .describe('Target document token (file_token from the doc_comment notification).'),
-      comment_id: z
-        .string()
-        .describe('Comment to reply under (from notification meta).'),
-      content: z
-        .string()
-        .describe('Reply body in plain text + optional inline URLs; max 1000 chars.'),
-      file_type: z.enum(['docx', 'doc', 'sheet', 'file', 'slides', 'bitable']),
+      description:
+        'Reply to a Feishu doc comment (owner-only). Use after a doc_comment notification — pass the comment_id and doc_token from the notification meta. Content is plain text + optional inline URLs, max 1000 chars.',
+      inputSchema: z.object({
+        chat_id: z
+          .string()
+          .describe('Caller chat_id from notification meta (e.g. doc:<file_token> or __terminal__).'),
+        thread_id: z.string().optional(),
+        doc_token: z
+          .string()
+          .describe('Target document token (file_token from the doc_comment notification).'),
+        comment_id: z
+          .string()
+          .describe('Comment to reply under (from notification meta).'),
+        content: z
+          .string()
+          .describe('Reply body in plain text + optional inline URLs; max 1000 chars.'),
+        file_type: z.enum(['docx', 'doc', 'sheet', 'file', 'slides', 'bitable']),
+      }),
     },
     async ({ chat_id, thread_id, doc_token, comment_id, content, file_type }) => {
       const auditArgs = { doc_token, comment_id, content, file_type };
@@ -553,14 +563,18 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
     },
   );
 
-  server.tool(
+  server.registerTool(
     'create_doc_comment',
     {
-      chat_id: z.string(),
-      thread_id: z.string().optional(),
-      doc_token: z.string(),
-      content: z.string(),
-      file_type: z.enum(['docx', 'doc', 'sheet', 'file', 'slides', 'bitable']),
+      description:
+        'Post a new top-level comment on a Feishu doc (owner-only). Use to start a fresh comment thread rather than reply to an existing one.',
+      inputSchema: z.object({
+        chat_id: z.string(),
+        thread_id: z.string().optional(),
+        doc_token: z.string(),
+        content: z.string(),
+        file_type: z.enum(['docx', 'doc', 'sheet', 'file', 'slides', 'bitable']),
+      }),
     },
     async ({ chat_id, thread_id, doc_token, content, file_type }) => {
       const auditArgs = { doc_token, content, file_type };

@@ -36,7 +36,7 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   };
   const registered: Record<string, any> = {};
   const fakeServer = {
-    tool: (name: string, _schema: any, handler: any) => { registered[name] = handler; },
+    registerTool: (name: string, _config: any, handler: any) => { registered[name] = handler; },
   };
   registerDocCommentTools({
     server: fakeServer as any,
@@ -98,7 +98,7 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 {
   const session = new IdentitySession(() => null);
   const registered: Record<string, any> = {};
-  const fakeServer = { tool: (n: string, _s: any, h: any) => { registered[n] = h; } };
+  const fakeServer = { registerTool: (n: string, _c: any, h: any) => { registered[n] = h; } };
   const dummyClient = { drive: { fileCommentReply: { create: async () => ({ data: {} }) }, fileComment: { create: async () => ({}) } } };
   registerDocCommentTools({ server: fakeServer as any, client: dummyClient as any, identitySession: session });
   const r = await registered.reply_doc_comment({
@@ -111,7 +111,7 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 {
   const session = new IdentitySession(() => 'ou_owner_test');
   const registered: Record<string, any> = {};
-  const fakeServer = { tool: (n: string, _s: any, h: any) => { registered[n] = h; } };
+  const fakeServer = { registerTool: (n: string, _c: any, h: any) => { registered[n] = h; } };
   const failingClient = { drive: {
     fileCommentReply: { create: async () => { const e: any = new Error('feishu generic boom'); throw e; } },
     fileComment: { create: async () => ({}) },
@@ -128,7 +128,7 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
 {
   const session = new IdentitySession(() => 'ou_owner_test');
   const registered: Record<string, any> = {};
-  const fakeServer = { tool: (n: string, _s: any, h: any) => { registered[n] = h; } };
+  const fakeServer = { registerTool: (n: string, _c: any, h: any) => { registered[n] = h; } };
   const deniedClient = { drive: {
     fileCommentReply: { create: async () => { const e: any = new Error('blocked'); e.code = 1069302; throw e; } },
     fileComment: { create: async () => ({}) },
