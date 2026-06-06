@@ -97,7 +97,12 @@ export class IdentitySession {
     private readonly maxAgeMs: number = 3600_000,
     opts: { maxSize?: number } = {},
   ) {
-    this.maxSize = opts.maxSize ?? DEFAULT_MAX_SIZE;
+    // PR #182 round-6 M-3: clamp to a floor of 1. With maxSize=0 the LRU
+    // loop on an empty map would skip eviction (no oldest key to delete),
+    // then immediately insert 1 entry — effective cap "1 slot, not 0".
+    // Treating 0 as 1 makes the cap's behavior at the corner explicit
+    // rather than silently degraded.
+    this.maxSize = Math.max(1, opts.maxSize ?? DEFAULT_MAX_SIZE);
   }
 
   private key(chatId: string, threadId?: string): string {

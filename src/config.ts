@@ -202,6 +202,18 @@ export const appConfig = {
       optionalNumber('LARK_INACTIVITY_HOURS', 3) * 2 * 60 * 60 * 1000,
     ),
   ),
+  /**
+   * Soft cap on the IdentitySession LRU map size (PR #182 round-6 M-2).
+   * Per-comment keying (post-round-4 I1) means the map can grow 1 entry
+   * per comment under a hostile commenter, so this LRU cap is the second
+   * line of defense behind the 2h TTL. Default 5000 matches the in-code
+   * DEFAULT_MAX_SIZE constant; env override mirrors the pattern used by
+   * other tracker caps (`LARK_*_CACHE_SIZE`, `LARK_BOT_MESSAGE_TRACKER_SIZE`).
+   * `optionalPositiveNumber` rejects 0/negatives and falls back to the
+   * default; the IdentitySession constructor additionally clamps to a
+   * floor of 1 (round-6 M-3) so the cap is always effective.
+   */
+  identitySessionMaxSize: optionalPositiveNumber('LARK_IDENTITY_SESSION_MAX_SIZE', 5000),
 
   // Paths
   memoriesDir: path.join(os.homedir(), '.claude', 'channels', 'lark', 'memories'),

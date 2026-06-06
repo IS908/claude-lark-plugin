@@ -138,4 +138,17 @@ function fail(msg: string): never {
   if (!threw) fail('15: doc: chat_id without thread_id must throw');
 }
 
-console.log('identity smoke: 15/15 PASS');
+// 16. maxSize=0 is clamped to 1 (corner-case defense — PR #182 round 6 M-3).
+// Without the clamp, the LRU loop on an empty map skips eviction (no oldest
+// to delete) and the first insert lands → effective cap is "1 slot, not 0".
+// The clamp makes the corner explicit so the cap is always effective.
+{
+  const s = new IdentitySession(() => 'ou_owner', 3600_000, { maxSize: 0 });
+  s.setCaller('doc:a', 'c1', 'ou_alice');
+  s.setCaller('doc:b', 'c2', 'ou_bob');
+  // Only 1 slot available; the first entry should have been evicted.
+  if (s.getCaller('doc:a', 'c1') !== null) fail('16: maxSize=0 must clamp to 1 (oldest evicted)');
+  if (s.getCaller('doc:b', 'c2') !== 'ou_bob') fail('16: most recent must be present');
+}
+
+console.log('identity smoke: 16/16 PASS');

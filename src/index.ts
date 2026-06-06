@@ -229,6 +229,7 @@ async function main() {
   const identitySession = new IdentitySession(
     () => appConfig.ownerOpenId,
     appConfig.identitySessionTtlMs,
+    { maxSize: appConfig.identitySessionMaxSize },
   );
   if (appConfig.ownerOpenId) {
     console.error(`[identity] owner fallback: ${appConfig.ownerOpenId}`);
