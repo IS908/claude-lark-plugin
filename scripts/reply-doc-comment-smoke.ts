@@ -161,4 +161,26 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   if (!/exceeds/i.test(r.content[0].text)) fail(`8: error msg should mention exceeds: ${r.content[0].text}`);
 }
 
-console.error(`PASS: 8 cases (owner gate + error paths)`);
+// 9. create_doc_comment owner pass + non-owner deny
+{
+  const h = makeHarness();
+  const okR = await h.registered.create_doc_comment({
+    chat_id: '__terminal__',
+    doc_token: 'dox_new',
+    content: 'top-level comment',
+    file_type: 'docx',
+  });
+  if (okR?.isError) fail(`9a: owner must pass: ${JSON.stringify(okR)}`);
+  if (h.fileCommentCreateCalls.length !== 1) fail(`9a: expected create call`);
+
+  h.session.setCaller('oc_other', undefined, 'ou_not_owner');
+  const denyR = await h.registered.create_doc_comment({
+    chat_id: 'oc_other',
+    doc_token: 'dox_new',
+    content: 'x',
+    file_type: 'docx',
+  });
+  if (!denyR?.isError) fail(`9b: non-owner must deny`);
+}
+
+console.error(`PASS: 9 cases (owner gate + error paths + create)`);

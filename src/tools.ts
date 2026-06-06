@@ -552,6 +552,67 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
       }
     },
   );
+
+  server.tool(
+    'create_doc_comment',
+    {
+      chat_id: z.string(),
+      thread_id: z.string().optional(),
+      doc_token: z.string(),
+      content: z.string(),
+      file_type: z.enum(['docx', 'doc', 'sheet', 'file', 'slides', 'bitable']),
+    },
+    async ({ chat_id, thread_id, doc_token, content, file_type }) => {
+      const auditArgs = { doc_token, content, file_type };
+      const auth = resolveCaller('create_doc_comment', chat_id, thread_id, auditArgs);
+      if ('error' in auth) return auth.error;
+      const owner = identitySession.getOwner();
+      if (auth.caller !== owner) {
+        void audit('create_doc_comment', auth.caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: 'create_doc_comment is owner-only.' }],
+        };
+      }
+      if (!content || content.trim() === '') {
+        void audit('create_doc_comment', auth.caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: 'comment content cannot be empty' }],
+        };
+      }
+      let elements;
+      try {
+        elements = buildCommentElements(content);
+      } catch (e: any) {
+        void audit('create_doc_comment', auth.caller, auditArgs, 'error');
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: e?.message || 'invalid content' }],
+        };
+      }
+      try {
+        const resp = await client.drive.fileComment.create({
+          path: { file_token: doc_token },
+          params: { file_type, user_id_type: 'open_id' },
+          data: { reply_list: { replies: [{ content: { elements } }] } },
+        });
+        void audit('create_doc_comment', auth.caller, auditArgs, 'ok');
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Top-level comment posted. comment_id=${resp?.data?.comment_id ?? '<unknown>'}`,
+          }],
+        };
+      } catch (e: any) {
+        void audit('create_doc_comment', auth.caller, auditArgs, 'error');
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: `Feishu API error: ${e?.message || String(e)}` }],
+        };
+      }
+    },
+  );
 }
 
 /**
