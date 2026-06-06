@@ -65,7 +65,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
             return {
               data: {
                 quote: 'quoted text',
-                reply_list: { items: [{ reply_id: params.path.comment_id, content: { text: 'body' } }] },
+                reply_list: { replies: [{ reply_id: params.path.comment_id, content: { text: 'body' } }] },
               },
             };
           },
@@ -148,7 +148,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
     drive: {
       fileComment: {
         get: async (params: any) => ({
-          data: { quote: '', reply_list: { items: [{ reply_id: params.path.comment_id, content: { text: 'b' } }] } },
+          data: { quote: '', reply_list: { replies: [{ reply_id: params.path.comment_id, content: { text: 'b' } }] } },
         }),
       },
       meta: { batchQuery: async () => { throw new Error('meta boom'); } },
@@ -189,7 +189,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
       fileComment: {
         get: async () => ({ data: {
           quote: 'q',
-          reply_list: { items: [
+          reply_list: { replies: [
             { reply_id: 'cmt_6_parent', content: { text: 'parent body' } },
             { reply_id: 'cmt_6_r1', content: { text: 'first reply body' } },
             { reply_id: 'cmt_6_r2', content: { text: 'target reply body' } },
@@ -214,7 +214,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
     drive: {
       fileComment: {
         get: async () => ({ data: {
-          reply_list: { items: [{ reply_id: 'cmt_14_parent', content: { text: 'p' } }] },
+          reply_list: { replies: [{ reply_id: 'cmt_14_parent', content: { text: 'p' } }] },
         } }),
       },
       meta: { batchQuery: async () => ({ data: { metas: [] } }) },
@@ -274,7 +274,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 {
   const noQuote = {
     drive: {
-      fileComment: { get: async () => ({ data: { quote: '', reply_list: { items: [{ reply_id: 'cmt_001', content: { text: 'x' } }] } } }) },
+      fileComment: { get: async () => ({ data: { quote: '', reply_list: { replies: [{ reply_id: 'cmt_001', content: { text: 'x' } }] } } }) },
       meta: { batchQuery: async () => ({ data: { metas: [] } }) },
     },
   };

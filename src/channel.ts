@@ -397,7 +397,9 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
     });
     const c = resp?.data ?? {};
     quote = typeof c.quote === 'string' && c.quote.length > 0 ? c.quote : undefined;
-    const replies: any[] = c.reply_list?.items ?? c.reply_list ?? [];
+    const replies: any[] = c.reply_list?.replies
+      ?? c.reply_list?.items
+      ?? (Array.isArray(c.reply_list) ? c.reply_list : []);
     if (replyId) {
       // add_reply: parent = reply_list[0] (the comment itself), body = the reply_id one
       // Task 8 fleshes out the missing-reply_id case; for now, leave body undefined when not found.
