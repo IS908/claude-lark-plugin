@@ -56,11 +56,19 @@ export const SYSTEM_FLUSH_CALLER = '__system_flush__';
 
 /**
  * Synthetic chat_id prefix used to route doc-comment events through the
- * IdentitySession to the owner fallback. The format is `doc:<file_token>`.
- * `getCaller` short-circuits any chat_id with this prefix to `ownerFallback()`.
+ * IdentitySession. The format is `doc:<file_token>`.
  *
- * Audit before adding sibling prefixes — `startsWith` matches `doc:`, `docs:`,
- * `doc-comment:`, etc. would all collide and incorrectly route to owner.
+ * IMPORTANT: this is a naming convention only — there is NO short-circuit
+ * in `getCaller` that maps `doc:` prefix to a specific identity. The caller
+ * is bound at event-time by `setCaller("doc:<file_token>", undefined,
+ * from_user_id.open_id)` in `handleCommentEvent`, and resolved through the
+ * normal session-map lookup. Tools that require owner identity (e.g.
+ * `reply_doc_comment`) check the resolved caller against `getOwner()`
+ * explicitly.
+ *
+ * An earlier version of this PR had a `chatId.startsWith(DOC_CHAT_ID_PREFIX)
+ * → ownerFallback()` shortcut. That shortcut bypassed the server-derived
+ * identity model and was removed — see PR #182 review.
  */
 export const DOC_CHAT_ID_PREFIX = 'doc:';
 
@@ -92,13 +100,6 @@ export class IdentitySession {
    */
   getCaller(chatId: string, threadId?: string): string | null {
     if (chatId === TERMINAL_CHAT_ID) {
-      return this.ownerFallback();
-    }
-    // Doc-comment events route through synthetic chat_id `doc:<file_token>`.
-    // v1: all events processed under owner identity, mirroring TERMINAL_CHAT_ID.
-    // Future: if multi-user routing is added, replace this short-circuit with
-    // an event-derived caller (e.g. from notice_meta.from_user_id).
-    if (chatId.startsWith(DOC_CHAT_ID_PREFIX)) {
       return this.ownerFallback();
     }
     if (threadId) {

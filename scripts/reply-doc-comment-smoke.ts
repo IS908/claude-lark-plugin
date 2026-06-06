@@ -81,9 +81,10 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   if (h.fileCommentReplyCalls.length !== 0) fail(`2: API should not be called`);
 }
 
-// 3. doc:<token> route → treated as owner via IdentitySession
+// 3. doc:<token> route with owner bound via setCaller (simulates event-time flow when owner @-mentions bot)
 {
   const h = makeHarness();
+  h.session.setCaller('doc:dox_test', undefined, 'ou_owner_test');
   const r = await h.registered.reply_doc_comment({
     chat_id: 'doc:dox_test',
     doc_token: 'dox_test',
@@ -91,7 +92,22 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
     content: 'ok',
     file_type: 'docx',
   });
-  if (r?.isError) fail(`3: doc: prefix should resolve to owner: ${JSON.stringify(r)}`);
+  if (r?.isError) fail(`3: owner bound via setCaller should pass: ${JSON.stringify(r)}`);
+}
+
+// 3a. doc:<token> route with non-owner bound via setCaller → denied (security regression)
+{
+  const h = makeHarness();
+  h.session.setCaller('doc:dox_test', undefined, 'ou_alice');
+  const r = await h.registered.reply_doc_comment({
+    chat_id: 'doc:dox_test',
+    doc_token: 'dox_test',
+    comment_id: 'cmt_a',
+    content: 'ok',
+    file_type: 'docx',
+  });
+  if (!r?.isError) fail(`3a: SECURITY: non-owner bound to doc: chat_id must be denied`);
+  if (h.fileCommentReplyCalls.length !== 0) fail(`3a: API must not be called`);
 }
 
 // 4. terminal chat_id with no LARK_OWNER_OPEN_ID → denied
@@ -183,4 +199,4 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   if (!denyR?.isError) fail(`9b: non-owner must deny`);
 }
 
-console.error(`PASS: 9 cases (owner gate + error paths + create)`);
+console.error(`PASS: 10 cases (owner gate + error paths + create + doc: security regression)`);

@@ -85,24 +85,29 @@ function fail(msg: string): never {
   if (s.getOwner() !== null) fail('getOwner null when ownerFallback returns null');
 }
 
-// 11. doc:<token> prefix routes to owner fallback
+// 11. doc:<token> with no setCaller binding → null (no shortcut to owner anymore)
 {
   const s = new IdentitySession(() => 'ou_owner');
-  if (s.getCaller('doc:doxcnXXX') !== 'ou_owner') fail('doc: prefix should return owner');
+  if (s.getCaller('doc:doxcnXXX') !== null) {
+    fail('11: doc: prefix must NOT short-circuit to owner — caller is bound at event-time via setCaller');
+  }
 }
 
-// 12. doc:<token> with no owner configured → null
-{
-  const s = new IdentitySession(() => null);
-  if (s.getCaller('doc:doxcnXXX') !== null) fail('doc: prefix should null when owner unset');
-}
-
-// 13. doc: prefix takes precedence over any chat/thread entry
+// 12. doc:<token> with setCaller binding → returns the bound user (event-time identity preserved)
 {
   const s = new IdentitySession(() => 'ou_owner');
-  s.setCaller('doc:doxcnXXX', 't1', 'ou_someone_else');
-  if (s.getCaller('doc:doxcnXXX', 't1') !== 'ou_owner') {
-    fail('doc: prefix must short-circuit before chat/thread lookup');
+  s.setCaller('doc:doxcnXXX', undefined, 'ou_from_user');
+  if (s.getCaller('doc:doxcnXXX') !== 'ou_from_user') {
+    fail('12: doc: chat_id must resolve to the setCaller-bound user, not owner');
+  }
+}
+
+// 13. doc:<token> with non-owner setCaller binding → returns non-owner (security regression test)
+{
+  const s = new IdentitySession(() => 'ou_owner');
+  s.setCaller('doc:doxcnXXX', undefined, 'ou_alice');
+  if (s.getCaller('doc:doxcnXXX') === 'ou_owner') {
+    fail('13: SECURITY: doc: chat_id must NOT silently elevate non-owner to owner identity');
   }
 }
 
