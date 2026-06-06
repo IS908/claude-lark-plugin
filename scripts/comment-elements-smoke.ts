@@ -81,4 +81,16 @@ function fail(msg: string): never {
   if (els[0].text_run?.text !== 'see ftp://x.y') fail(`9: full text should stay`);
 }
 
-console.error(`PASS: 9 cases (text baseline + URL parsing)`);
+// 7. text exceeding per-element char limit → throw
+{
+  let threw = false;
+  try {
+    buildCommentElements('x'.repeat(1500));
+  } catch (e: any) {
+    threw = true;
+    if (!/exceeds.*char/i.test(e.message)) fail(`7: error message unclear: ${e.message}`);
+  }
+  if (!threw) fail(`7: should throw on >${1000} chars`);
+}
+
+console.error(`PASS: 10 cases (text baseline + URL + length limit)`);

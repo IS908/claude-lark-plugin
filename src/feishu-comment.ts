@@ -21,6 +21,11 @@ export const MAX_TEXT_RUN_LEN = 1000;
 const URL_RE = /https?:\/\/[^\s"'<>]+/g;
 
 export function buildCommentElements(markdown: string): CommentElement[] {
+  if (markdown.length > MAX_TEXT_RUN_LEN) {
+    throw new Error(
+      `reply text exceeds ${MAX_TEXT_RUN_LEN} char per-element limit (got ${markdown.length}).`,
+    );
+  }
   if (markdown === '') {
     return [{ type: 'text_run', text_run: { text: '' } }];
   }
