@@ -1490,16 +1490,23 @@ console.log('\n[54] doc_comment with no satisfying tool_use → exit 2');
   assertEq(r.exitCode, 2, 'doc_comment empty turn must exit 2');
 }
 
-// --- Test 55: reply_doc_comment with matching ids → exit 0 ---
-console.log('\n[55] reply_doc_comment with matching doc_token+comment_id → exit 0');
+// --- Test 55: reply_doc_comment with matching ids + SUCCESS tool_result → exit 0 ---
+console.log('\n[55] reply_doc_comment with matching doc_token+comment_id + success tool_result → exit 0');
 {
+  // #182 P2-R3 update: under the stricter satisfier semantics, a
+  // matching reply_doc_comment counts ONLY when the corresponding
+  // tool_result confirms success (is_error !== true). This test now
+  // explicitly pairs the tool_use with a SUCCESS result block to
+  // continue exercising the happy path.
   const userContent =
     '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const toolUseId = 'tu_55_doc';
   const path = writeTranscript('doc-comment-satisfied', [
     makeUserMsg(userContent),
-    makeAssistantToolUse('mcp__plugin_lark_lark__reply_doc_comment', {
+    makeAssistantToolUseWithId('mcp__plugin_lark_lark__reply_doc_comment', toolUseId, {
       doc_token: 'X', comment_id: 'Y', content: 'ok', file_type: 'docx',
     }),
+    makeUserToolResult(toolUseId, 'Posted reply to comment Y in doc X.'),
   ]);
   const r = runHook({ transcriptPath: path });
   assertEq(r.exitCode, 0, 'matching reply_doc_comment satisfies');
@@ -1580,6 +1587,110 @@ console.log('\n[60] create_doc_comment (sibling create, not reply) → exit 2');
   ]);
   const r = runHook({ transcriptPath: path });
   assertEq(r.exitCode, 2, 'create_doc_comment does NOT satisfy a comment reply obligation');
+}
+
+// ─── #182 P2-R3: tool_result-aware doc_comment satisfier ───────────────────
+// The Stop hook (pre-fix) treated any matching reply_doc_comment tool_use as
+// a satisfier without inspecting the corresponding tool_result. But
+// reply_doc_comment has many isError paths (non-owner gate, doc_token
+// mismatch, empty/oversize content, Feishu API errors, permission_denied).
+// Under the common case of a non-owner @-mention reaching the owner-only
+// tool, the gate denied the call — yet the hook saw the attempt and exited
+// 0, leaving the user with silence and Claude no chance to remediate. Fix:
+// the satisfier check now confirms (a) a tool_result block exists AND (b)
+// is_error !== true. Errored or missing-result tool_uses leave the
+// doc_comment pending; Claude must remediate (e.g. via [LARK_DEFER]).
+//
+// Scoped to doc_comment ONLY. IM `reply` / `react` satisfiers remain
+// tool_result-agnostic — different operational model (auth established at
+// inbound time; tool-level defer via tool_result `[LARK_DEFER]` injection
+// at #122 is the existing remediation path).
+
+// Helper: tool_result with is_error: true (the existing `makeUserToolResult`
+// always emits is_error implicitly false).
+function makeUserToolResultError(toolUseId, text) {
+  return {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: toolUseId, content: text, is_error: true },
+      ],
+    },
+  };
+}
+
+// --- Test 61: errored tool_result does NOT satisfy doc_comment ---
+console.log('\n[61] reply_doc_comment with is_error=true tool_result → does NOT satisfy → exit 2 (#182 P2-R3)');
+{
+  // The COMMON case: a non-owner @-mentions the bot in a doc comment.
+  // Event forwarded, Claude calls reply_doc_comment, owner-gate denies
+  // with isError=true. Pre-fix the hook treated the attempt as a
+  // satisfier and exited 0 — user got silence. Post-fix the errored
+  // result leaves the obligation pending and the hook exits 2.
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const toolUseId = 'tu_61_doc_err';
+  const path = writeTranscript('doc-comment-tool-error', [
+    makeUserMsg(userContent),
+    makeAssistantToolUseWithId('mcp__plugin_lark_lark__reply_doc_comment', toolUseId, {
+      doc_token: 'X', comment_id: 'Y', content: 'attempted', file_type: 'docx',
+    }),
+    makeUserToolResultError(toolUseId, 'reply_doc_comment is owner-only.'),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'errored reply_doc_comment must NOT satisfy');
+  assertContains(
+    r.auditLine,
+    'status=blocked',
+    'block path taken despite the attempted call',
+  );
+}
+
+// --- Test 62: missing tool_result block does NOT satisfy doc_comment ---
+console.log('\n[62] reply_doc_comment with NO tool_result block → does NOT satisfy → exit 2 (#182 P2-R3)');
+{
+  // Defensive case: the call somehow didn't produce a tool_result entry
+  // (truncated transcript, crash mid-call, future entry-shape change).
+  // Without confirmation that the call succeeded, the satisfier cannot
+  // count — the obligation remains pending.
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const toolUseId = 'tu_62_doc_no_result';
+  const path = writeTranscript('doc-comment-no-result', [
+    makeUserMsg(userContent),
+    makeAssistantToolUseWithId('mcp__plugin_lark_lark__reply_doc_comment', toolUseId, {
+      doc_token: 'X', comment_id: 'Y', content: 'attempted', file_type: 'docx',
+    }),
+    // NO tool_result block — call didn't complete or wasn't recorded
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 2, 'missing tool_result must NOT satisfy');
+}
+
+// --- Test 63: errored tool_result + [LARK_DEFER] sentinel DOES satisfy ---
+console.log('\n[63] errored reply_doc_comment + [LARK_DEFER] sentinel → defers, exit 0 (#182 P2-R3)');
+{
+  // The remediation path: after the owner-gate deny, Claude
+  // acknowledges the inability to post and emits the defer sentinel
+  // on its own line in assistant text. Existing sentinel handling
+  // (which runs AFTER computeUnanswered finds the obligation pending)
+  // accepts this and exits 0 cleanly.
+  const userContent =
+    '<channel source="plugin:lark:lark" kind="doc_comment" doc_token="X" comment_id="Y">stuff</channel>';
+  const toolUseId = 'tu_63_doc_defer';
+  const path = writeTranscript('doc-comment-error-then-defer', [
+    makeUserMsg(userContent),
+    makeAssistantToolUseWithId('mcp__plugin_lark_lark__reply_doc_comment', toolUseId, {
+      doc_token: 'X', comment_id: 'Y', content: 'attempted', file_type: 'docx',
+    }),
+    makeUserToolResultError(toolUseId, 'reply_doc_comment is owner-only.'),
+    makeAssistantText(
+      'Non-owner trigger; cannot post bot reply.\n[LARK_DEFER]\nWill notify owner separately.',
+    ),
+  ]);
+  const r = runHook({ transcriptPath: path });
+  assertEq(r.exitCode, 0, '[LARK_DEFER] satisfies even after errored reply_doc_comment');
 }
 
 // --- Summary ---

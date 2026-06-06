@@ -473,9 +473,35 @@ function collectPendingLarkMessages(entries, realUserIndices) {
   return pending;
 }
 
-function collectReplies(entries, fromIndex) {
+// Build a tool_use_id → tool_result_block index over the turn entries.
+// Used by the doc_comment satisfy check (#182 P2-R3) to confirm the call
+// actually succeeded before counting it as a satisfier. Tool results live
+// inside user-role entries with content `[{type:'tool_result', tool_use_id,
+// content, is_error?}]`. A turn may contain many tool_uses paired with
+// their results; we collect them all once so each satisfier check is O(1).
+function buildToolResultIndex(entries, fromIndex) {
+  const map = new Map();
+  for (let i = fromIndex; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry?.type !== 'user') continue;
+    const content = entry.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+        map.set(block.tool_use_id, block);
+      }
+    }
+  }
+  return map;
+}
+
+function collectReplies(entries, fromIndex, toolResultIndex) {
   const replies = [];
   const docCommentReplies = [];
+  // Diagnostic counters for audit log when doc_comment obligations remain
+  // unsatisfied due to errored/missing tool_results — surfaces the WHY
+  // ("attempted but denied") rather than the misleading "no attempt".
+  const docCommentSkipped = [];
   for (let i = fromIndex; i < entries.length; i++) {
     const entry = entries[i];
     if (entry?.type !== 'assistant') continue;
@@ -488,6 +514,13 @@ function collectReplies(entries, fromIndex) {
         // as the target. (edit_message is excluded from REPLY_TOOLS above —
         // its message_id targets the BOT's previous message, not the user's
         // inbound id, so it cannot satisfy a pending reply obligation.)
+        //
+        // IM satisfiers are tool_result-AGNOSTIC by design (#182 P2-R3): the
+        // operational model is "auth established at inbound time, reply is
+        // best-effort send." A failed `reply` (Feishu transient error) still
+        // means Claude attempted to address the user; tool-level remediation
+        // happens via tool_result `[LARK_DEFER]` injection (#122). The
+        // tool_result check is scoped to doc_comment only.
         const targetMessageId = input.reply_to || input.message_id || '';
         replies.push({
           tool: t.name,
@@ -502,15 +535,50 @@ function collectReplies(entries, fromIndex) {
         // against pending doc_comment records by composite key.
         // create_doc_comment is INTENTIONALLY excluded — it opens a new
         // thread rather than replying to the pending comment.
+        //
+        // #182 P2-R3 fix: only count as satisfier when the call actually
+        // succeeded. `reply_doc_comment` has many isError paths (non-owner
+        // gate, doc_token mismatch, empty/oversize content, Feishu API
+        // errors, permission_denied/1069302). The pre-fix hook treated any
+        // matching tool_use as a satisfier — under the common case of a
+        // non-owner @-mention reaching an owner-only tool, the deny was
+        // silently treated as "answered" and Claude never remediated.
+        //
+        // We look up the matching `tool_result` by `tool_use_id`. The
+        // satisfier counts only if a result exists AND its `is_error` is
+        // not true. Errored/missing results are diagnostically logged so
+        // the audit trail shows the obligation remained pending because
+        // the attempt FAILED, not because no attempt was made.
+        const docToken = input.doc_token || '';
+        const commentId = input.comment_id || '';
+        const result = t.id ? toolResultIndex.get(t.id) : undefined;
+        if (!result) {
+          docCommentSkipped.push({
+            doc_token: docToken,
+            comment_id: commentId,
+            tool_use_id: t.id || '',
+            reason: 'missing_result',
+          });
+          continue;
+        }
+        if (result.is_error === true) {
+          docCommentSkipped.push({
+            doc_token: docToken,
+            comment_id: commentId,
+            tool_use_id: t.id || '',
+            reason: 'tool_error',
+          });
+          continue;
+        }
         docCommentReplies.push({
           tool: t.name,
-          doc_token: input.doc_token || '',
-          comment_id: input.comment_id || '',
+          doc_token: docToken,
+          comment_id: commentId,
         });
       }
     }
   }
-  return { replies, docCommentReplies };
+  return { replies, docCommentReplies, docCommentSkipped };
 }
 
 // Collect text the model emitted in this turn — assistant text blocks AND
@@ -869,10 +937,15 @@ function main() {
     process.exit(0);
   }
 
-  let pending, replies, docCommentReplies, assistantText, larkToolUseIds, toolResultText;
+  let pending, replies, docCommentReplies, docCommentSkipped, assistantText, larkToolUseIds, toolResultText;
   try {
     pending = collectPendingLarkMessages(entries, turn.realUserIndices);
-    ({ replies, docCommentReplies } = collectReplies(entries, turn.scanFromIndex));
+    // #182 P2-R3: build tool_use_id → tool_result index once, share with
+    // collectReplies so the doc_comment satisfier check can confirm success.
+    const toolResultIndex = buildToolResultIndex(entries, turn.scanFromIndex);
+    ({ replies, docCommentReplies, docCommentSkipped } = collectReplies(
+      entries, turn.scanFromIndex, toolResultIndex,
+    ));
     assistantText = collectAssistantText(entries, turn.scanFromIndex);
     // #122 fix: also gather tool_result text from lark-plugin tools.
     // Lets the defer signal be mechanical (the tool itself emits the
@@ -915,8 +988,23 @@ function main() {
     process.exit(0);
   }
 
-  // Normal block path. IDs in the audit line surface either the IM
-  // message_id or the doc_comment composite key for diagnostic grep-ability.
+  // Normal block path.
+  // #182 P2-R3: when a doc_comment obligation remains unsatisfied because
+  // reply_doc_comment WAS called but the call errored (or no result block
+  // was recorded), surface the WHY in the audit log so an operator can
+  // distinguish "Claude never tried" from "Claude tried, gate denied."
+  // One line per skipped attempt; emitted BEFORE the canonical
+  // status=blocked line so that line remains the most-recent audit entry
+  // (matches the contract test 24 and others rely on).
+  if (docCommentSkipped && docCommentSkipped.length > 0) {
+    for (const s of docCommentSkipped) {
+      audit(
+        `Stop  doc_comment_obligation_unsatisfied  doc:${s.doc_token}:${s.comment_id}  tool_use_id=${s.tool_use_id}  reason=${s.reason}`,
+      );
+    }
+  }
+  // IDs in the audit line surface either the IM message_id or the
+  // doc_comment composite key for diagnostic grep-ability.
   const msg = buildBlockMessage(unanswered);
   const idList = unanswered
     .map((u) => (u.kind === 'doc_comment' ? `doc:${u.doc_token}:${u.comment_id}` : u.message_id))
