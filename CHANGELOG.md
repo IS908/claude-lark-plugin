@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1.1] - 2026-06-07
+
+### Fixed
+- **Doc-comment events 100% silently dropped in v1.1.0** (#183). `handleCommentEvent` (added by #182) read `data.header.event_id` and `data.event.notice_meta`, but the Lark Node SDK's `EventDispatcher.register` auto-unwraps the envelope and delivers the event body directly. `data.event` was always `undefined`, the early `if (!meta) return` fired on every event, and no doc comment ever reached Claude. Reproduced on a live docx in #183. Fixed by reading fields from their real SDK locations: `data.event_id`, `data.notice_meta`, `data.is_mentioned`, `data.comment_id`, `data.reply_id`. `notice_meta.{file_token, file_type, from_user_id, to_user_id}` were already at the correct nesting and didn't move.
+
+### Implementation
+- `src/channel.ts:391`: rewrote field extraction in `handleCommentEvent`. Added `debugLog` to every silent return point (missing `notice_meta`, `is_mentioned=false`, `to_user_id` mismatch, self-loop prevention) — adjacent gap also flagged in #183. Without these, the v1.1.0 silent-drop bug had no log trail and operators saw a dead bot with no remediation path.
+- `scripts/comment-event-smoke.ts`: rewrote `makeEvent` factory to mirror the real SDK payload shape (flat `event_id` / `comment_id` / `reply_id` / `is_mentioned` at root; `notice_meta` at root). The previous factory duplicated the buggy nesting, so all 20 smoke cases were green while production was 100% broken — same family as #180.
+
+### Known follow-ups (not in this patch)
+- Add an integration smoke that exercises the real `Lark.EventDispatcher.register` dispatch path (currently every doc-comment smoke calls `handleCommentEvent` directly with hand-built mocks). Would catch wire-format regressions before merge.
+
 ## [1.1.0] - 2026-06-07
 
 ### Added
