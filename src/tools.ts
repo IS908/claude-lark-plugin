@@ -498,6 +498,13 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
           content: [{ type: 'text' as const, text: 'reply_doc_comment is owner-only.' }],
         };
       }
+      if (!content || content.trim() === '') {
+        void audit('reply_doc_comment', auth.caller, auditArgs, 'denied');
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: 'reply content cannot be empty' }],
+        };
+      }
       let elements;
       try {
         elements = buildCommentElements(content);

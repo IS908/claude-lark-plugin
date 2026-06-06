@@ -81,4 +81,84 @@ function makeHarness(opts: { ownerFallback?: () => string | null } = {}) {
   if (h.fileCommentReplyCalls.length !== 0) fail(`2: API should not be called`);
 }
 
-console.error(`PASS: 2 cases (owner gate)`);
+// 3. doc:<token> route → treated as owner via IdentitySession
+{
+  const h = makeHarness();
+  const r = await h.registered.reply_doc_comment({
+    chat_id: 'doc:dox_test',
+    doc_token: 'dox_test',
+    comment_id: 'cmt_a',
+    content: 'ok',
+    file_type: 'docx',
+  });
+  if (r?.isError) fail(`3: doc: prefix should resolve to owner: ${JSON.stringify(r)}`);
+}
+
+// 4. terminal chat_id with no LARK_OWNER_OPEN_ID → denied
+{
+  const session = new IdentitySession(() => null);
+  const registered: Record<string, any> = {};
+  const fakeServer = { tool: (n: string, _s: any, h: any) => { registered[n] = h; } };
+  const dummyClient = { drive: { fileCommentReply: { create: async () => ({ data: {} }) }, fileComment: { create: async () => ({}) } } };
+  registerDocCommentTools({ server: fakeServer as any, client: dummyClient as any, identitySession: session });
+  const r = await registered.reply_doc_comment({
+    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
+  });
+  if (!r?.isError) fail(`4: terminal without owner must deny`);
+}
+
+// 5. Feishu API generic failure → error returned with message preserved
+{
+  const session = new IdentitySession(() => 'ou_owner_test');
+  const registered: Record<string, any> = {};
+  const fakeServer = { tool: (n: string, _s: any, h: any) => { registered[n] = h; } };
+  const failingClient = { drive: {
+    fileCommentReply: { create: async () => { const e: any = new Error('feishu generic boom'); throw e; } },
+    fileComment: { create: async () => ({}) },
+  }};
+  registerDocCommentTools({ server: fakeServer as any, client: failingClient as any, identitySession: session });
+  const r = await registered.reply_doc_comment({
+    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
+  });
+  if (!r?.isError) fail(`5: expected error`);
+  if (!r.content[0].text.includes('feishu generic boom')) fail(`5: original error message lost`);
+}
+
+// 6. permission_denied (code 1069302) → clear hint
+{
+  const session = new IdentitySession(() => 'ou_owner_test');
+  const registered: Record<string, any> = {};
+  const fakeServer = { tool: (n: string, _s: any, h: any) => { registered[n] = h; } };
+  const deniedClient = { drive: {
+    fileCommentReply: { create: async () => { const e: any = new Error('blocked'); e.code = 1069302; throw e; } },
+    fileComment: { create: async () => ({}) },
+  }};
+  registerDocCommentTools({ server: fakeServer as any, client: deniedClient as any, identitySession: session });
+  const r = await registered.reply_doc_comment({
+    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c', content: 'x', file_type: 'docx',
+  });
+  if (!r?.isError) fail(`6: expected error`);
+  if (!/collaborator|allow.*comment/i.test(r.content[0].text)) fail(`6: hint missing: ${r.content[0].text}`);
+}
+
+// 7. empty content → tool-level error
+{
+  const h = makeHarness();
+  const r = await h.registered.reply_doc_comment({
+    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c', content: '', file_type: 'docx',
+  });
+  if (!r?.isError) fail(`7: empty content must be rejected at tool layer`);
+}
+
+// 8. content >1000 chars → buildCommentElements throws, tool returns error
+{
+  const h = makeHarness();
+  const r = await h.registered.reply_doc_comment({
+    chat_id: '__terminal__', doc_token: 'd', comment_id: 'c',
+    content: 'x'.repeat(1500), file_type: 'docx',
+  });
+  if (!r?.isError) fail(`8: oversized content must error`);
+  if (!/exceeds/i.test(r.content[0].text)) fail(`8: error msg should mention exceeds: ${r.content[0].text}`);
+}
+
+console.error(`PASS: 8 cases (owner gate + error paths)`);
