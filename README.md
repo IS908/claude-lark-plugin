@@ -245,7 +245,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 
 > **Whitelist semantics:** when both lists are set, a message is accepted if **either** the sender is in `LARK_ALLOWED_USER_IDS` **or** the chat is in `LARK_ALLOWED_CHAT_IDS` (OR). Setting only one list gates on that list alone.
 >
-> For `drive.notice.comment_add_v1` (doc-comment) events: when `LARK_ALLOWED_USER_IDS` is configured, the comment author's `open_id` must match. When only `LARK_ALLOWED_CHAT_IDS` is configured (no user list), doc-comment events pass through — the chat list cannot meaningfully match the synthetic `doc:<file_token>` chat_id, and Feishu-side ACL (bot must be a doc collaborator + @-mentioned) is the upstream boundary (v1.1.0+).
+> For `drive.notice.comment_add_v1` (doc-comment) events: when `LARK_ALLOWED_USER_IDS` is configured, the comment author's `open_id` must match. When only `LARK_ALLOWED_CHAT_IDS` is configured (no user list), doc-comment events pass through — the chat list cannot meaningfully match the synthetic `doc:<file_token>` chat_id, and Feishu-side ACL (bot must be a doc collaborator + @-mentioned) is the upstream boundary (v1.1.1+).
 
 ### Optional -- Messaging
 
@@ -361,8 +361,8 @@ The plugin registers the following MCP tools for Claude to use:
 | `delete_job` | Delete a cronjob. Owner-only. Requires `chat_id`. |
 | `what_do_you_know` | List what the bot has stored in the caller's profile. Filtered by rendering visibility (both tiers in p2p, public only in groups). Each line carries an 8-char hash for use with `forget_memory`. (v0.11.0+) |
 | `forget_memory` | Remove a specific line from the caller's profile by hash. Caller-scoped and idempotent. Optional `promote_to_rule` promotes the removal into a durable `## Always private` rule in `privacy-rules.md`. (v0.11.0+) |
-| `reply_doc_comment` | Reply to a Feishu doc comment thread. Owner-only. Posts as the bot's app identity. (v1.1.0+) |
-| `create_doc_comment` | Create a new top-level comment on a Feishu doc. Owner-only. (v1.1.0+) |
+| `reply_doc_comment` | Reply to a Feishu doc comment thread. Owner-only. Posts as the bot's app identity. (v1.1.1+) |
+| `create_doc_comment` | Create a new top-level comment on a Feishu doc. Owner-only. (v1.1.1+) |
 
 ---
 

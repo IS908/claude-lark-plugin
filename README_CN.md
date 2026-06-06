@@ -80,7 +80,7 @@
 
 1. 前往[飞书开放平台](https://open.feishu.cn/)创建自建应用
 2. 启用「机器人」能力
-3. 添加以下权限：`im:message`、`im:message:send_as_bot`、`im:resource`；（v1.1.0+ 文档评论功能）`docs:document.comment:read`、`docs:document.comment:create`、`drive:drive.metadata:readonly`、`docx:document:readonly`
+3. 添加以下权限：`im:message`、`im:message:send_as_bot`、`im:resource`；（v1.1.1+ 文档评论功能）`docs:document.comment:read`、`docs:document.comment:create`、`drive:drive.metadata:readonly`、`docx:document:readonly`
 4. 获取 App ID 和 App Secret
 
 ### 第 2 步：安装插件
@@ -226,7 +226,7 @@ node -e "console.log(require('./package.json').version)"
 
 > **白名单语义**：两个列表都设置时，发送者在 `LARK_ALLOWED_USER_IDS` 里**或**聊天在 `LARK_ALLOWED_CHAT_IDS` 里即允许（OR 关系）。只设置一个列表时，只用那个列表过滤。
 >
-> 对于 `drive.notice.comment_add_v1`（文档评论）事件：当 `LARK_ALLOWED_USER_IDS` 已配置时，评论作者的 `open_id` 必须在列表中。当仅配置 `LARK_ALLOWED_CHAT_IDS`（未配置用户列表）时，文档评论事件直接放行——合成的 `doc:<file_token>` chat_id 无法和真实的群 ID 匹配，飞书侧的 ACL（机器人必须是文档协作者 + 被 @）是上游边界（v1.1.0+）。
+> 对于 `drive.notice.comment_add_v1`（文档评论）事件：当 `LARK_ALLOWED_USER_IDS` 已配置时，评论作者的 `open_id` 必须在列表中。当仅配置 `LARK_ALLOWED_CHAT_IDS`（未配置用户列表）时，文档评论事件直接放行——合成的 `doc:<file_token>` chat_id 无法和真实的群 ID 匹配，飞书侧的 ACL（机器人必须是文档协作者 + 被 @）是上游边界（v1.1.1+）。
 
 ### 可选 —— 消息
 
@@ -352,8 +352,8 @@ tmux kill-session -t lark
 | `delete_job` | `(id, chat_id, thread_id?)` | 删除 job。仅 owner 可操作 |
 | `what_do_you_know` | `(chat_id, thread_id?)` | 列出 bot 存储的当前调用者 profile 条目。按可见性过滤（私聊展示 public+private，群里只展示 public）。每行附带 8 位 hash，供 `forget_memory` 使用（v0.11.0+）|
 | `forget_memory` | `(chat_id, thread_id?, hash, tier?, promote_to_rule?)` | 按 hash 删除 profile 里的某行。调用者本人才能操作。可选 `promote_to_rule=true` 把本次删除沉淀为 `privacy-rules.md` 的永久规则（v0.11.0+）|
-| `reply_doc_comment` | `(chat_id, doc_token, comment_id, content, file_type, thread_id?)` | 回复飞书文档评论。仅 owner 可调用。机器人以应用身份发送（v1.1.0+）|
-| `create_doc_comment` | `(chat_id, doc_token, content, file_type, thread_id?)` | 在飞书文档下创建新的顶级评论。仅 owner 可调用（v1.1.0+）|
+| `reply_doc_comment` | `(chat_id, doc_token, comment_id, content, file_type, thread_id?)` | 回复飞书文档评论。仅 owner 可调用。机器人以应用身份发送（v1.1.1+）|
+| `create_doc_comment` | `(chat_id, doc_token, content, file_type, thread_id?)` | 在飞书文档下创建新的顶级评论。仅 owner 可调用（v1.1.1+）|
 
 ---
 
