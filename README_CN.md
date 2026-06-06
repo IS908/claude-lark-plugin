@@ -262,6 +262,7 @@ node -e "console.log(require('./package.json').version)"
 |------|--------|------|
 | `LARK_OWNER_OPEN_ID` | （空） | 运营者 open_id。用于终端技能（如 `/lark:jobs`）通过 `__terminal__` 哨兵 chat_id 解析调用者。未设置时，终端侧的敏感操作将被拒绝 |
 | `LARK_IDENTITY_SESSION_TTL_MS` | `max(2h, LARK_INACTIVITY_HOURS × 2h)` | 服务端 `(chat_id, thread_id?) → open_id` 会话条目的 TTL。必须超过自动蒸馏窗口，以保证 flush 触发的工具调用仍能解析到最后的真实用户 |
+| `LARK_IDENTITY_SESSION_MAX_SIZE` | `5000` | 调用者身份 LRU 缓存的最大条目数。文档评论事件（v1.1.0 起）按 comment_id 分桶，所以同时参与多个文档协作的 bot 累积的条目数会高于纯 IM 时代。取值范围 [1, 1_000_000]；超出容量时驱逐最旧条目。 |
 | `LARK_PRIVACY_RULES_FILE` | `~/.claude/channels/lark/privacy-rules.md` | L2 用户规则文件路径。蒸馏器会把文件内容注入分类 prompt（v0.10.0+）|
 | `LARK_AUDIT_LOG` | `~/.claude/channels/lark/audit.log` | 审计日志路径。每次敏感工具调用都会追加一行（尽力而为，写入失败不影响工具行为）（v0.11.0+）|
 

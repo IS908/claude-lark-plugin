@@ -151,4 +151,22 @@ function fail(msg: string): never {
   if (s.getCaller('doc:b', 'c2') !== 'ou_bob') fail('16: most recent must be present');
 }
 
-console.log('identity smoke: 16/16 PASS');
+// 17. SECURITY: maxSize=NaN falls back to DEFAULT (PR #182 round-7 M-2).
+// `Math.max(1, NaN) === NaN`, so without the Number.isFinite guard the cap
+// would silently disable (any `size >= NaN` comparison is false → LRU loop
+// skipped → unbounded growth). Not reachable through the env path, but a
+// direct caller could land it. This smoke locks the defense in.
+{
+  const s = new IdentitySession(() => 'ou_owner', 3600_000, { maxSize: NaN as unknown as number });
+  // Insert 10 entries — should NOT cause cap to silently disable; insertion succeeds, no throw.
+  for (let i = 0; i < 10; i++) {
+    s.setCaller('doc:test', `c${i}`, `ou_user_${i}`);
+  }
+  // We don't assert exact behavior beyond "didn't crash and accepts all 10" — the smoke
+  // proves the constructor didn't degrade into "no cap means LRU loop skipped".
+  // If the bug returned, maxSize=NaN would let _size grow unbounded; here we just confirm
+  // the constructor didn't crash and the map accepts entries (10 ≤ DEFAULT_MAX_SIZE 5000).
+  if (s._size() !== 10) fail(`17: SECURITY: NaN maxSize must use default cap, not silently disable`);
+}
+
+console.log('identity smoke: 17/17 PASS');

@@ -102,7 +102,16 @@ export class IdentitySession {
     // then immediately insert 1 entry — effective cap "1 slot, not 0".
     // Treating 0 as 1 makes the cap's behavior at the corner explicit
     // rather than silently degraded.
-    this.maxSize = Math.max(1, opts.maxSize ?? DEFAULT_MAX_SIZE);
+    //
+    // PR #182 round-7 M-2: defense-in-depth against NaN. `Math.max(1, NaN)
+    // === NaN`, so a direct caller passing `maxSize: NaN` would silently
+    // disable the cap (`this.map.size >= NaN` is always false). Not
+    // reachable through the env path (`optionalPositiveNumber` rejects
+    // non-finite), but a test fixture or future smoke could land it.
+    // `Number.isFinite` rejects NaN, Infinity, and non-numbers; falls back
+    // to DEFAULT_MAX_SIZE before the Math.max clamp.
+    const requested = Number.isFinite(opts.maxSize) ? (opts.maxSize as number) : DEFAULT_MAX_SIZE;
+    this.maxSize = Math.max(1, requested);
   }
 
   private key(chatId: string, threadId?: string): string {
