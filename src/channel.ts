@@ -18,6 +18,15 @@ import { writeSdkResource } from './sdk-resource.js';
 const DEBUG_LOG = path.join(os.homedir(), '.claude', 'channels', 'lark', 'debug.log');
 
 /**
+ * Per-field cap (UTF-8 bytes) for doc-comment body / parentBody before envelope
+ * assembly. A comment can have many elements at up to 1000 chars each per
+ * Feishu spec; without a cap a single hostile comment could shove ~100KB into
+ * the prompt and inflate Claude's input tokens. 8KB mirrors the conservatism
+ * of memory enrichment slabs (PR #182 round 4 M3).
+ */
+const DOC_COMMENT_BODY_CAP_BYTES = 8 * 1024;
+
+/**
  * Ack-reaction TTL (#85): an ack older than this is considered orphaned
  * and gets force-revoked by `pruneStaleAcks`. 5 minutes is long enough
  * to span a slow reply (the longest Claude turn we'd expect under
@@ -427,6 +436,12 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
     fetchError = e?.message || String(e);
   }
 
+  // Cap body / parentBody to bound prompt size before envelope assembly
+  // (PR #182 round 4 M3). Uses Buffer to count UTF-8 bytes properly so a
+  // 4-byte CJK char isn't double-counted as a JS string length-2 surrogate.
+  body = capUtf8(body, DOC_COMMENT_BODY_CAP_BYTES);
+  parentBody = capUtf8(parentBody, DOC_COMMENT_BODY_CAP_BYTES);
+
   let docTitle: string | undefined;
   try {
     const metaResp = await deps.client.drive.meta.batchQuery({
@@ -466,6 +481,23 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
     deps.identitySession.setCaller(`${DOC_CHAT_ID_PREFIX}${fileToken}`, commentId, fromOpenId);
     await deps.messageHandler(synthetic);
   });
+}
+
+/**
+ * Truncate `s` so its UTF-8 byte length is ≤ `max`, appending an ellipsis
+ * marker. Returns the input unchanged when undefined/short enough. Used to
+ * bound doc-comment body sizes before envelope assembly (PR #182 round 4 M3).
+ *
+ * Buffer.subarray on a UTF-8 buffer can split a multi-byte codepoint at the
+ * boundary; calling .toString('utf8') on a partial codepoint emits U+FFFD
+ * (replacement character) which is fine — the truncation marker makes the
+ * shape obvious to a downstream reader.
+ */
+function capUtf8(s: string | undefined, max: number): string | undefined {
+  if (s === undefined) return undefined;
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= max) return s;
+  return buf.subarray(0, max).toString('utf8') + ' …[truncated]';
 }
 
 function extractText(content: any): string | undefined {

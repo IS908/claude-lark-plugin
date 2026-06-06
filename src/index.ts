@@ -19,14 +19,29 @@ import { mcpServerInstructions } from './prompts.js';
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
 
 function extractDocCommentMeta(envelope: string): Record<string, string> {
-  // Parse the <doc_comment ...> opening tag to extract structured fields.
+  // Allow-list of attributes we extract from <doc_comment ...> into notification meta.
+  // Explicit allow-list (not the regex's full output) prevents a future envelope
+  // attribute addition from silently overriding system-set meta fields like
+  // chat_id or message_id (defense-in-depth — PR #182 round 4 M2).
+  const ALLOWED_ATTRS = new Set([
+    'doc_token',
+    'comment_id',
+    'reply_id',
+    'kind',
+    'operator',
+    'doc_title',
+    'file_type',
+    'is_mentioned',
+  ]);
   const m = envelope.match(/<doc_comment\s+([^>]+)>/);
   if (!m) return {};
   const out: Record<string, string> = {};
   const attrRe = /(\w+)="([^"]*)"/g;
   let attr: RegExpExecArray | null;
   while ((attr = attrRe.exec(m[1])) !== null) {
-    out[attr[1]] = attr[2];
+    if (ALLOWED_ATTRS.has(attr[1])) {
+      out[attr[1]] = attr[2];
+    }
   }
   return out;
 }

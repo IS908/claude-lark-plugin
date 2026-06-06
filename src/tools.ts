@@ -508,7 +508,9 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
       }),
     },
     async ({ chat_id, thread_id, doc_token, comment_id, content, file_type }) => {
-      const auditArgs = { doc_token, comment_id, content, file_type };
+      // chat_id + thread_id included for forensic completeness alongside other
+      // sensitive-tool audit lines (PR #182 round 4 M1).
+      const auditArgs = { chat_id, thread_id, doc_token, comment_id, content, file_type };
       const auth = resolveCaller('reply_doc_comment', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const owner = identitySession.getOwner();
@@ -622,7 +624,8 @@ export function registerDocCommentTools(deps: DocCommentToolsDeps): void {
       }),
     },
     async ({ chat_id, thread_id, doc_token, content, file_type }) => {
-      const auditArgs = { doc_token, content, file_type };
+      // chat_id + thread_id included for forensic completeness (PR #182 round 4 M1).
+      const auditArgs = { chat_id, thread_id, doc_token, content, file_type };
       const auth = resolveCaller('create_doc_comment', chat_id, thread_id, auditArgs);
       if ('error' in auth) return auth.error;
       const owner = identitySession.getOwner();
