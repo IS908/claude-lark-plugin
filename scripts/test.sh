@@ -187,4 +187,16 @@ echo "=== Profile distillation Stage 2 orchestrator unit checks ==="
 npx tsx scripts/profile-distill-stage2-smoke.ts
 
 echo ""
+echo "=== Feishu comment elements unit checks ==="
+npx tsx scripts/comment-elements-smoke.ts
+
+echo ""
+echo "=== Comment event (drive.notice.comment_add_v1) unit checks ==="
+npx tsx scripts/comment-event-smoke.ts
+
+echo ""
+echo "=== reply_doc_comment / create_doc_comment tool checks ==="
+npx tsx scripts/reply-doc-comment-smoke.ts
+
+echo ""
 echo "All tests passed."

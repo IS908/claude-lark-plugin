@@ -12,10 +12,19 @@ import { withFeishuRetry } from './feishu-retry.js';
 import { MemoryStore } from './memory/file.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
-import { TERMINAL_CHAT_ID } from './identity-session.js';
+import { TERMINAL_CHAT_ID, DOC_CHAT_ID_PREFIX } from './identity-session.js';
 import { writeSdkResource } from './sdk-resource.js';
 
 const DEBUG_LOG = path.join(os.homedir(), '.claude', 'channels', 'lark', 'debug.log');
+
+/**
+ * Per-field cap (UTF-8 bytes) for doc-comment body / parentBody before envelope
+ * assembly. A comment can have many elements at up to 1000 chars each per
+ * Feishu spec; without a cap a single hostile comment could shove ~100KB into
+ * the prompt and inflate Claude's input tokens. 8KB mirrors the conservatism
+ * of memory enrichment slabs (PR #182 round 4 M3).
+ */
+const DOC_COMMENT_BODY_CAP_BYTES = 8 * 1024;
 
 /**
  * Ack-reaction TTL (#85): an ack older than this is considered orphaned
@@ -132,6 +141,26 @@ export function passesWhitelist(senderId: string, chatId: string): boolean {
   const userOk = userConfigured && appConfig.allowedUserIds.includes(senderId);
   const chatOk = chatConfigured && appConfig.allowedChatIds.includes(chatId);
   return userOk || chatOk;
+}
+
+/**
+ * Whitelist gate specifically for doc-comment events. Because doc-comment events
+ * have a synthetic chat_id (`doc:<file_token>`) that won't match real
+ * `LARK_ALLOWED_CHAT_IDS` entries, the standard `passesWhitelist` would silently
+ * drop every event when only the chat list is configured — a valid,
+ * README-documented operator setup (PR #182 round 5 I-1).
+ *
+ * Semantics (asymmetric vs IM):
+ *   - `LARK_ALLOWED_USER_IDS` set → must match user list.
+ *   - `LARK_ALLOWED_USER_IDS` unset → allow (Feishu-side ACL is the meaningful
+ *     upstream boundary: the bot must be a doc collaborator AND `is_mentioned`
+ *     must be true for the event to fire at all). The chat list does not gate
+ *     doc-comment events — there is no real chat_id to gate against.
+ */
+export function passesDocCommentWhitelist(senderId: string): boolean {
+  const allowedUsers = appConfig.allowedUserIds;
+  if (allowedUsers.length === 0) return true; // user list unset → open
+  return allowedUsers.includes(senderId);
 }
 
 export interface LarkMessage {
@@ -324,6 +353,243 @@ export function computeBotMentioned(
   return parsedMentions.some((m) => m.id === botOpenId);
 }
 
+/**
+ * Injected dependencies for {@link handleCommentEvent} — the pure
+ * dispatcher for `drive.notice.comment_add_v1` events (#181).
+ *
+ * Extracted as a standalone function (rather than a `LarkChannel` method)
+ * so the smoke test can exercise dedup / filter / pre-fetch logic without
+ * constructing a real Feishu SDK client. The `client` field declares only
+ * the minimal API surface used (file_comment.get, drive.meta.batchQuery),
+ * so mocks stay small.
+ *
+ * Subsequent tasks (#181 plan tasks 6–10) layer filters, pre-fetch, and
+ * the channel-envelope build on top of this skeleton.
+ */
+export interface CommentEventDeps {
+  botOpenId: string;
+  seenEventIds: TTLCache<string, true>;
+  identitySession: IdentitySession;
+  queue: MessageQueue;
+  messageHandler: MessageHandler;
+  resolveUserName: (openId: string) => Promise<string>;
+  client: {
+    drive: {
+      fileComment: { get: (req: any) => Promise<any> };
+      meta: { batchQuery: (req: any) => Promise<any> };
+    };
+  };
+}
+
+/**
+ * Skeleton dispatcher for `drive.notice.comment_add_v1` (#181).
+ *
+ * This task (#181 plan task 5) only implements event_id dedup. The 3
+ * filter clauses, comment/reply pre-fetch, channel envelope build, and
+ * queue.enqueue all land in tasks 6–9.
+ */
+export async function handleCommentEvent(data: any, deps: CommentEventDeps): Promise<void> {
+  const eventId: string | undefined = data?.header?.event_id;
+  if (eventId && deps.seenEventIds.has(eventId)) {
+    return;  // dedup — same event_id already processed
+  }
+  if (eventId) deps.seenEventIds.set(eventId, true);
+
+  const meta = data?.event?.notice_meta;
+  if (!meta) return;
+
+  // @bot only — drop generic notifications where bot is just a subscriber.
+  if (meta.is_mentioned !== true) return;
+
+  // Defensive: should always be bot (event routed by Feishu), but check.
+  if (meta.to_user_id?.open_id !== deps.botOpenId) return;
+
+  // Loop prevention: don't process the bot's own comments.
+  if (meta.from_user_id?.open_id === deps.botOpenId) return;
+
+  const fileToken: string = meta.file_token;
+  const commentId: string = meta.comment_id;
+  const replyId: string | undefined = meta.reply_id;
+  const fileType: string = meta.file_type;
+  const fromOpenId: string = meta.from_user_id.open_id;
+
+  // Whitelist gate — applies to ALL inbound channels (IM, reactions, doc comments).
+  // Operators relying on LARK_ALLOWED_USER_IDS expect tenant-wide enforcement;
+  // skipping this here would let any tenant user prompt-inject Claude through
+  // any doc the bot has been @-mentioned in (which auto-adds bot as collaborator).
+  //
+  // Doc-comment events have a synthetic chat_id (`doc:<file_token>`) that can
+  // never match real LARK_ALLOWED_CHAT_IDS, so passesWhitelist's OR semantics
+  // would silently drop EVERY event when only the chat list is configured —
+  // a valid, README-documented operator setup. passesDocCommentWhitelist
+  // gates on the user list only (Feishu-side ACL — collaborator + @-mention
+  // — is the meaningful upstream boundary). See PR #182 round 5 I-1.
+  if (!passesDocCommentWhitelist(fromOpenId)) {
+    debugLog(
+      `[channel] Doc comment from ${fromOpenId} on doc ${fileToken} rejected by whitelist`,
+    );
+    return;
+  }
+
+  // Pre-fetch comment body. We swallow errors but flag them in the envelope
+  // so Claude can decide whether to defer or surface to the user.
+  let parentBody: string | undefined;
+  let body: string | undefined;
+  let quote: string | undefined;
+  let fetchError: string | undefined;
+  try {
+    const resp = await deps.client.drive.fileComment.get({
+      path: { file_token: fileToken, comment_id: commentId },
+      params: { file_type: fileType },
+    });
+    const c = resp?.data ?? {};
+    quote = typeof c.quote === 'string' && c.quote.length > 0 ? c.quote : undefined;
+    const replies: any[] = c.reply_list?.replies
+      ?? c.reply_list?.items
+      ?? (Array.isArray(c.reply_list) ? c.reply_list : []);
+    if (replyId) {
+      // add_reply: parent = reply_list[0] (the comment itself), body = the reply_id one
+      // Task 8 fleshes out the missing-reply_id case; for now, leave body undefined when not found.
+      parentBody = extractText(replies[0]?.content);
+      const target = replies.find((r: any) => r.reply_id === replyId);
+      body = target ? extractText(target.content) : undefined;
+    } else {
+      // add_comment: body = the comment itself
+      body = extractText(replies[0]?.content);
+    }
+  } catch (e: any) {
+    fetchError = e?.message || String(e);
+  }
+
+  // Cap body / parentBody to bound prompt size before envelope assembly
+  // (PR #182 round 4 M3). Uses Buffer to count UTF-8 bytes properly so a
+  // 4-byte CJK char isn't double-counted as a JS string length-2 surrogate.
+  body = capUtf8(body, DOC_COMMENT_BODY_CAP_BYTES);
+  parentBody = capUtf8(parentBody, DOC_COMMENT_BODY_CAP_BYTES);
+
+  let docTitle: string | undefined;
+  try {
+    const metaResp = await deps.client.drive.meta.batchQuery({
+      data: { request_docs: [{ doc_token: fileToken, doc_type: fileType }] },
+    });
+    docTitle = metaResp?.data?.metas?.[0]?.title;
+  } catch {
+    docTitle = undefined;
+  }
+
+  const senderName = await deps.resolveUserName(fromOpenId);
+  const envelope = buildDocCommentEnvelope({
+    fileToken, commentId, replyId, fileType,
+    operator: senderName, isMentioned: true,
+    docTitle, quote, parentBody, body, fetchError,
+  });
+
+  const synthetic: LarkMessage = {
+    messageId: replyId ?? commentId,
+    chatId: `${DOC_CHAT_ID_PREFIX}${fileToken}`,
+    // PR #182 round 4 (I1): bind the session per-comment, not per-doc. setCaller
+    // used to write at chat-level (`(doc:<token>, undefined)`), so two concurrent
+    // events on the same doc overwrote each other — attacker @-mentioning bot
+    // in the same doc as owner's in-flight turn would flip identity. Per-comment
+    // keying via threadId also lets independent comments on the same doc
+    // process in parallel through the per-thread queue (good UX, no perf concern).
+    threadId: commentId,
+    chatType: 'doc_comment',
+    senderId: fromOpenId,
+    senderName,
+    text: envelope,
+    messageType: 'doc_comment',
+    rawContent: JSON.stringify(data),
+  };
+
+  deps.queue.enqueue(`${DOC_CHAT_ID_PREFIX}${fileToken}`, commentId, async () => {
+    deps.identitySession.setCaller(`${DOC_CHAT_ID_PREFIX}${fileToken}`, commentId, fromOpenId);
+    await deps.messageHandler(synthetic);
+  });
+}
+
+/**
+ * Truncate `s` so its UTF-8 byte length is ≤ `max`, appending an ellipsis
+ * marker. Returns the input unchanged when undefined/short enough. Used to
+ * bound doc-comment body sizes before envelope assembly (PR #182 round 4 M3).
+ *
+ * PR #182 round 5 N-2: snap the cut back to the last valid UTF-8 codepoint
+ * boundary so the toString('utf8') call doesn't emit a U+FFFD replacement
+ * char at the truncation seam. UTF-8 continuation bytes have the high two
+ * bits set to `10` (`b & 0xC0 === 0x80`); walk backwards through any
+ * continuation bytes until we land on a leading byte (or position 0).
+ */
+function capUtf8(s: string | undefined, max: number): string | undefined {
+  if (s === undefined) return undefined;
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= max) return s;
+  let cut = max;
+  while (cut > 0 && (buf[cut] & 0xC0) === 0x80) cut--;
+  return buf.subarray(0, cut).toString('utf8') + ' …[truncated]';
+}
+
+function extractText(content: any): string | undefined {
+  if (!content) return undefined;
+  // Feishu comment content is either { text: "..." } or { elements: [...] }
+  if (typeof content.text === 'string') return content.text;
+  if (Array.isArray(content.elements)) {
+    return content.elements
+      .map((el: any) => el?.text_run?.text ?? el?.docs_link?.url ?? '')
+      .join('');
+  }
+  return undefined;
+}
+
+function escapeAttr(s: string | undefined): string {
+  if (!s) return '';
+  // & MUST be escaped first; otherwise the &-prefix from later substitutions
+  // (&quot;, &lt;, &gt;) gets double-escaped to &amp;quot;, etc.
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeBody(s: string | undefined): string {
+  if (!s) return '';
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+interface DocCommentEnvelopeArgs {
+  fileToken: string; commentId: string; replyId?: string; fileType: string;
+  operator: string; isMentioned: boolean;
+  docTitle?: string; quote?: string; parentBody?: string; body?: string; fetchError?: string;
+}
+
+function buildDocCommentEnvelope(a: DocCommentEnvelopeArgs): string {
+  const kind = a.replyId ? 'reply' : 'comment';
+  const attrs = [
+    `doc_token="${escapeAttr(a.fileToken)}"`,
+    `comment_id="${escapeAttr(a.commentId)}"`,
+    a.replyId ? `reply_id="${escapeAttr(a.replyId)}"` : '',
+    `kind="${kind}"`,
+    `operator="${escapeAttr(a.operator)}"`,
+    a.docTitle ? `doc_title="${escapeAttr(a.docTitle)}"` : '',
+    `file_type="${escapeAttr(a.fileType)}"`,
+    `is_mentioned="${a.isMentioned}"`,
+  ].filter(Boolean).join(' ');
+
+  const inner: string[] = [];
+  if (a.fetchError) inner.push(`  <fetch_error>${escapeBody(a.fetchError)}</fetch_error>`);
+  if (a.quote) inner.push(`  <selected_text>${escapeBody(a.quote)}</selected_text>`);
+  if (a.parentBody) inner.push(`  <parent>${escapeBody(a.parentBody)}</parent>`);
+  if (a.body !== undefined) {
+    inner.push(`  <body>${escapeBody(a.body)}</body>`);
+  } else {
+    inner.push(`  <body unknown="true"></body>`);
+  }
+  return `<doc_comment ${attrs}>\n${inner.join('\n')}\n</doc_comment>`;
+}
+
 export class LarkChannel {
   private client: Lark.Client;
   // #109 fix: bounded TTL + LRU caches replace unbounded Maps. Pre-fix
@@ -440,6 +706,14 @@ export class LarkChannel {
   private loggedStaleAcks = new Set<string>();
   private botMessageTracker = new BotMessageTracker(appConfig.botMessageTrackerSize);
   private latestMessageTracker = new LatestMessageTracker();
+  /**
+   * #181: dedup state for `drive.notice.comment_add_v1` events. Feishu may
+   * deliver the same event_id more than once (retries, edge cases); the
+   * cache short-circuits duplicates in `handleCommentEvent`. 500 entries
+   * × 60 min TTL matches the order-of-magnitude of `recentInboundIds` and
+   * is well above any realistic comment-event rate.
+   */
+  private commentEventIdSeen = new TTLCache<string, true>({ maxSize: 500, ttlMs: 60 * 60_000 });
 
   constructor() {
     this.client = new Lark.Client({
@@ -645,6 +919,23 @@ export class LarkChannel {
           await this.handleReactionEvent(data);
         } catch (err) {
           console.error('[channel] Error handling reaction event:', err);
+        }
+      },
+    }).register({
+      'drive.notice.comment_add_v1': async (data: any) => {
+        debugLog(`[channel] Event received: drive.notice.comment_add_v1`);
+        try {
+          await handleCommentEvent(data, {
+            botOpenId: this.botOpenId,
+            seenEventIds: this.commentEventIdSeen,
+            identitySession: this.identitySession!,
+            queue: this.queue,
+            messageHandler: this.messageHandler!,
+            resolveUserName: this.resolveUserName.bind(this),
+            client: this.client,
+          });
+        } catch (err) {
+          console.error('[channel] Error handling doc comment event:', err);
         }
       },
     });

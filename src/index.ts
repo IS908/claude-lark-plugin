@@ -18,6 +18,34 @@ import { mcpServerInstructions } from './prompts.js';
 
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
 
+function extractDocCommentMeta(envelope: string): Record<string, string> {
+  // Allow-list of attributes we extract from <doc_comment ...> into notification meta.
+  // Explicit allow-list (not the regex's full output) prevents a future envelope
+  // attribute addition from silently overriding system-set meta fields like
+  // chat_id or message_id (defense-in-depth — PR #182 round 4 M2).
+  const ALLOWED_ATTRS = new Set([
+    'doc_token',
+    'comment_id',
+    'reply_id',
+    'kind',
+    'operator',
+    'doc_title',
+    'file_type',
+    'is_mentioned',
+  ]);
+  const m = envelope.match(/<doc_comment\s+([^>]+)>/);
+  if (!m) return {};
+  const out: Record<string, string> = {};
+  const attrRe = /(\w+)="([^"]*)"/g;
+  let attr: RegExpExecArray | null;
+  while ((attr = attrRe.exec(m[1])) !== null) {
+    if (ALLOWED_ATTRS.has(attr[1])) {
+      out[attr[1]] = attr[2];
+    }
+  }
+  return out;
+}
+
 async function acquireLock(): Promise<void> {
   const myToken = buildLockToken(process.pid);
   try {
@@ -201,6 +229,7 @@ async function main() {
   const identitySession = new IdentitySession(
     () => appConfig.ownerOpenId,
     appConfig.identitySessionTtlMs,
+    { maxSize: appConfig.identitySessionMaxSize },
   );
   if (appConfig.ownerOpenId) {
     console.error(`[identity] owner fallback: ${appConfig.ownerOpenId}`);
@@ -210,7 +239,7 @@ async function main() {
 
   // 2. Create MCP server
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.0.59' },
+    { name: 'claude-lark-plugin', version: '1.1.0' },
     {
       capabilities: {
         logging: {},
@@ -403,6 +432,9 @@ async function main() {
               : message.attachments && message.attachments.length > 1
                 ? { attachments: JSON.stringify(message.attachments) }
                 : {}),
+            ...(message.chatType === 'doc_comment'
+              ? extractDocCommentMeta(message.text)
+              : {}),
           },
         },
       });

@@ -54,25 +54,94 @@ export const TERMINAL_CHAT_ID = '__terminal__';
  */
 export const SYSTEM_FLUSH_CALLER = '__system_flush__';
 
+/**
+ * Synthetic chat_id prefix used to route doc-comment events through the
+ * IdentitySession. The format is `doc:<file_token>`.
+ *
+ * IMPORTANT: this is a naming convention only — there is NO short-circuit
+ * in `getCaller` that maps `doc:` prefix to a specific identity. The caller
+ * is bound at event-time by `setCaller("doc:<file_token>", comment_id,
+ * from_user_id.open_id)` in `handleCommentEvent` — keyed per-comment to
+ * avoid cross-event session races on the same doc (PR #182 round 4 I1,
+ * commit `b87657c`). Resolved through the normal session-map lookup.
+ * Tools that require owner identity (e.g. `reply_doc_comment`) check the
+ * resolved caller against `getOwner()` explicitly.
+ *
+ * An earlier version of this PR had a `chatId.startsWith(DOC_CHAT_ID_PREFIX)
+ * → ownerFallback()` shortcut. That shortcut bypassed the server-derived
+ * identity model and was removed — see PR #182 review.
+ */
+export const DOC_CHAT_ID_PREFIX = 'doc:';
+
 interface SessionEntry {
   userId: string;
   updatedAt: number;
 }
 
+/**
+ * Soft cap on the number of live session entries. With per-comment keying
+ * (PR #182 round 4 I1) the map grows 1 entry per comment, not 1 per doc —
+ * a hostile commenter on a bot-collaborated doc could otherwise grow the
+ * map unbounded until the TTL window (default 2h) catches up. 5000 entries
+ * × ~80 bytes ≈ 400KB worst case; large enough to never bite a realistic
+ * deployment, small enough that pathological growth gets evicted.
+ */
+const DEFAULT_MAX_SIZE = 5000;
+
 export class IdentitySession {
   private map = new Map<string, SessionEntry>();
+  private readonly maxSize: number;
 
   constructor(
     private readonly ownerFallback: () => string | null,
     private readonly maxAgeMs: number = 3600_000,
-  ) {}
+    opts: { maxSize?: number } = {},
+  ) {
+    // PR #182 round-6 M-3: clamp to a floor of 1. With maxSize=0 the LRU
+    // loop on an empty map would skip eviction (no oldest key to delete),
+    // then immediately insert 1 entry — effective cap "1 slot, not 0".
+    // Treating 0 as 1 makes the cap's behavior at the corner explicit
+    // rather than silently degraded.
+    //
+    // PR #182 round-7 M-2: defense-in-depth against NaN. `Math.max(1, NaN)
+    // === NaN`, so a direct caller passing `maxSize: NaN` would silently
+    // disable the cap (`this.map.size >= NaN` is always false). Not
+    // reachable through the env path (`optionalPositiveNumber` rejects
+    // non-finite), but a test fixture or future smoke could land it.
+    // `Number.isFinite` rejects NaN, Infinity, and non-numbers; falls back
+    // to DEFAULT_MAX_SIZE before the Math.max clamp.
+    const requested = Number.isFinite(opts.maxSize) ? (opts.maxSize as number) : DEFAULT_MAX_SIZE;
+    this.maxSize = Math.max(1, requested);
+  }
 
   private key(chatId: string, threadId?: string): string {
     return threadId ? `${chatId}#${threadId}` : chatId;
   }
 
   setCaller(chatId: string, threadId: string | undefined, userId: string): void {
-    this.map.set(this.key(chatId, threadId), { userId, updatedAt: Date.now() });
+    // Invariant: doc: chat_ids are ONLY ever keyed per-comment to avoid
+    // cross-event session races (commit b87657c, PR #182 round-4 I1). A
+    // chat-level entry for a doc: chat_id would silently match any
+    // subsequent thread-keyed lookup via getCaller's fallback path,
+    // breaking the per-comment isolation. Throw rather than allow the
+    // ambiguous binding to corrupt session state.
+    if (chatId.startsWith(DOC_CHAT_ID_PREFIX) && threadId === undefined) {
+      throw new Error(
+        `IdentitySession.setCaller: doc: chat_id "${chatId}" requires a non-undefined thread_id (use comment_id). Chat-level binding would silently shadow per-comment entries via getCaller's fallback path.`,
+      );
+    }
+    const k = this.key(chatId, threadId);
+    // LRU-style cap (Map iterates in insertion order). When at capacity
+    // and inserting a NEW key, evict the oldest entry first. When
+    // overwriting an existing key, we delete+re-insert below to refresh
+    // its LRU position.
+    if (this.map.size >= this.maxSize && !this.map.has(k)) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) this.map.delete(oldest);
+    }
+    // Refresh insertion order on overwrite.
+    this.map.delete(k);
+    this.map.set(k, { userId, updatedAt: Date.now() });
   }
 
   /**
@@ -120,5 +189,10 @@ export class IdentitySession {
   /** Test-only helper. */
   _size(): number {
     return this.map.size;
+  }
+
+  /** Test-only helper — exposes the post-clamp/post-fallback cap. */
+  _maxSize(): number {
+    return this.maxSize;
   }
 }
