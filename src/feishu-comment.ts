@@ -17,11 +17,30 @@ export type CommentElement =
 
 export const MAX_TEXT_RUN_LEN = 1000;
 
+// Only http(s) URLs. Stops at whitespace/quotes/punctuation that aren't valid in URLs.
+const URL_RE = /https?:\/\/[^\s"'<>]+/g;
+
 export function buildCommentElements(markdown: string): CommentElement[] {
-  // Feishu requires non-empty elements array; emit a 0-length placeholder.
   if (markdown === '') {
     return [{ type: 'text_run', text_run: { text: '' } }];
   }
-  // Baseline: single text_run. URL parsing comes in Task 2.
-  return [{ type: 'text_run', text_run: { text: markdown } }];
+  const out: CommentElement[] = [];
+  let cursor = 0;
+  URL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = URL_RE.exec(markdown)) !== null) {
+    if (m.index > cursor) {
+      out.push({ type: 'text_run', text_run: { text: markdown.slice(cursor, m.index) } });
+    }
+    out.push({ type: 'docs_link', docs_link: { url: m[0] } });
+    cursor = m.index + m[0].length;
+  }
+  if (cursor < markdown.length) {
+    out.push({ type: 'text_run', text_run: { text: markdown.slice(cursor) } });
+  }
+  if (out.length === 0) {
+    // Shouldn't happen since markdown !== '' above, but defensive.
+    out.push({ type: 'text_run', text_run: { text: markdown } });
+  }
+  return out;
 }
