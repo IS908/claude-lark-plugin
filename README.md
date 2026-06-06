@@ -245,7 +245,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 
 > **Whitelist semantics:** when both lists are set, a message is accepted if **either** the sender is in `LARK_ALLOWED_USER_IDS` **or** the chat is in `LARK_ALLOWED_CHAT_IDS` (OR). Setting only one list gates on that list alone.
 >
-> Whitelist also gates `drive.notice.comment_add_v1` events: a doc-comment author whose `open_id` is not in `LARK_ALLOWED_USER_IDS` will be dropped before Claude processes it (v1.1.0+).
+> For `drive.notice.comment_add_v1` (doc-comment) events: when `LARK_ALLOWED_USER_IDS` is configured, the comment author's `open_id` must match. When only `LARK_ALLOWED_CHAT_IDS` is configured (no user list), doc-comment events pass through — the chat list cannot meaningfully match the synthetic `doc:<file_token>` chat_id, and Feishu-side ACL (bot must be a doc collaborator + @-mentioned) is the upstream boundary (v1.1.0+).
 
 ### Optional -- Messaging
 

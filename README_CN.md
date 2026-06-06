@@ -226,7 +226,7 @@ node -e "console.log(require('./package.json').version)"
 
 > **白名单语义**：两个列表都设置时，发送者在 `LARK_ALLOWED_USER_IDS` 里**或**聊天在 `LARK_ALLOWED_CHAT_IDS` 里即允许（OR 关系）。只设置一个列表时，只用那个列表过滤。
 >
-> 白名单同时控制 `drive.notice.comment_add_v1` 事件：评论作者 `open_id` 不在 `LARK_ALLOWED_USER_IDS` 内时，事件在到达 Claude 前被丢弃（v1.1.0+）。
+> 对于 `drive.notice.comment_add_v1`（文档评论）事件：当 `LARK_ALLOWED_USER_IDS` 已配置时，评论作者的 `open_id` 必须在列表中。当仅配置 `LARK_ALLOWED_CHAT_IDS`（未配置用户列表）时，文档评论事件直接放行——合成的 `doc:<file_token>` chat_id 无法和真实的群 ID 匹配，飞书侧的 ACL（机器人必须是文档协作者 + 被 @）是上游边界（v1.1.0+）。
 
 ### 可选 —— 消息
 

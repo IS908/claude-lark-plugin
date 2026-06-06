@@ -323,6 +323,43 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (deps.commentGetCalls.length !== 0) fail(`15: SECURITY: pre-fetch must not run for whitelisted-out user`);
 }
 
+// 17. I-1: chat-list-only config must NOT block doc-comment events. Pre-fix
+// passesWhitelist required matching LARK_ALLOWED_CHAT_IDS, but the synthetic
+// `doc:<token>` chat_id can never match, so every event was silently dropped.
+{
+  const savedUsers = [...appConfig.allowedUserIds];
+  const savedChats = [...appConfig.allowedChatIds];
+  appConfig.allowedUserIds.length = 0; // empty user list → gate falls open
+  appConfig.allowedChatIds.push('oc_unrelated_chat'); // chat list set but irrelevant for doc-comment
+
+  try {
+    const deps = makeDeps();
+    await handleCommentEvent(
+      makeEvent({ from_open_id: 'ou_random_user' }), // not in any list
+      deps,
+    );
+    if (deps.handlerCalls.length !== 1) {
+      fail(`17: I-1: chat-list-only must NOT block doc-comment (got ${deps.handlerCalls.length} handler calls)`);
+    }
+  } finally {
+    appConfig.allowedUserIds.length = 0;
+    appConfig.allowedUserIds.push(...savedUsers);
+    appConfig.allowedChatIds.length = 0;
+    appConfig.allowedChatIds.push(...savedChats);
+  }
+}
+
+// 18. I-1: when LARK_ALLOWED_USER_IDS is set, the user gate still applies
+// (duplicate of case 15's semantics, but here for explicit I-1 coverage).
+{
+  const deps = makeDeps();
+  await handleCommentEvent(
+    makeEvent({ from_open_id: 'ou_excluded_outsider' }), // not in user list
+    deps,
+  );
+  if (deps.handlerCalls.length !== 0) fail(`18: I-1: user list still gates when configured`);
+}
+
 // 16. SECURITY: concurrent events on the same doc don't overwrite each other's
 // session entries (PR #182 round 4 I1). Pre-fix, both events shared the
 // (doc:<token>, undefined) session slot and the second event clobbered the first.
@@ -345,4 +382,4 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (bobCaller !== 'ou_bob') fail(`16: bob's session lost (got ${bobCaller})`);
 }
 
-console.error(`PASS: 18 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race)`);
+console.error(`PASS: 20 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race + chat-list-only doc-comment + user-list gate)`);

@@ -143,6 +143,26 @@ export function passesWhitelist(senderId: string, chatId: string): boolean {
   return userOk || chatOk;
 }
 
+/**
+ * Whitelist gate specifically for doc-comment events. Because doc-comment events
+ * have a synthetic chat_id (`doc:<file_token>`) that won't match real
+ * `LARK_ALLOWED_CHAT_IDS` entries, the standard `passesWhitelist` would silently
+ * drop every event when only the chat list is configured — a valid,
+ * README-documented operator setup (PR #182 round 5 I-1).
+ *
+ * Semantics (asymmetric vs IM):
+ *   - `LARK_ALLOWED_USER_IDS` set → must match user list.
+ *   - `LARK_ALLOWED_USER_IDS` unset → allow (Feishu-side ACL is the meaningful
+ *     upstream boundary: the bot must be a doc collaborator AND `is_mentioned`
+ *     must be true for the event to fire at all). The chat list does not gate
+ *     doc-comment events — there is no real chat_id to gate against.
+ */
+export function passesDocCommentWhitelist(senderId: string): boolean {
+  const allowedUsers = appConfig.allowedUserIds;
+  if (allowedUsers.length === 0) return true; // user list unset → open
+  return allowedUsers.includes(senderId);
+}
+
 export interface LarkMessage {
   messageId: string;
   chatId: string;
@@ -397,9 +417,14 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
   // Operators relying on LARK_ALLOWED_USER_IDS expect tenant-wide enforcement;
   // skipping this here would let any tenant user prompt-inject Claude through
   // any doc the bot has been @-mentioned in (which auto-adds bot as collaborator).
-  // Synthetic chat_id can't match LARK_ALLOWED_CHAT_IDS by design; operator
-  // semantic for doc-comment is "users I trust", and that's the meaningful gate.
-  if (!passesWhitelist(fromOpenId, `${DOC_CHAT_ID_PREFIX}${fileToken}`)) {
+  //
+  // Doc-comment events have a synthetic chat_id (`doc:<file_token>`) that can
+  // never match real LARK_ALLOWED_CHAT_IDS, so passesWhitelist's OR semantics
+  // would silently drop EVERY event when only the chat list is configured —
+  // a valid, README-documented operator setup. passesDocCommentWhitelist
+  // gates on the user list only (Feishu-side ACL — collaborator + @-mention
+  // — is the meaningful upstream boundary). See PR #182 round 5 I-1.
+  if (!passesDocCommentWhitelist(fromOpenId)) {
     debugLog(
       `[channel] Doc comment from ${fromOpenId} on doc ${fileToken} rejected by whitelist`,
     );
