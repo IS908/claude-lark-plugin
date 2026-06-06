@@ -92,4 +92,26 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (deps.handlerCalls.length !== 1) fail(`1: expected 1 handler call, got ${deps.handlerCalls.length}`);
 }
 
-console.error(`PASS: 1 case (dedup)`);
+// 2. is_mentioned=false dropped
+{
+  const deps = makeDeps();
+  await handleCommentEvent(makeEvent({ is_mentioned: false }), deps);
+  if (deps.handlerCalls.length !== 0) fail(`2: is_mentioned=false should drop`);
+  if (deps.commentGetCalls.length !== 0) fail(`2: should not pre-fetch`);
+}
+
+// 3. to_user_id != bot dropped (defensive)
+{
+  const deps = makeDeps();
+  await handleCommentEvent(makeEvent({ to_open_id: 'ou_other_user' }), deps);
+  if (deps.handlerCalls.length !== 0) fail(`3: to_user_id mismatch should drop`);
+}
+
+// 4. from_user_id == bot dropped (loop prevention)
+{
+  const deps = makeDeps();
+  await handleCommentEvent(makeEvent({ from_open_id: 'ou_bot' }), deps);
+  if (deps.handlerCalls.length !== 0) fail(`4: bot's own comment must be dropped`);
+}
+
+console.error(`PASS: 4 cases (dedup + filters)`);

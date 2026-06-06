@@ -366,12 +366,22 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
   }
   if (eventId) deps.seenEventIds.set(eventId, true);
 
-  // Subsequent filters land in Task 6.
+  const meta = data?.event?.notice_meta;
+  if (!meta) return;
+
+  // @bot only — drop generic notifications where bot is just a subscriber.
+  if (meta.is_mentioned !== true) return;
+
+  // Defensive: should always be bot (event routed by Feishu), but check.
+  if (meta.to_user_id?.open_id !== deps.botOpenId) return;
+
+  // Loop prevention: don't process the bot's own comments.
+  if (meta.from_user_id?.open_id === deps.botOpenId) return;
+
   // Pre-fetch and envelope build land in Tasks 7–9.
-  // For now, dispatch a minimal placeholder message so dedup is observable
-  // via the messageHandler. This intentionally builds nothing of substance —
-  // Task 9 replaces this with the real envelope after filters/pre-fetch.
-  const meta = data?.event?.notice_meta ?? {};
+  // For now, dispatch a minimal placeholder message so dedup + filters are
+  // observable via the messageHandler. This intentionally builds nothing of
+  // substance — Task 9 replaces this with the real envelope after pre-fetch.
   const minimal: LarkMessage = {
     messageId: `doc_comment:${meta.file_token ?? ''}:${meta.comment_id ?? ''}`,
     chatId: `doc:${meta.file_token ?? ''}`,
