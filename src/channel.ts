@@ -389,27 +389,50 @@ export interface CommentEventDeps {
  * queue.enqueue all land in tasks 6–9.
  */
 export async function handleCommentEvent(data: any, deps: CommentEventDeps): Promise<void> {
-  const eventId: string | undefined = data?.header?.event_id;
+  // The Lark Node SDK's EventDispatcher.register auto-unwraps the envelope and
+  // delivers the event body directly — so event_id / comment_id / reply_id /
+  // is_mentioned live at root, NOT nested under data.event or data.header.
+  // notice_meta is also at root. See issue #183 for the live-event dump that
+  // verified this shape. Pre-v1.1.1 code read from data.header.event_id and
+  // data.event.notice_meta, so data.event was always undefined and EVERY
+  // doc-comment event was silently dropped at the early `if (!meta) return`.
+  const eventId: string | undefined = data?.event_id;
   if (eventId && deps.seenEventIds.has(eventId)) {
     return;  // dedup — same event_id already processed
   }
   if (eventId) deps.seenEventIds.set(eventId, true);
 
-  const meta = data?.event?.notice_meta;
-  if (!meta) return;
+  const meta = data?.notice_meta;
+  if (!meta) {
+    debugLog(`[channel] Doc comment event missing notice_meta — dropped (event_id=${eventId ?? '<none>'})`);
+    return;
+  }
 
   // @bot only — drop generic notifications where bot is just a subscriber.
-  if (meta.is_mentioned !== true) return;
+  if (data.is_mentioned !== true) {
+    debugLog(`[channel] Doc comment event is_mentioned=false — dropped (event_id=${eventId ?? '<none>'})`);
+    return;
+  }
 
   // Defensive: should always be bot (event routed by Feishu), but check.
-  if (meta.to_user_id?.open_id !== deps.botOpenId) return;
+  if (meta.to_user_id?.open_id !== deps.botOpenId) {
+    debugLog(
+      `[channel] Doc comment to_user_id=${meta.to_user_id?.open_id ?? '<none>'} != bot=${deps.botOpenId} — dropped (event_id=${eventId ?? '<none>'})`,
+    );
+    return;
+  }
 
   // Loop prevention: don't process the bot's own comments.
-  if (meta.from_user_id?.open_id === deps.botOpenId) return;
+  if (meta.from_user_id?.open_id === deps.botOpenId) {
+    debugLog(
+      `[channel] Doc comment from bot itself — dropped to prevent loop (event_id=${eventId ?? '<none>'})`,
+    );
+    return;
+  }
 
   const fileToken: string = meta.file_token;
-  const commentId: string = meta.comment_id;
-  const replyId: string | undefined = meta.reply_id;
+  const commentId: string = data.comment_id;
+  const replyId: string | undefined = data.reply_id;
   const fileType: string = meta.file_type;
   const fromOpenId: string = meta.from_user_id.open_id;
 
