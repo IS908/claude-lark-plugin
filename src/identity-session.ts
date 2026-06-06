@@ -78,20 +78,56 @@ interface SessionEntry {
   updatedAt: number;
 }
 
+/**
+ * Soft cap on the number of live session entries. With per-comment keying
+ * (PR #182 round 4 I1) the map grows 1 entry per comment, not 1 per doc —
+ * a hostile commenter on a bot-collaborated doc could otherwise grow the
+ * map unbounded until the TTL window (default 2h) catches up. 5000 entries
+ * × ~80 bytes ≈ 400KB worst case; large enough to never bite a realistic
+ * deployment, small enough that pathological growth gets evicted.
+ */
+const DEFAULT_MAX_SIZE = 5000;
+
 export class IdentitySession {
   private map = new Map<string, SessionEntry>();
+  private readonly maxSize: number;
 
   constructor(
     private readonly ownerFallback: () => string | null,
     private readonly maxAgeMs: number = 3600_000,
-  ) {}
+    opts: { maxSize?: number } = {},
+  ) {
+    this.maxSize = opts.maxSize ?? DEFAULT_MAX_SIZE;
+  }
 
   private key(chatId: string, threadId?: string): string {
     return threadId ? `${chatId}#${threadId}` : chatId;
   }
 
   setCaller(chatId: string, threadId: string | undefined, userId: string): void {
-    this.map.set(this.key(chatId, threadId), { userId, updatedAt: Date.now() });
+    // Invariant: doc: chat_ids are ONLY ever keyed per-comment to avoid
+    // cross-event session races (commit b87657c, PR #182 round-4 I1). A
+    // chat-level entry for a doc: chat_id would silently match any
+    // subsequent thread-keyed lookup via getCaller's fallback path,
+    // breaking the per-comment isolation. Throw rather than allow the
+    // ambiguous binding to corrupt session state.
+    if (chatId.startsWith(DOC_CHAT_ID_PREFIX) && threadId === undefined) {
+      throw new Error(
+        `IdentitySession.setCaller: doc: chat_id "${chatId}" requires a non-undefined thread_id (use comment_id). Chat-level binding would silently shadow per-comment entries via getCaller's fallback path.`,
+      );
+    }
+    const k = this.key(chatId, threadId);
+    // LRU-style cap (Map iterates in insertion order). When at capacity
+    // and inserting a NEW key, evict the oldest entry first. When
+    // overwriting an existing key, we delete+re-insert below to refresh
+    // its LRU position.
+    if (this.map.size >= this.maxSize && !this.map.has(k)) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) this.map.delete(oldest);
+    }
+    // Refresh insertion order on overwrite.
+    this.map.delete(k);
+    this.map.set(k, { userId, updatedAt: Date.now() });
   }
 
   /**

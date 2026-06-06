@@ -513,16 +513,19 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
  * marker. Returns the input unchanged when undefined/short enough. Used to
  * bound doc-comment body sizes before envelope assembly (PR #182 round 4 M3).
  *
- * Buffer.subarray on a UTF-8 buffer can split a multi-byte codepoint at the
- * boundary; calling .toString('utf8') on a partial codepoint emits U+FFFD
- * (replacement character) which is fine — the truncation marker makes the
- * shape obvious to a downstream reader.
+ * PR #182 round 5 N-2: snap the cut back to the last valid UTF-8 codepoint
+ * boundary so the toString('utf8') call doesn't emit a U+FFFD replacement
+ * char at the truncation seam. UTF-8 continuation bytes have the high two
+ * bits set to `10` (`b & 0xC0 === 0x80`); walk backwards through any
+ * continuation bytes until we land on a leading byte (or position 0).
  */
 function capUtf8(s: string | undefined, max: number): string | undefined {
   if (s === undefined) return undefined;
   const buf = Buffer.from(s, 'utf8');
   if (buf.length <= max) return s;
-  return buf.subarray(0, max).toString('utf8') + ' …[truncated]';
+  let cut = max;
+  while (cut > 0 && (buf[cut] & 0xC0) === 0x80) cut--;
+  return buf.subarray(0, cut).toString('utf8') + ' …[truncated]';
 }
 
 function extractText(content: any): string | undefined {

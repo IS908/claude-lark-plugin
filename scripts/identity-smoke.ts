@@ -93,22 +93,49 @@ function fail(msg: string): never {
   }
 }
 
-// 12. doc:<token> with setCaller binding → returns the bound user (event-time identity preserved)
+// 12. doc:<token> with setCaller binding → returns the bound user (event-time identity preserved).
+// Post-N-5: doc: chat_ids MUST be keyed per-comment, so this test binds via (chat, comment_id).
 {
   const s = new IdentitySession(() => 'ou_owner');
-  s.setCaller('doc:doxcnXXX', undefined, 'ou_from_user');
-  if (s.getCaller('doc:doxcnXXX') !== 'ou_from_user') {
+  s.setCaller('doc:doxcnXXX', 'cmt_1', 'ou_from_user');
+  if (s.getCaller('doc:doxcnXXX', 'cmt_1') !== 'ou_from_user') {
     fail('12: doc: chat_id must resolve to the setCaller-bound user, not owner');
   }
 }
 
-// 13. doc:<token> with non-owner setCaller binding → returns non-owner (security regression test)
+// 13. doc:<token> with non-owner setCaller binding → returns non-owner (security regression test).
+// Post-N-5: per-comment keyed.
 {
   const s = new IdentitySession(() => 'ou_owner');
-  s.setCaller('doc:doxcnXXX', undefined, 'ou_alice');
-  if (s.getCaller('doc:doxcnXXX') === 'ou_owner') {
+  s.setCaller('doc:doxcnXXX', 'cmt_1', 'ou_alice');
+  if (s.getCaller('doc:doxcnXXX', 'cmt_1') === 'ou_owner') {
     fail('13: SECURITY: doc: chat_id must NOT silently elevate non-owner to owner identity');
   }
 }
 
-console.log('identity smoke: 13/13 PASS');
+// 14. LRU cap: oldest entry evicted when capacity exceeded (PR #182 round 5 N-1)
+{
+  const s = new IdentitySession(() => 'ou_owner', 3600_000, { maxSize: 3 });
+  s.setCaller('chat_a', 't1', 'ou_alice');
+  s.setCaller('chat_b', 't2', 'ou_bob');
+  s.setCaller('chat_c', 't3', 'ou_carol');
+  if (s.getCaller('chat_a', 't1') !== 'ou_alice') fail('14: alice should still be present at capacity');
+  s.setCaller('chat_d', 't4', 'ou_dave'); // triggers eviction of oldest (alice)
+  if (s.getCaller('chat_a', 't1') !== null) fail('14: LRU should evict oldest entry on capacity overflow');
+  if (s.getCaller('chat_d', 't4') !== 'ou_dave') fail('14: new entry must be present');
+}
+
+// 15. doc: chat_id without thread_id throws — invariant lock-in (PR #182 round 5 N-5)
+{
+  const s = new IdentitySession(() => 'ou_owner');
+  let threw = false;
+  try {
+    s.setCaller('doc:abc', undefined, 'ou_someone');
+  } catch (e: any) {
+    threw = true;
+    if (!/non-undefined thread_id/i.test(e.message)) fail('15: error message should explain the invariant');
+  }
+  if (!threw) fail('15: doc: chat_id without thread_id must throw');
+}
+
+console.log('identity smoke: 15/15 PASS');
