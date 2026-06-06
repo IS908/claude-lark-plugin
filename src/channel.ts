@@ -324,6 +324,66 @@ export function computeBotMentioned(
   return parsedMentions.some((m) => m.id === botOpenId);
 }
 
+/**
+ * Injected dependencies for {@link handleCommentEvent} — the pure
+ * dispatcher for `drive.notice.comment_add_v1` events (#181).
+ *
+ * Extracted as a standalone function (rather than a `LarkChannel` method)
+ * so the smoke test can exercise dedup / filter / pre-fetch logic without
+ * constructing a real Feishu SDK client. The `client` field declares only
+ * the minimal API surface used (file_comment.get, drive.metas.batchQuery),
+ * so mocks stay small.
+ *
+ * Subsequent tasks (#181 plan tasks 6–10) layer filters, pre-fetch, and
+ * the channel-envelope build on top of this skeleton.
+ */
+export interface CommentEventDeps {
+  botOpenId: string;
+  seenEventIds: TTLCache<string, true>;
+  identitySession: IdentitySession;
+  queue: MessageQueue;
+  messageHandler: MessageHandler;
+  resolveUserName: (openId: string) => Promise<string>;
+  client: {
+    drive: {
+      fileComment: { get: (req: any) => Promise<any> };
+      metas: { batchQuery: (req: any) => Promise<any> };
+    };
+  };
+}
+
+/**
+ * Skeleton dispatcher for `drive.notice.comment_add_v1` (#181).
+ *
+ * This task (#181 plan task 5) only implements event_id dedup. The 3
+ * filter clauses, comment/reply pre-fetch, channel envelope build, and
+ * queue.enqueue all land in tasks 6–9.
+ */
+export async function handleCommentEvent(data: any, deps: CommentEventDeps): Promise<void> {
+  const eventId: string | undefined = data?.header?.event_id;
+  if (eventId && deps.seenEventIds.has(eventId)) {
+    return;  // dedup — same event_id already processed
+  }
+  if (eventId) deps.seenEventIds.set(eventId, true);
+
+  // Subsequent filters land in Task 6.
+  // Pre-fetch and envelope build land in Tasks 7–9.
+  // For now, dispatch a minimal placeholder message so dedup is observable
+  // via the messageHandler. This intentionally builds nothing of substance —
+  // Task 9 replaces this with the real envelope after filters/pre-fetch.
+  const meta = data?.event?.notice_meta ?? {};
+  const minimal: LarkMessage = {
+    messageId: `doc_comment:${meta.file_token ?? ''}:${meta.comment_id ?? ''}`,
+    chatId: `doc:${meta.file_token ?? ''}`,
+    chatType: 'p2p',
+    senderId: meta?.from_user_id?.open_id ?? '',
+    text: '',
+    messageType: 'doc_comment',
+    rawContent: '',
+  };
+  await deps.messageHandler(minimal);
+}
+
 export class LarkChannel {
   private client: Lark.Client;
   // #109 fix: bounded TTL + LRU caches replace unbounded Maps. Pre-fix
