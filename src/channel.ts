@@ -375,6 +375,13 @@ export interface CommentEventDeps {
   messageHandler: MessageHandler;
   resolveUserName: (openId: string) => Promise<string>;
   client: {
+    // #187 v1.2.0: raw HTTP adapter for the v2 comments/reaction endpoint
+    // (`POST /drive/v2/files/{file_token}/comments/reaction`). The Lark
+    // Node SDK's typed `drive` namespace doesn't expose this endpoint, so
+    // we go through `client.request` directly — same pattern as the
+    // `DocCommentClient` adapter in `src/tools.ts`. Typed `any` to match
+    // the existing convention; the call site validates structure.
+    request: (req: any) => Promise<any>;
     drive: {
       // #185 v1.1.2: switched from `fileComment.get` (404s for is_whole=false
       // anchored comments — the typical @-bot-in-doc UX) to parallel
@@ -385,6 +392,47 @@ export interface CommentEventDeps {
       meta: { batchQuery: (req: any) => Promise<any> };
     };
   };
+}
+
+/**
+ * Fire-and-forget ack-react helper for inbound doc-comment events (#187).
+ *
+ * Posts to `POST /open-apis/drive/v2/files/{file_token}/comments/reaction`
+ * with `action: 'add'` to attach a persistent emoji reaction on the user's
+ * reply (or the original comment for add_comment events). Used as the
+ * doc-comment analog to the IM `LARK_ACK_EMOJI` reaction — but UNLIKE the
+ * IM equivalent there is NO revoke / tracker / TTL: doc comments are async
+ * and persistently visible to collaborators reading the thread later, so a
+ * persistent `THUMBSUP` is informational (an audit marker that the bot
+ * processed this comment) rather than visual clutter to clean up after.
+ *
+ * Errors are swallowed with a `debugLog` so the main pre-fetch → envelope
+ * → Claude routing flow never blocks on ack delivery. Called via
+ * `void ackReact(...)` so the caller doesn't await — the reaction issues
+ * in parallel with the rest of the dispatcher's I/O.
+ */
+async function ackReact(
+  client: { request: (req: any) => Promise<any> },
+  fileToken: string,
+  fileType: string,
+  replyId: string,
+  emoji: string,
+): Promise<void> {
+  try {
+    await client.request({
+      url: `https://open.feishu.cn/open-apis/drive/v2/files/${encodeURIComponent(fileToken)}/comments/reaction`,
+      method: 'POST',
+      params: { file_type: fileType },
+      // NOTE: bare string here — IM ack (see message-reaction.create call
+      // below) uses nested { emoji_type: emoji } per the IM message-reaction
+      // API. Don't unify; these are different endpoint contracts.
+      data: { action: 'add', reaction_type: emoji, reply_id: replyId },
+    });
+  } catch (e: any) {
+    debugLog(
+      `[channel] Doc comment ack reaction failed (reply_id=${replyId}, emoji=${emoji}): ${e?.message || String(e)}`,
+    );
+  }
 }
 
 /**
@@ -458,6 +506,23 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
       `[channel] Doc comment from ${fromOpenId} on doc ${fileToken} rejected by whitelist`,
     );
     return;
+  }
+
+  // Ack: react on the user's reply BEFORE pre-fetch when we already have a
+  // reply_id (#187). For `add_reply` events the inbound `event.reply_id` IS
+  // the reply we react to, so we can fire-and-forget in parallel with the
+  // pre-fetch below. For `add_comment` events the analog target is
+  // `items[0].reply_id` from `fileCommentReply.list`, which we only have
+  // AFTER pre-fetch — that branch fires the ack a few lines further down.
+  // No revoke / tracker / TTL: doc comments are async/persistent, so the
+  // reaction lives as an audit marker, not residue to clean up.
+  const ackEmoji = appConfig.docCommentAckEmoji;
+  let ackFired = false;
+  if (ackEmoji && replyId) {
+    // Fire-and-forget; don't await — the Promise.allSettled below runs
+    // concurrently with this HTTP call.
+    void ackReact(deps.client, fileToken, fileType, replyId, ackEmoji);
+    ackFired = true;
   }
 
   // Pre-fetch comment body. We swallow errors but flag them in the envelope
@@ -555,6 +620,24 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
   } else {
     // add_comment: body = the comment itself (replies[0]).
     body = extractText(replies[0]?.content);
+  }
+
+  // Ack for add_comment events (#187). Unlike add_reply we don't have a
+  // usable reply_id at event time — we have to wait for pre-fetch to expose
+  // `items[0].reply_id` from `fileCommentReply.list`. Fire-and-forget; main
+  // flow does NOT block on ack delivery (envelope assembly + enqueue
+  // continue immediately below). Sub-second latency vs. the parallel
+  // add_reply path is acceptable since the user-visible signal is just
+  // "bot saw this", not "bot is thinking".
+  if (ackEmoji && !ackFired) {
+    const originalReplyId = replies[0]?.reply_id;
+    if (typeof originalReplyId === 'string' && originalReplyId.length > 0) {
+      void ackReact(deps.client, fileToken, fileType, originalReplyId, ackEmoji);
+    } else {
+      debugLog(
+        `[channel] Doc comment ack skipped — add_comment had no usable items[0].reply_id (comment_id=${commentId})`,
+      );
+    }
   }
 
   // Cap body / parentBody to bound prompt size before envelope assembly

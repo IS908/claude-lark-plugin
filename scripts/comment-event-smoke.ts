@@ -4,6 +4,12 @@
  */
 process.env.LARK_APP_ID = process.env.LARK_APP_ID ?? 'cli_test';
 process.env.LARK_APP_SECRET = process.env.LARK_APP_SECRET ?? 'secret';
+// #187: appConfig is built at module load, so the env var has to be set
+// BEFORE the `appConfig` import line below. We default to THUMBSUP so the
+// smoke is deterministic regardless of the dev's local env; case 22
+// explicitly mutates `appConfig.docCommentAckEmoji` to test the empty-disables
+// contract.
+process.env.LARK_DOC_COMMENT_ACK_EMOJI = process.env.LARK_DOC_COMMENT_ACK_EMOJI ?? 'THUMBSUP';
 
 import { handleCommentEvent, type CommentEventDeps } from '../src/channel.js';
 import { IdentitySession } from '../src/identity-session.js';
@@ -63,6 +69,7 @@ function makeEvent(overrides: Partial<{ event_id: string; is_mentioned: boolean;
 
 function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps & {
   handlerCalls: any[]; commentRepliesListCalls: any[]; commentListCalls: any[]; metaCalls: any[];
+  reactionCalls: any[];
 } {
   const handlerCalls: any[] = [];
   // v1.1.2 (#185): handleCommentEvent now calls fileCommentReply.list (for
@@ -72,6 +79,10 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   const commentRepliesListCalls: any[] = [];
   const commentListCalls: any[] = [];
   const metaCalls: any[] = [];
+  // #187 v1.2.0: client.request is the adapter handleCommentEvent uses for
+  // the v2 comments/reaction endpoint (POST /drive/v2/files/.../comments/reaction).
+  // Recorded here so cases 20/21/22 can assert URL / method / body.
+  const reactionCalls: any[] = [];
   const session = new IdentitySession(() => 'ou_owner_for_test');
   const deps: CommentEventDeps = {
     botOpenId: 'ou_bot',
@@ -81,6 +92,10 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
     messageHandler: async (m) => { handlerCalls.push(m); },
     resolveUserName: async (openId) => `name_for_${openId}`,
     client: {
+      request: async (req: any) => {
+        reactionCalls.push(req);
+        return { data: {} };
+      },
       drive: {
         fileCommentReply: {
           list: async (params: any) => {
@@ -128,7 +143,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
     } as any,
     ...overrides,
   };
-  return Object.assign(deps, { handlerCalls, commentRepliesListCalls, commentListCalls, metaCalls });
+  return Object.assign(deps, { handlerCalls, commentRepliesListCalls, commentListCalls, metaCalls, reactionCalls });
 }
 
 // 1. dedup: same event_id processed twice → handler called once
@@ -191,6 +206,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // comments fail) path that v1.1.1's Promise.all would have incorrectly wiped.
 {
   const failingClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: { list: async () => { throw new Error('feishu replies boom'); } },
       fileComment: { list: async () => { throw new Error('feishu comments boom'); } },
@@ -207,6 +223,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // v1.1.2 (#185): replies + comments come from the two list endpoints.
 {
   const noTitleClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async (params: any) => ({
@@ -262,6 +279,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // preserving the Feishu data model where items[0] is the original comment body.
 {
   const replyClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async () => ({
@@ -304,6 +322,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // so body falls through to undefined → envelope renders <body unknown="true">.
 {
   const partialClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async () => ({
@@ -384,6 +403,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // v1.1.2 (#185): quote now comes from fileComment.list's matching item.
 {
   const noQuote = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async () => ({
@@ -507,6 +527,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   let commentsCalled = false;
   const deps = makeDeps({
     client: {
+      request: async () => ({ data: {} }),
       drive: {
         fileCommentReply: {
           list: async (_params: any) => {
@@ -555,6 +576,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 //   omits <selected_text> without poisoning the envelope.
 {
   const partialClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async () => ({
@@ -580,4 +602,78 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (text.includes('<selected_text>')) fail(`7c: quote-only failure must omit selected_text: ${text.slice(0,300)}`);
 }
 
-console.error(`PASS: 22 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race + chat-list-only doc-comment + user-list gate + anchored is_whole=false #185 + partial-failure allSettled #186)`);
+// 20. ack: add_reply event triggers react on event.reply_id in parallel with pre-fetch (#187)
+{
+  const deps = makeDeps();
+  await handleCommentEvent(makeEvent({
+    comment_id: 'cmt_20_parent',
+    reply_id: 'cmt_20_target',
+  }), deps);
+  if (deps.reactionCalls.length !== 1) fail(`20: expected 1 reaction call, got ${deps.reactionCalls.length}`);
+  const call = deps.reactionCalls[0];
+  if (call.method !== 'POST') fail(`20: method wrong: ${call.method}`);
+  if (!String(call.url).includes('/drive/v2/files/dox_test/comments/reaction')) fail(`20: url wrong: ${call.url}`);
+  if (call.params?.file_type !== 'docx') fail(`20: file_type wrong`);
+  if (call.data?.action !== 'add') fail(`20: action wrong: ${call.data?.action}`);
+  if (call.data?.reaction_type !== 'THUMBSUP') fail(`20: reaction_type wrong: ${call.data?.reaction_type}`);
+  if (call.data?.reply_id !== 'cmt_20_target') fail(`20: reply_id should be event.reply_id, got ${call.data?.reply_id}`);
+}
+
+// 21. ack: add_comment event triggers react on items[0].reply_id from fileCommentReply.list (#187)
+{
+  const reactionCalls: any[] = [];
+  const customClient: any = {
+    request: async (req: any) => {
+      reactionCalls.push(req);
+      return { data: {} };
+    },
+    drive: {
+      fileCommentReply: {
+        list: async () => ({
+          data: {
+            items: [
+              { reply_id: 'cmt_21_first_reply', content: { elements: [{ type: 'text_run', text_run: { text: 'comment body' } }] } },
+            ],
+            has_more: false,
+          },
+        }),
+      },
+      fileComment: {
+        list: async () => ({
+          data: { items: [{ comment_id: 'cmt_21', is_whole: true, reply_list: { replies: [] } }], has_more: false },
+        }),
+      },
+      meta: { batchQuery: async () => ({ data: { metas: [{ title: 'D' }] } }) },
+    },
+  };
+  const deps = makeDeps({ client: customClient });
+  await handleCommentEvent(makeEvent({
+    comment_id: 'cmt_21',
+    reply_id: undefined,  // add_comment
+  }), deps);
+  if (reactionCalls.length !== 1) fail(`21: expected 1 reaction call, got ${reactionCalls.length}`);
+  if (reactionCalls[0].data?.reply_id !== 'cmt_21_first_reply') {
+    fail(`21: add_comment ack should use items[0].reply_id, got ${reactionCalls[0].data?.reply_id}`);
+  }
+}
+
+// 22. ack: empty LARK_DOC_COMMENT_ACK_EMOJI disables the react entirely (#187)
+{
+  // Save+restore so other cases aren't affected. Mutating appConfig in-place
+  // is the cross-smoke convention here (same pattern as case 17 for the
+  // whitelist arrays).
+  const saved = appConfig.docCommentAckEmoji;
+  (appConfig as any).docCommentAckEmoji = '';
+  try {
+    const deps = makeDeps();
+    await handleCommentEvent(makeEvent({
+      comment_id: 'cmt_22',
+      reply_id: 'cmt_22_target',
+    }), deps);
+    if (deps.reactionCalls.length !== 0) fail(`22: empty ack emoji must skip react entirely, got ${deps.reactionCalls.length}`);
+  } finally {
+    (appConfig as any).docCommentAckEmoji = saved;
+  }
+}
+
+console.error(`PASS: 25 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race + chat-list-only doc-comment + user-list gate + anchored is_whole=false #185 + partial-failure allSettled #186 + doc-comment ack #187)`);

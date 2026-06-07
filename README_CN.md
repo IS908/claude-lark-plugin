@@ -239,6 +239,7 @@ node -e "console.log(require('./package.json').version)"
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `LARK_ACK_EMOJI` | `MeMeMe` | 收到消息时的 emoji 回应。留空可禁用 |
+| `LARK_DOC_COMMENT_ACK_EMOJI` | `THUMBSUP` | 收到文档评论事件时机器人给用户回复加的表情回应，作为即时视觉反馈。空字符串关闭。不撤销——文档评论是异步协作内容，表情作为审计痕迹常驻（v1.2.0+）。 |
 | `LARK_BOT_MESSAGE_TRACKER_SIZE` | `500` | 用于 reaction 过滤的 bot 消息 ID 追踪上限（FIFO） |
 
 ### 可选 —— 定时任务

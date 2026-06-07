@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.0] - 2026-06-07
+
+### Added
+- **Ack reaction on inbound doc-comment events** (#187). Bot now reacts to incoming doc-comment events with a configurable emoji (`LARK_DOC_COMMENT_ACK_EMOJI`, default `THUMBSUP`) so users get immediate visual feedback that the bot saw their comment — even before Claude's processing finishes (typically 2-30 seconds depending on tool calls). Empty env disables.
+
+  **No revoke** — design choice intentional. IM's `LARK_ACK_EMOJI` revokes after the reply because synchronous chat emojis become visual clutter. Doc-comment is the opposite context: async, persistent, viewed by collaborators reading the thread later. A persistent `THUMBSUP` is informational ("bot processed this") — an audit marker, not residue. No tracker, no TTL, no revocation race conditions to engineer around.
+
+  **add_reply** events (the typical @-bot UX) react immediately on `event.reply_id` in parallel with pre-fetch. **add_comment** events react after pre-fetch using `items[0].reply_id` from `fileCommentReply.list`. Failures are fire-and-forget with `debugLog` — main flow doesn't block on ack.
+
+### Implementation
+- `src/config.ts`: new `docCommentAckEmoji` setting via `LARK_DOC_COMMENT_ACK_EMOJI` (default `THUMBSUP`). Uses `process.env[KEY] ?? 'THUMBSUP'` (not the `optional` helper) so an explicit empty string disables the ack — `optional` would have collapsed empty back to the default via its `||` short-circuit.
+- `src/channel.ts:handleCommentEvent`: ack-react helper using raw `client.request(...)` for the v2 endpoint (`POST /open-apis/drive/v2/files/{file_token}/comments/reaction`) — same adapter pattern as `DocCommentClient` in `src/tools.ts`. Reaction fires before pre-fetch for add_reply (parallelism), after pre-fetch for add_comment (data dependency on items[0]). `CommentEventDeps.client` extended with `request` for the v2 endpoint.
+- `scripts/comment-event-smoke.ts`: `client.request` recorder added to `makeDeps`; 3 new cases — case 20 verifies add_reply ack fires on `event.reply_id` with correct URL/method/body shape; case 21 verifies add_comment ack uses items[0].reply_id from pre-fetch; case 22 verifies empty env disables ack entirely.
+
+### Migration
+- No new Feishu scope required (`docs:document.comment:create` already requested for v1.1.0 covers the reaction endpoint).
+- Operators wanting to opt out: `LARK_DOC_COMMENT_ACK_EMOJI=""`.
+- No behavioral change for existing flows — pre-fetch / envelope / Claude routing / Stop hook all unchanged.
+
 ## [1.1.2] - 2026-06-07
 
 ### Fixed
