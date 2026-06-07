@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1.2] - 2026-06-07
+
+### Fixed
+- **Anchored doc-comment events (`is_whole=false`) silently produced empty `<body>` and `<fetch_error>` in v1.1.1** (#185). `handleCommentEvent` used `drive.fileComment.get` for pre-fetch, but that endpoint returns 404 (`code=1069307`, "not exist") for any comment where `is_whole=false` — the typical UX for @-mentioning the bot inside a docx (user highlights text + types `@bot`). Whole-doc comments (`is_whole=true`) were unaffected and worked. Replaced with parallel `drive.fileCommentReply.list` + `drive.fileComment.list` — both endpoints work for anchored and whole-doc comments. `fileCommentReply.list` returns the original comment as `items[0]` (Feishu's data model) so `body` extraction logic is unchanged in spirit; `quote` is pulled from the matching item in `fileComment.list`.
+
+### Implementation
+- `src/channel.ts:handleCommentEvent`: replaced single `fileComment.get` call with parallel `Promise.all([fileCommentReply.list, fileComment.list])`. Page size capped at 100 — if a comment has >100 replies or a doc has >100 comments, the matching item may not be in the first page; current behavior would show `<body unknown="true">` (existing add_reply fallback) for missing-reply or omit `quote` for missing-comment. Pagination support is a follow-up.
+- `CommentEventDeps.client` interface: removed `fileComment.get`, added `fileComment.list` and `fileCommentReply.list` shapes.
+- `scripts/comment-event-smoke.ts`: rewrote `makeDeps` default factory + all 5 ad-hoc per-case clients (cases 6, 7, 8, 12, 14) to mock the new endpoints. Added case 19 explicitly exercising the anchored-comment path (verifies both list calls fire + quote surfaces in `<selected_text>` + body in `<body>`). All 20 prior cases preserve their semantic intent under the new shape.
+
+### Known follow-up
+- Pagination for `fileComment.list` and `fileCommentReply.list` (`page_token` loop). Currently capped at `page_size=100`; large threads silently lose data beyond that. Acceptable for v1.1.2 hot-path fix.
+
 ## [1.1.1] - 2026-06-07
 
 ### Fixed
