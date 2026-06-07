@@ -515,10 +515,24 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
   if (repliesResult.status === 'rejected' && commentsResult.status === 'rejected') {
     const r: any = repliesResult.reason;
     fetchError = r?.message || String(r);
+    debugLog(
+      `[channel] Doc comment pre-fetch: BOTH list endpoints failed (event_id=${eventId ?? '<none>'}, comment_id=${commentId}): ${fetchError}`,
+    );
   } else if (repliesResult.status === 'rejected') {
     // Body unrecoverable but doc title still works — surface partial failure.
     const r: any = repliesResult.reason;
     fetchError = `replies list failed: ${r?.message || String(r)}`;
+    debugLog(
+      `[channel] Doc comment pre-fetch: replies list failed (event_id=${eventId ?? '<none>'}, comment_id=${commentId}): ${r?.message || String(r)}`,
+    );
+  } else if (commentsResult.status === 'rejected') {
+    // Body still renders; quote silently omitted. Log so operators can see
+    // when fileComment.list is degraded (otherwise the only signal is
+    // missing <selected_text> in every envelope until it recovers).
+    const r: any = commentsResult.reason;
+    debugLog(
+      `[channel] Doc comment pre-fetch: comments list failed, quote omitted (event_id=${eventId ?? '<none>'}, comment_id=${commentId}): ${r?.message || String(r)}`,
+    );
   }
 
   // `quote` lives at the comment level, not on individual replies.

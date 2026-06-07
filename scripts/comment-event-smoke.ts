@@ -185,9 +185,10 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 
 // 7. pre-fetch throws → handler still called with <fetch_error>, event not dropped.
 // v1.1.2 (#185): both fileCommentReply.list and fileComment.list run in parallel
-// via Promise.all; either throwing rejects the await and triggers the catch.
-// We make both throw to lock in fetch_error semantics under the new endpoint
-// shape regardless of which one Feishu rejects first.
+// via Promise.allSettled (round-1 review I-1). Both rejecting hits the dual-failure
+// branch that surfaces <fetch_error>. We mock both throwing to lock in this
+// dual-rejection behavior; case 7c covers the partial-failure (replies OK,
+// comments fail) path that v1.1.1's Promise.all would have incorrectly wiped.
 {
   const failingClient = {
     drive: {
