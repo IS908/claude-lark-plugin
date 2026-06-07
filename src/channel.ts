@@ -485,43 +485,62 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
   let body: string | undefined;
   let quote: string | undefined;
   let fetchError: string | undefined;
-  try {
-    const [repliesResp, commentsResp] = await Promise.all([
-      deps.client.drive.fileCommentReply.list({
-        path: { file_token: fileToken, comment_id: commentId },
-        params: { file_type: fileType, page_size: 100 },
-      }),
-      deps.client.drive.fileComment.list({
-        path: { file_token: fileToken },
-        params: { file_type: fileType, page_size: 100 },
-      }),
-    ]);
-    const replies: any[] = repliesResp?.data?.items ?? [];
-    const comments: any[] = commentsResp?.data?.items ?? [];
 
-    // `quote` lives at the comment level, not on individual replies.
-    // Find the matching comment by id; if it's not on page 1 (>100 comments
-    // on this doc), `quote` is silently omitted (better than blocking the
-    // body delivery for missing context).
-    const targetComment = comments.find((c: any) => c.comment_id === commentId);
-    quote = typeof targetComment?.quote === 'string' && targetComment.quote.length > 0
-      ? targetComment.quote
-      : undefined;
+  // PR #186 round 1 I-1: switched from Promise.all to Promise.allSettled so a
+  // transient quote-list failure no longer wipes the resolved body-list result.
+  // The pre-fix code routed both rejections through a single catch and surfaced
+  // `<fetch_error>` even when only the (auxiliary) `fileComment.list` call had
+  // failed — losing a perfectly-good body. allSettled lets each leg degrade
+  // independently: `fetchError` fires only when BOTH endpoints fail (body
+  // truly unrecoverable), and quote-only failure silently omits `<selected_text>`.
+  const [repliesResult, commentsResult] = await Promise.allSettled([
+    deps.client.drive.fileCommentReply.list({
+      path: { file_token: fileToken, comment_id: commentId },
+      params: { file_type: fileType, page_size: 100 },
+    }),
+    deps.client.drive.fileComment.list({
+      path: { file_token: fileToken },
+      params: { file_type: fileType, page_size: 100 },
+    }),
+  ]);
 
-    if (replyId) {
-      // add_reply: parent = original comment (replies[0] per Feishu data
-      // model); body = matching reply by id. Missing-reply_id (>100 replies
-      // and the target is on page 2+, or upstream race) leaves body
-      // undefined → envelope renders `<body unknown="true">`.
-      parentBody = extractText(replies[0]?.content);
-      const target = replies.find((r: any) => r.reply_id === replyId);
-      body = target ? extractText(target.content) : undefined;
-    } else {
-      // add_comment: body = the comment itself (replies[0]).
-      body = extractText(replies[0]?.content);
-    }
-  } catch (e: any) {
-    fetchError = e?.message || String(e);
+  const replies: any[] =
+    repliesResult.status === 'fulfilled' ? (repliesResult.value?.data?.items ?? []) : [];
+  const comments: any[] =
+    commentsResult.status === 'fulfilled' ? (commentsResult.value?.data?.items ?? []) : [];
+
+  // `fetch_error` only when BOTH endpoints fail (body unrecoverable).
+  // Quote is auxiliary; quote-only failure silently omits `<selected_text>`
+  // rather than poisoning the body delivery.
+  if (repliesResult.status === 'rejected' && commentsResult.status === 'rejected') {
+    const r: any = repliesResult.reason;
+    fetchError = r?.message || String(r);
+  } else if (repliesResult.status === 'rejected') {
+    // Body unrecoverable but doc title still works — surface partial failure.
+    const r: any = repliesResult.reason;
+    fetchError = `replies list failed: ${r?.message || String(r)}`;
+  }
+
+  // `quote` lives at the comment level, not on individual replies.
+  // Find the matching comment by id; if it's not on page 1 (>100 comments
+  // on this doc), `quote` is silently omitted (better than blocking the
+  // body delivery for missing context).
+  const targetComment = comments.find((c: any) => c.comment_id === commentId);
+  quote = typeof targetComment?.quote === 'string' && targetComment.quote.length > 0
+    ? targetComment.quote
+    : undefined;
+
+  if (replyId) {
+    // add_reply: parent = original comment (replies[0] per Feishu data
+    // model); body = matching reply by id. Missing-reply_id (>100 replies
+    // and the target is on page 2+, or upstream race) leaves body
+    // undefined → envelope renders `<body unknown="true">`.
+    parentBody = extractText(replies[0]?.content);
+    const target = replies.find((r: any) => r.reply_id === replyId);
+    body = target ? extractText(target.content) : undefined;
+  } else {
+    // add_comment: body = the comment itself (replies[0]).
+    body = extractText(replies[0]?.content);
   }
 
   // Cap body / parentBody to bound prompt size before envelope assembly

@@ -292,6 +292,10 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   const text = deps.handlerCalls[0]?.text ?? '';
   if (!text.includes('<parent>parent body</parent>')) fail(`6: parent wrong: ${text.slice(0,300)}`);
   if (!text.includes('<body>target reply body</body>')) fail(`6: body wrong: ${text.slice(0,300)}`);
+  // PR #186 round 1 M-4: the mock already returns `quote: 'q'` on the matching
+  // comment_id, so the envelope should render `<selected_text>q</selected_text>`.
+  // Previously this case only asserted parent/body — the quote leg was uncovered.
+  if (!text.includes('<selected_text>q</selected_text>')) fail(`6: quote should render as selected_text: ${text.slice(0,300)}`);
 }
 
 // 14. reply_id not in fileCommentReply.list items → body marked unknown, no throw.
@@ -543,4 +547,36 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   }
 }
 
-console.error(`PASS: 21 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race + chat-list-only doc-comment + user-list gate + anchored is_whole=false #185)`);
+// 7c. PR #186 round 1 M-3: partial failure (replies succeeds, comments fails).
+//   Quote is auxiliary; quote-only failure must NOT wipe body delivery (the
+//   pre-I-1 Promise.all code would have surfaced <fetch_error> and an empty
+//   body here). Post-I-1 Promise.allSettled lets the resolved body render and
+//   omits <selected_text> without poisoning the envelope.
+{
+  const partialClient = {
+    drive: {
+      fileCommentReply: {
+        list: async () => ({
+          data: {
+            items: [
+              { reply_id: 'cmt_001', content: { elements: [{ type: 'text_run', text_run: { text: 'body delivered' } }] } },
+            ],
+            has_more: false,
+          },
+        }),
+      },
+      fileComment: {
+        list: async () => { throw new Error('comments list rate-limited'); },
+      },
+      meta: { batchQuery: async () => ({ data: { metas: [{ title: 'D' }] } }) },
+    },
+  };
+  const deps = makeDeps({ client: partialClient as any });
+  await handleCommentEvent(makeEvent({ comment_id: 'cmt_001' }), deps);
+  const text = deps.handlerCalls[0]?.text ?? '';
+  if (text.includes('<fetch_error>')) fail(`7c: quote-only failure must NOT surface fetch_error: ${text.slice(0,300)}`);
+  if (!text.includes('<body>body delivered</body>')) fail(`7c: body must render despite quote failure: ${text.slice(0,300)}`);
+  if (text.includes('<selected_text>')) fail(`7c: quote-only failure must omit selected_text: ${text.slice(0,300)}`);
+}
+
+console.error(`PASS: 22 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race + chat-list-only doc-comment + user-list gate + anchored is_whole=false #185 + partial-failure allSettled #186)`);
