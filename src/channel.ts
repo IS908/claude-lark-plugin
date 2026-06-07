@@ -360,8 +360,9 @@ export function computeBotMentioned(
  * Extracted as a standalone function (rather than a `LarkChannel` method)
  * so the smoke test can exercise dedup / filter / pre-fetch logic without
  * constructing a real Feishu SDK client. The `client` field declares only
- * the minimal API surface used (file_comment.get, drive.meta.batchQuery),
- * so mocks stay small.
+ * the minimal API surface used (`file_comment_reply.list`,
+ * `file_comment.list`, `drive.meta.batchQuery`), so mocks stay small.
+ * Switched from `file_comment.get` to the two list endpoints in v1.1.2 (#185).
  *
  * Subsequent tasks (#181 plan tasks 6–10) layer filters, pre-fetch, and
  * the channel-envelope build on top of this skeleton.
@@ -375,7 +376,12 @@ export interface CommentEventDeps {
   resolveUserName: (openId: string) => Promise<string>;
   client: {
     drive: {
-      fileComment: { get: (req: any) => Promise<any> };
+      // #185 v1.1.2: switched from `fileComment.get` (404s for is_whole=false
+      // anchored comments — the typical @-bot-in-doc UX) to parallel
+      // `fileCommentReply.list` (body / parent body) + `fileComment.list`
+      // (quote). Both list endpoints support anchored AND whole-doc comments.
+      fileComment: { list: (req: any) => Promise<any> };
+      fileCommentReply: { list: (req: any) => Promise<any> };
       meta: { batchQuery: (req: any) => Promise<any> };
     };
   };
@@ -456,28 +462,62 @@ export async function handleCommentEvent(data: any, deps: CommentEventDeps): Pro
 
   // Pre-fetch comment body. We swallow errors but flag them in the envelope
   // so Claude can decide whether to defer or surface to the user.
+  //
+  // #185 v1.1.2: switched from a single `fileComment.get` call to parallel
+  // `fileCommentReply.list` (replies under this comment) + `fileComment.list`
+  // (all comments on the doc, to find this one's `quote`). The old GET
+  // endpoint returns 404 (`code=1069307`, "not exist") for any comment where
+  // `is_whole=false` — the typical UX for @-mentioning the bot inside a
+  // docx (user highlights text + types `@bot`). Whole-doc comments
+  // (`is_whole=true`) work on GET but break on every anchored case.
+  // Both list endpoints work for anchored AND whole-doc, so we always run
+  // both in parallel. Per #185 live testing, `items[0]` from
+  // `fileCommentReply.list` IS the original comment body (Feishu's data
+  // model treats the original message as the first reply), so existing
+  // body / parentBody semantics are preserved.
+  //
+  // Pagination cap: page_size=100 for both calls. If a thread has >100
+  // replies or a doc has >100 comments, the matching item may not be on
+  // page 1 — body falls back to `<body unknown="true">` or `quote` is
+  // omitted. Acceptable for the hot-path fix; pagination loop is a
+  // follow-up tracked in CHANGELOG.
   let parentBody: string | undefined;
   let body: string | undefined;
   let quote: string | undefined;
   let fetchError: string | undefined;
   try {
-    const resp = await deps.client.drive.fileComment.get({
-      path: { file_token: fileToken, comment_id: commentId },
-      params: { file_type: fileType },
-    });
-    const c = resp?.data ?? {};
-    quote = typeof c.quote === 'string' && c.quote.length > 0 ? c.quote : undefined;
-    const replies: any[] = c.reply_list?.replies
-      ?? c.reply_list?.items
-      ?? (Array.isArray(c.reply_list) ? c.reply_list : []);
+    const [repliesResp, commentsResp] = await Promise.all([
+      deps.client.drive.fileCommentReply.list({
+        path: { file_token: fileToken, comment_id: commentId },
+        params: { file_type: fileType, page_size: 100 },
+      }),
+      deps.client.drive.fileComment.list({
+        path: { file_token: fileToken },
+        params: { file_type: fileType, page_size: 100 },
+      }),
+    ]);
+    const replies: any[] = repliesResp?.data?.items ?? [];
+    const comments: any[] = commentsResp?.data?.items ?? [];
+
+    // `quote` lives at the comment level, not on individual replies.
+    // Find the matching comment by id; if it's not on page 1 (>100 comments
+    // on this doc), `quote` is silently omitted (better than blocking the
+    // body delivery for missing context).
+    const targetComment = comments.find((c: any) => c.comment_id === commentId);
+    quote = typeof targetComment?.quote === 'string' && targetComment.quote.length > 0
+      ? targetComment.quote
+      : undefined;
+
     if (replyId) {
-      // add_reply: parent = reply_list[0] (the comment itself), body = the reply_id one
-      // Task 8 fleshes out the missing-reply_id case; for now, leave body undefined when not found.
+      // add_reply: parent = original comment (replies[0] per Feishu data
+      // model); body = matching reply by id. Missing-reply_id (>100 replies
+      // and the target is on page 2+, or upstream race) leaves body
+      // undefined → envelope renders `<body unknown="true">`.
       parentBody = extractText(replies[0]?.content);
       const target = replies.find((r: any) => r.reply_id === replyId);
       body = target ? extractText(target.content) : undefined;
     } else {
-      // add_comment: body = the comment itself
+      // add_comment: body = the comment itself (replies[0]).
       body = extractText(replies[0]?.content);
     }
   } catch (e: any) {
