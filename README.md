@@ -258,6 +258,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 | Variable | Default | Description |
 |---|---|---|
 | `LARK_ACK_EMOJI` | `MeMeMe` | Emoji reaction on message receive. Set to empty string to disable. |
+| `LARK_DOC_COMMENT_ACK_EMOJI` | `THUMBSUP` | Reaction emoji the bot adds to inbound doc-comment events for immediate visual feedback. Empty string disables. No revoke — persistent audit marker per the async/collaborative nature of doc comments (v1.2.0+). |
 | `LARK_BOT_MESSAGE_TRACKER_SIZE` | `500` | Max bot-sent message IDs tracked for reaction filtering (FIFO) |
 
 ### Optional -- CronJob
