@@ -35,18 +35,28 @@ function makeEvent(overrides: Partial<{ event_id: string; is_mentioned: boolean;
     from_open_id = 'ou_sender',
     to_open_id = 'ou_bot',
   } = overrides;
+  // Match the real Lark SDK EventDispatcher.register payload shape (issue #183).
+  // event_id / comment_id / reply_id / is_mentioned live AT ROOT, not nested under
+  // notice_meta or event. notice_meta also lives at root. Pre-v1.1.1 this factory
+  // duplicated the buggy nesting in handleCommentEvent, so all 20 cases were
+  // green while production was 100% broken — same family as #180.
   return {
-    header: { event_id, event_type: 'drive.notice.comment_add_v1' },
-    event: {
-      notice_meta: {
-        file_type: 'docx',
-        file_token,
-        comment_id,
-        reply_id,
-        is_mentioned,
-        from_user_id: { open_id: from_open_id },
-        to_user_id: { open_id: to_open_id },
-      },
+    schema: '2.0',
+    event_id,
+    token: '',
+    create_time: '1780000000000',
+    event_type: 'drive.notice.comment_add_v1',
+    tenant_key: 'tenant_test',
+    app_id: 'cli_test_app_id',
+    comment_id,
+    reply_id,
+    is_mentioned,
+    notice_meta: {
+      file_type: 'docx',
+      file_token,
+      notice_type: reply_id ? 'add_reply' : 'add_comment',
+      from_user_id: { open_id: from_open_id, union_id: 'on_test_from', user_id: null },
+      to_user_id: { open_id: to_open_id, union_id: 'on_test_to', user_id: null },
     },
   };
 }

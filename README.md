@@ -245,7 +245,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 
 > **Whitelist semantics:** when both lists are set, a message is accepted if **either** the sender is in `LARK_ALLOWED_USER_IDS` **or** the chat is in `LARK_ALLOWED_CHAT_IDS` (OR). Setting only one list gates on that list alone.
 >
-> For `drive.notice.comment_add_v1` (doc-comment) events: when `LARK_ALLOWED_USER_IDS` is configured, the comment author's `open_id` must match. When only `LARK_ALLOWED_CHAT_IDS` is configured (no user list), doc-comment events pass through — the chat list cannot meaningfully match the synthetic `doc:<file_token>` chat_id, and Feishu-side ACL (bot must be a doc collaborator + @-mentioned) is the upstream boundary (v1.1.0+).
+> For `drive.notice.comment_add_v1` (doc-comment) events: when `LARK_ALLOWED_USER_IDS` is configured, the comment author's `open_id` must match. When only `LARK_ALLOWED_CHAT_IDS` is configured (no user list), doc-comment events pass through — the chat list cannot meaningfully match the synthetic `doc:<file_token>` chat_id, and Feishu-side ACL (bot must be a doc collaborator + @-mentioned) is the upstream boundary (v1.1.1+).
 
 ### Optional -- Messaging
 
@@ -281,7 +281,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 |---|---|---|
 | `LARK_OWNER_OPEN_ID` | (empty) | Operator open_id. Enables terminal skill invocations (e.g. `/lark:jobs`) to resolve the caller via the reserved `__terminal__` chat id. When unset, terminal-side sensitive operations are denied. |
 | `LARK_IDENTITY_SESSION_TTL_MS` | `max(2h, LARK_INACTIVITY_HOURS × 2h)` | Lifetime of a server-side `(chat_id, thread_id?) → open_id` session entry. Must exceed the auto-flush window so distillation-triggered tool calls still resolve to the last real user. |
-| `LARK_IDENTITY_SESSION_MAX_SIZE` | `5000` | Max number of live entries in the per-(chat,thread) caller-identity LRU. Doc-comment events (post-v1.1.0) key per-comment, so a busy bot collaborating in many docs can accumulate more entries than the legacy IM-only flow. Minimum 1 (lower values clamped); no upper bound — operators choose based on RAM budget (each entry ~80 bytes). Oldest entry evicted when capacity exceeded. |
+| `LARK_IDENTITY_SESSION_MAX_SIZE` | `5000` | Max number of live entries in the per-(chat,thread) caller-identity LRU. Doc-comment events (v1.1.1+) key per-comment, so a busy bot collaborating in many docs can accumulate more entries than the legacy IM-only flow. Minimum 1 (lower values clamped); no upper bound — operators choose based on RAM budget (each entry ~80 bytes). Oldest entry evicted when capacity exceeded. |
 | `LARK_PRIVACY_RULES_FILE` | `~/.claude/channels/lark/privacy-rules.md` | Override the path to the L2 user rules file. The distiller injects this file's contents into its classification prompt. |
 | `LARK_AUDIT_LOG` | `~/.claude/channels/lark/audit.log` | Override the path to the append-only audit log. Every sensitive-tool invocation is recorded (best-effort; log failures never propagate). (v0.11.0+) |
 
@@ -361,8 +361,8 @@ The plugin registers the following MCP tools for Claude to use:
 | `delete_job` | Delete a cronjob. Owner-only. Requires `chat_id`. |
 | `what_do_you_know` | List what the bot has stored in the caller's profile. Filtered by rendering visibility (both tiers in p2p, public only in groups). Each line carries an 8-char hash for use with `forget_memory`. (v0.11.0+) |
 | `forget_memory` | Remove a specific line from the caller's profile by hash. Caller-scoped and idempotent. Optional `promote_to_rule` promotes the removal into a durable `## Always private` rule in `privacy-rules.md`. (v0.11.0+) |
-| `reply_doc_comment` | Reply to a Feishu doc comment thread. Owner-only. Posts as the bot's app identity. (v1.1.0+) |
-| `create_doc_comment` | Create a new top-level comment on a Feishu doc. Owner-only. (v1.1.0+) |
+| `reply_doc_comment` | Reply to a Feishu doc comment thread. Owner-only. Posts as the bot's app identity. (v1.1.1+) |
+| `create_doc_comment` | Create a new top-level comment on a Feishu doc. Owner-only. (v1.1.1+) |
 
 ---
 
