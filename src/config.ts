@@ -127,6 +127,21 @@ export const appConfig = {
   allowedChatIds: optionalList('LARK_ALLOWED_CHAT_IDS'),
   textChunkLimit: optionalNumber('LARK_TEXT_CHUNK_LIMIT', 4000),
   ackEmoji: optional('LARK_ACK_EMOJI', 'MeMeMe'),
+  // #187 v1.2.0: ack reaction on inbound doc-comment events. Defaults to
+  // `THUMBSUP` so users get immediate visual feedback that the bot saw
+  // their comment even before Claude's processing finishes (typically
+  // 2-30s). Empty string disables the reaction entirely — no revoke,
+  // no tracker, no TTL: the doc-comment context is async/collaborative
+  // so the reaction lives as a persistent audit marker (per the
+  // design discussion in #187), not as residue to clean up.
+  //
+  // `optional` returns the fallback when env is undefined OR empty, so
+  // an explicit `LARK_DOC_COMMENT_ACK_EMOJI=` (empty) reaches the
+  // consumer as `''` via the `process.env[KEY] || fallback` short-circuit
+  // — but that means "unset" and "explicitly empty" both collapse to
+  // the default `THUMBSUP`. To support the documented "empty disables"
+  // contract, read the raw env here and only fall back when undefined.
+  docCommentAckEmoji: process.env.LARK_DOC_COMMENT_ACK_EMOJI ?? 'THUMBSUP',
   botMessageTrackerSize: optionalNumber('LARK_BOT_MESSAGE_TRACKER_SIZE', 500),
   cronScanInterval: optionalNumber('LARK_CRON_SCAN_INTERVAL', 60),
   cronTimezone: optional('LARK_CRON_TIMEZONE', Intl.DateTimeFormat().resolvedOptions().timeZone),
