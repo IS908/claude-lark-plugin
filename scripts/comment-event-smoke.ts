@@ -62,10 +62,15 @@ function makeEvent(overrides: Partial<{ event_id: string; is_mentioned: boolean;
 }
 
 function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps & {
-  handlerCalls: any[]; commentGetCalls: any[]; metaCalls: any[];
+  handlerCalls: any[]; commentRepliesListCalls: any[]; commentListCalls: any[]; metaCalls: any[];
 } {
   const handlerCalls: any[] = [];
-  const commentGetCalls: any[] = [];
+  // v1.1.2 (#185): handleCommentEvent now calls fileCommentReply.list (for
+  // body + parentBody) + fileComment.list (for quote) in parallel, replacing
+  // the old fileComment.get. The recorder arrays track each separately so
+  // tests can assert which endpoints fired.
+  const commentRepliesListCalls: any[] = [];
+  const commentListCalls: any[] = [];
   const metaCalls: any[] = [];
   const session = new IdentitySession(() => 'ou_owner_for_test');
   const deps: CommentEventDeps = {
@@ -77,13 +82,38 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
     resolveUserName: async (openId) => `name_for_${openId}`,
     client: {
       drive: {
-        fileComment: {
-          get: async (params: any) => {
-            commentGetCalls.push(params);
+        fileCommentReply: {
+          list: async (params: any) => {
+            commentRepliesListCalls.push(params);
             return {
               data: {
-                quote: 'quoted text',
-                reply_list: { replies: [{ reply_id: params.path.comment_id, content: { text: 'body' } }] },
+                // Per Feishu data model (verified in #185): items[0] is the
+                // original comment body; subsequent items are reply chain.
+                items: [
+                  {
+                    reply_id: params.path.comment_id,
+                    content: { elements: [{ type: 'text_run', text_run: { text: 'body' } }] },
+                  },
+                ],
+                has_more: false,
+              },
+            };
+          },
+        },
+        fileComment: {
+          list: async (params: any) => {
+            commentListCalls.push(params);
+            return {
+              data: {
+                items: [
+                  {
+                    comment_id: 'cmt_001',  // matches default makeEvent comment_id
+                    quote: 'quoted text',
+                    is_whole: false,
+                    reply_list: { replies: [] },
+                  },
+                ],
+                has_more: false,
               },
             };
           },
@@ -98,7 +128,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
     } as any,
     ...overrides,
   };
-  return Object.assign(deps, { handlerCalls, commentGetCalls, metaCalls });
+  return Object.assign(deps, { handlerCalls, commentRepliesListCalls, commentListCalls, metaCalls });
 }
 
 // 1. dedup: same event_id processed twice → handler called once
@@ -115,7 +145,8 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   const deps = makeDeps();
   await handleCommentEvent(makeEvent({ is_mentioned: false }), deps);
   if (deps.handlerCalls.length !== 0) fail(`2: is_mentioned=false should drop`);
-  if (deps.commentGetCalls.length !== 0) fail(`2: should not pre-fetch`);
+  if (deps.commentRepliesListCalls.length !== 0) fail(`2: should not pre-fetch (replies.list)`);
+  if (deps.commentListCalls.length !== 0) fail(`2: should not pre-fetch (comment.list)`);
 }
 
 // 3. to_user_id != bot dropped (defensive)
@@ -132,25 +163,37 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (deps.handlerCalls.length !== 0) fail(`4: bot's own comment must be dropped`);
 }
 
-// 5. add_comment (no reply_id): pre-fetch + envelope has <body> not <parent>
+// 5. add_comment (no reply_id): pre-fetch fires BOTH list endpoints + envelope
+// has <body> not <parent>. v1.1.2 (#185): pre-fix called fileComment.get once;
+// post-fix calls fileCommentReply.list (for body) + fileComment.list (for quote)
+// in parallel.
 {
   const deps = makeDeps();
   await handleCommentEvent(makeEvent({ comment_id: 'cmt_5', reply_id: undefined }), deps);
-  if (deps.commentGetCalls.length !== 1) fail(`5: expected 1 fileComment.get call`);
-  const call = deps.commentGetCalls[0];
-  if (call.path?.comment_id !== 'cmt_5') fail(`5: comment_id not passed`);
-  if (call.path?.file_token !== 'dox_test') fail(`5: file_token not passed`);
+  if (deps.commentRepliesListCalls.length !== 1) fail(`5: expected 1 fileCommentReply.list call`);
+  if (deps.commentListCalls.length !== 1) fail(`5: expected 1 fileComment.list call (for quote)`);
+  const repliesCall = deps.commentRepliesListCalls[0];
+  if (repliesCall.path?.comment_id !== 'cmt_5') fail(`5: comment_id not passed to replies.list`);
+  if (repliesCall.path?.file_token !== 'dox_test') fail(`5: file_token not passed to replies.list`);
+  const commentsCall = deps.commentListCalls[0];
+  if (commentsCall.path?.file_token !== 'dox_test') fail(`5: file_token not passed to comment.list`);
   if (deps.handlerCalls.length !== 1) fail(`5: expected 1 handler call`);
   const msg = deps.handlerCalls[0];
   if (!msg.text.includes('<body>')) fail(`5: envelope missing <body>: ${msg.text.slice(0, 200)}`);
   if (msg.text.includes('<parent>')) fail(`5: add_comment must not have <parent>`);
 }
 
-// 7. pre-fetch throws → handler still called with <fetch_error>, event not dropped
+// 7. pre-fetch throws → handler still called with <fetch_error>, event not dropped.
+// v1.1.2 (#185): both fileCommentReply.list and fileComment.list run in parallel
+// via Promise.allSettled (round-1 review I-1). Both rejecting hits the dual-failure
+// branch that surfaces <fetch_error>. We mock both throwing to lock in this
+// dual-rejection behavior; case 7c covers the partial-failure (replies OK,
+// comments fail) path that v1.1.1's Promise.all would have incorrectly wiped.
 {
   const failingClient = {
     drive: {
-      fileComment: { get: async () => { throw new Error('feishu boom'); } },
+      fileCommentReply: { list: async () => { throw new Error('feishu replies boom'); } },
+      fileComment: { list: async () => { throw new Error('feishu comments boom'); } },
       meta: { batchQuery: async () => ({ data: { metas: [] } }) },
     },
   };
@@ -160,13 +203,27 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (!deps.handlerCalls[0].text.includes('<fetch_error>')) fail(`7: envelope missing <fetch_error>`);
 }
 
-// 8. doc_title fetch failure → no doc_title attribute, handler still called
+// 8. doc_title fetch failure → no doc_title attribute, handler still called.
+// v1.1.2 (#185): replies + comments come from the two list endpoints.
 {
   const noTitleClient = {
     drive: {
+      fileCommentReply: {
+        list: async (params: any) => ({
+          data: {
+            items: [
+              {
+                reply_id: params.path.comment_id,
+                content: { elements: [{ type: 'text_run', text_run: { text: 'b' } }] },
+              },
+            ],
+            has_more: false,
+          },
+        }),
+      },
       fileComment: {
-        get: async (params: any) => ({
-          data: { quote: '', reply_list: { replies: [{ reply_id: params.path.comment_id, content: { text: 'b' } }] } },
+        list: async () => ({
+          data: { items: [{ comment_id: 'cmt_8', quote: '', is_whole: false, reply_list: { replies: [] } }], has_more: false },
         }),
       },
       meta: { batchQuery: async () => { throw new Error('meta boom'); } },
@@ -200,19 +257,31 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (text.includes('&amp;quot;')) fail(`7b: quote re-escaped: ${text.slice(0, 300)}`);
 }
 
-// 6. add_reply: <parent> = reply_list[0], <body> = matched reply
+// 6. add_reply: <parent> = items[0] (original comment), <body> = matched reply
+// from items[]. v1.1.2 (#185): items[] now comes from fileCommentReply.list,
+// preserving the Feishu data model where items[0] is the original comment body.
 {
   const replyClient = {
     drive: {
+      fileCommentReply: {
+        list: async () => ({
+          data: {
+            items: [
+              { reply_id: 'cmt_6_parent', content: { elements: [{ type: 'text_run', text_run: { text: 'parent body' } }] } },
+              { reply_id: 'cmt_6_r1', content: { elements: [{ type: 'text_run', text_run: { text: 'first reply body' } }] } },
+              { reply_id: 'cmt_6_r2', content: { elements: [{ type: 'text_run', text_run: { text: 'target reply body' } }] } },
+            ],
+            has_more: false,
+          },
+        }),
+      },
       fileComment: {
-        get: async () => ({ data: {
-          quote: 'q',
-          reply_list: { replies: [
-            { reply_id: 'cmt_6_parent', content: { text: 'parent body' } },
-            { reply_id: 'cmt_6_r1', content: { text: 'first reply body' } },
-            { reply_id: 'cmt_6_r2', content: { text: 'target reply body' } },
-          ]},
-        } }),
+        list: async () => ({
+          data: {
+            items: [{ comment_id: 'cmt_6_parent', quote: 'q', is_whole: false, reply_list: { replies: [] } }],
+            has_more: false,
+          },
+        }),
       },
       meta: { batchQuery: async () => ({ data: { metas: [{ title: 'D' }] } }) },
     },
@@ -224,16 +293,30 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   const text = deps.handlerCalls[0]?.text ?? '';
   if (!text.includes('<parent>parent body</parent>')) fail(`6: parent wrong: ${text.slice(0,300)}`);
   if (!text.includes('<body>target reply body</body>')) fail(`6: body wrong: ${text.slice(0,300)}`);
+  // PR #186 round 1 M-4: the mock already returns `quote: 'q'` on the matching
+  // comment_id, so the envelope should render `<selected_text>q</selected_text>`.
+  // Previously this case only asserted parent/body — the quote leg was uncovered.
+  if (!text.includes('<selected_text>q</selected_text>')) fail(`6: quote should render as selected_text: ${text.slice(0,300)}`);
 }
 
-// 14. reply_id not in reply_list → body marked unknown, no throw
+// 14. reply_id not in fileCommentReply.list items → body marked unknown, no throw.
+// v1.1.2 (#185): items[] is the new shape. The matching reply_id is absent,
+// so body falls through to undefined → envelope renders <body unknown="true">.
 {
   const partialClient = {
     drive: {
+      fileCommentReply: {
+        list: async () => ({
+          data: {
+            items: [
+              { reply_id: 'cmt_14_parent', content: { elements: [{ type: 'text_run', text_run: { text: 'p' } }] } },
+            ],
+            has_more: false,
+          },
+        }),
+      },
       fileComment: {
-        get: async () => ({ data: {
-          reply_list: { replies: [{ reply_id: 'cmt_14_parent', content: { text: 'p' } }] },
-        } }),
+        list: async () => ({ data: { items: [], has_more: false } }),
       },
       meta: { batchQuery: async () => ({ data: { metas: [] } }) },
     },
@@ -297,11 +380,29 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (msg.chatId !== 'doc:dox_test') fail(`11: chatId on LarkMessage wrong`);
 }
 
-// 12. quote === '' → no <selected_text> tag
+// 12. quote === '' → no <selected_text> tag.
+// v1.1.2 (#185): quote now comes from fileComment.list's matching item.
 {
   const noQuote = {
     drive: {
-      fileComment: { get: async () => ({ data: { quote: '', reply_list: { replies: [{ reply_id: 'cmt_001', content: { text: 'x' } }] } } }) },
+      fileCommentReply: {
+        list: async () => ({
+          data: {
+            items: [
+              { reply_id: 'cmt_001', content: { elements: [{ type: 'text_run', text_run: { text: 'x' } }] } },
+            ],
+            has_more: false,
+          },
+        }),
+      },
+      fileComment: {
+        list: async () => ({
+          data: {
+            items: [{ comment_id: 'cmt_001', quote: '', is_whole: false, reply_list: { replies: [] } }],
+            has_more: false,
+          },
+        }),
+      },
       meta: { batchQuery: async () => ({ data: { metas: [] } }) },
     },
   };
@@ -330,7 +431,8 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
     deps,
   );
   if (deps.handlerCalls.length !== 0) fail(`15: SECURITY: non-whitelisted sender must be dropped`);
-  if (deps.commentGetCalls.length !== 0) fail(`15: SECURITY: pre-fetch must not run for whitelisted-out user`);
+  if (deps.commentRepliesListCalls.length !== 0) fail(`15: SECURITY: pre-fetch must not run for whitelisted-out user (replies.list)`);
+  if (deps.commentListCalls.length !== 0) fail(`15: SECURITY: pre-fetch must not run for whitelisted-out user (comment.list)`);
 }
 
 // 17. I-1: chat-list-only config must NOT block doc-comment events. Pre-fix
@@ -392,4 +494,90 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   if (bobCaller !== 'ou_bob') fail(`16: bob's session lost (got ${bobCaller})`);
 }
 
-console.error(`PASS: 20 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race + chat-list-only doc-comment + user-list gate)`);
+// 19. SECURITY/UX: anchored (is_whole=false) comment pre-fetches via list endpoints (#185)
+//   Pre-fix path used fileComment.get which 404s for anchored comments (the
+//   typical UX for @-mentioning the bot inside a docx — user highlights text
+//   + types @bot). Whole-doc comments worked; anchored ones returned
+//   <fetch_error>404</fetch_error> with empty <body>. Post-fix uses
+//   fileCommentReply.list + fileComment.list which work for BOTH is_whole
+//   variants. This case locks in the new endpoints firing AND quote retrieval
+//   from the matching comment item AND body extraction from the replies item.
+{
+  let repliesCalled = false;
+  let commentsCalled = false;
+  const deps = makeDeps({
+    client: {
+      drive: {
+        fileCommentReply: {
+          list: async (_params: any) => {
+            repliesCalled = true;
+            return {
+              data: {
+                items: [
+                  { reply_id: 'cmt_19_target', content: { elements: [{ type: 'text_run', text_run: { text: 'anchored body' } }] } },
+                ],
+                has_more: false,
+              },
+            };
+          },
+        },
+        fileComment: {
+          list: async (_params: any) => {
+            commentsCalled = true;
+            return {
+              data: {
+                items: [
+                  { comment_id: 'cmt_19_target', is_whole: false, quote: 'highlighted text', reply_list: { replies: [] } },
+                ],
+                has_more: false,
+              },
+            };
+          },
+        },
+        meta: { batchQuery: async () => ({ data: { metas: [{ title: 'Anchored Doc' }] } }) },
+      },
+    } as any,
+  });
+  await handleCommentEvent(makeEvent({ comment_id: 'cmt_19_target' }), deps);
+  if (!repliesCalled) fail('19: fileCommentReply.list must be called');
+  if (!commentsCalled) fail('19: fileComment.list must be called (for quote)');
+  const text = deps.handlerCalls[0]?.text ?? '';
+  if (!text.includes('<body>anchored body</body>')) fail(`19: anchored body missing: ${text.slice(0,300)}`);
+  if (!text.includes('<selected_text>highlighted text</selected_text>')) {
+    fail(`19: quote should surface as selected_text: ${text.slice(0,300)}`);
+  }
+}
+
+// 7c. PR #186 round 1 M-3: partial failure (replies succeeds, comments fails).
+//   Quote is auxiliary; quote-only failure must NOT wipe body delivery (the
+//   pre-I-1 Promise.all code would have surfaced <fetch_error> and an empty
+//   body here). Post-I-1 Promise.allSettled lets the resolved body render and
+//   omits <selected_text> without poisoning the envelope.
+{
+  const partialClient = {
+    drive: {
+      fileCommentReply: {
+        list: async () => ({
+          data: {
+            items: [
+              { reply_id: 'cmt_001', content: { elements: [{ type: 'text_run', text_run: { text: 'body delivered' } }] } },
+            ],
+            has_more: false,
+          },
+        }),
+      },
+      fileComment: {
+        list: async () => { throw new Error('comments list rate-limited'); },
+      },
+      meta: { batchQuery: async () => ({ data: { metas: [{ title: 'D' }] } }) },
+    },
+  };
+  const deps = makeDeps({ client: partialClient as any });
+  await handleCommentEvent(makeEvent({ comment_id: 'cmt_001' }), deps);
+  const text = deps.handlerCalls[0]?.text ?? '';
+  if (text.includes('<fetch_error>')) fail(`7c: quote-only failure must NOT surface fetch_error: ${text.slice(0,300)}`);
+  if (!text.includes('<body>body delivered</body>')) fail(`7c: body must render despite quote failure: ${text.slice(0,300)}`);
+  if (text.includes('<selected_text>')) fail(`7c: quote-only failure must omit selected_text: ${text.slice(0,300)}`);
+}
+
+console.error(`PASS: 22 cases (filters + whitelist + pre-fetch happy + fetch errors + escape ordering + add_reply + unknown body + queue + setCaller + chatType + quote + escape + session race + chat-list-only doc-comment + user-list gate + anchored is_whole=false #185 + partial-failure allSettled #186)`);
