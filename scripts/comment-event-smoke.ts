@@ -206,6 +206,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // comments fail) path that v1.1.1's Promise.all would have incorrectly wiped.
 {
   const failingClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: { list: async () => { throw new Error('feishu replies boom'); } },
       fileComment: { list: async () => { throw new Error('feishu comments boom'); } },
@@ -222,6 +223,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // v1.1.2 (#185): replies + comments come from the two list endpoints.
 {
   const noTitleClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async (params: any) => ({
@@ -277,6 +279,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // preserving the Feishu data model where items[0] is the original comment body.
 {
   const replyClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async () => ({
@@ -319,6 +322,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // so body falls through to undefined → envelope renders <body unknown="true">.
 {
   const partialClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async () => ({
@@ -399,6 +403,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 // v1.1.2 (#185): quote now comes from fileComment.list's matching item.
 {
   const noQuote = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async () => ({
@@ -522,6 +527,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
   let commentsCalled = false;
   const deps = makeDeps({
     client: {
+      request: async () => ({ data: {} }),
       drive: {
         fileCommentReply: {
           list: async (_params: any) => {
@@ -570,6 +576,7 @@ function makeDeps(overrides: Partial<CommentEventDeps> = {}): CommentEventDeps &
 //   omits <selected_text> without poisoning the envelope.
 {
   const partialClient = {
+    request: async () => ({ data: {} }),
     drive: {
       fileCommentReply: {
         list: async () => ({

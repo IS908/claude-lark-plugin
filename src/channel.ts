@@ -423,6 +423,9 @@ async function ackReact(
       url: `https://open.feishu.cn/open-apis/drive/v2/files/${encodeURIComponent(fileToken)}/comments/reaction`,
       method: 'POST',
       params: { file_type: fileType },
+      // NOTE: bare string here — IM ack (see message-reaction.create call
+      // below) uses nested { emoji_type: emoji } per the IM message-reaction
+      // API. Don't unify; these are different endpoint contracts.
       data: { action: 'add', reaction_type: emoji, reply_id: replyId },
     });
   } catch (e: any) {
