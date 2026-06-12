@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.0] - 2026-06-12
+
+### Added
+- **Content-hash dedup of memory_context injection on hot threads** (#189). `enrichWithMemory` used to inject the same-shaped slab (profile, mentioned profiles, episodes, skills — ~7–10 KB) on every inbound message; on a thread follow-up the previous turn's copy is still in the main loop's conversation history, so the re-injection was pure duplication accumulating in history forever. Now each block carries a stable `dedupKey` (`profile:<ownerId>`, `thread_episode:<file>`, `skill:<slug>`, …) and is injected only if it was never seen in the `(chatId, threadId)` scope, its content hash changed, or its last injection is older than `LARK_MEMORY_DEDUP_WINDOW_MS` (default 30 min; `0` disables and restores pre-1.3.0 behavior).
+
+  **Design follows the #189 issue discussion, not the original strawman**: a single hash-dedup mechanism replaces the per-block-type follow-up rules table. Profile changes mid-thread re-inject automatically (hash change); a mid-thread flush writing a new episode is a new key; group multi-user threads work because the profile key embeds the owner id — user B's first message in a hot thread still injects B's profile after A's was suppressed.
+
+  **Stubs, not silence, for profiles**: a suppressed `profile` / `mentioned_profile` renders as a ~150-byte envelope-wrapped stub (`label="… · unchanged"`) so Claude can distinguish "deliberately omitted, see history" from "this user has no profile". Episodes/skills are omitted silently — absence of search hits is their normal case. Every emitted part, stubs included, still goes through `wrapEnrichmentSection` (#189 open question 5: no exception to the #114 trust envelope on the suppressed path).
+
+  **Absolute TTL, not sliding**: suppression does not refresh the injection timestamp, so even a continuously-hot thread re-grounds every block at least once per window. This bounds the staleness exposure to Claude-Code-side compaction / `/clear` / restart, which the plugin cannot observe (#190 discussion). The 30-min default is deliberately NOT the 5-min prompt-cache TTL from the issue text — suppression's precondition is "the prior copy is still in conversation history", which holds until compaction, not until cache expiry.
+
+### Implementation
+- `src/enrichment-dedup.ts` (new): `EnrichmentDedup` (per-scope LRU, max 2000 scopes × 64 keys, injectable clock) + `renderEnrichmentParts` (decision → envelope-wrapped parts + byte stats). State is in-memory only; plugin restart ⇒ full re-injection (the desired recovery semantics, #189 open question 1).
+- `src/channel.ts:enrichWithMemory`: refactored from inline `parts.push(wrap(...))` to collect `DedupBlock[]` → `enrichmentDedup.filter(...)` → `renderEnrichmentParts(...)`. Volatile label parts (search score, date tag) stay out of `dedupKey`, so score drift alone does not defeat dedup. Added the #189 measurement hook: one `[enrich-dedup]` debug.log line per enriched turn (injected/suppressed counts + bytes + stubs) so operators can evaluate cost/benefit before tuning the window.
+- `src/config.ts`: new `memoryDedupWindowMs` via `LARK_MEMORY_DEDUP_WINDOW_MS` (default `30 * 60 * 1000`).
+- `scripts/enrichment-dedup-smoke.ts` (new, wired into `scripts/test.sh`): 14 cases — disable switch, suppress/re-inject on hash change, window expiry, absolute-TTL semantics (suppression must not refresh the timestamp), scope isolation (thread vs thread vs thread-less), group multi-user profile keying, outer-LRU eviction, decision ordering, stub rendering through the envelope (incl. hostile-label escaping), and silent omission for episode kinds.
+
+### Migration
+- Default behavior changes: on hot threads, repeat blocks are suppressed within 30 min. Operators preferring the old inject-everything-every-turn behavior: `LARK_MEMORY_DEDUP_WINDOW_MS=0`.
+- No new Feishu scopes; doc-comment and cronjob paths are unaffected (they do not run `enrichWithMemory`).
+- Deferred (tracked in #189 discussion): thread-prioritized chat-episode trimming (`LARK_MEMORY_THREAD_PRIORITIZE`) and per-turn byte budget — both orthogonal to dedup and droppable until the measurement hook shows they're needed.
+
 ## [1.2.0] - 2026-06-07
 
 ### Added

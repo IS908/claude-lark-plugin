@@ -173,6 +173,22 @@ export const appConfig = {
   // episode budget in line with the system-prompt envelope.
   episodeWriteCapBytes: optionalNumber('LARK_EPISODE_WRITE_CAP_BYTES', 8 * 1024),
   episodeInjectCapBytes: optionalNumber('LARK_EPISODE_INJECT_CAP_BYTES', 2 * 1024),
+  // #189 — content-hash dedup of memory_context blocks on hot threads.
+  //
+  // Within this window, a block whose content hash is unchanged since
+  // its last injection into the same (chatId, threadId) scope is
+  // suppressed (profiles render as a ~150-byte "unchanged" stub;
+  // episodes/skills are omitted) — the model already has the full copy
+  // in conversation history from the prior turn. 0 disables dedup and
+  // restores pre-v1.3.0 inject-everything-every-turn behavior.
+  //
+  // Default 30 min, NOT the 5-min prompt-cache TTL from the original
+  // issue text: suppression's real precondition is "the prior copy is
+  // still in conversation history", which holds until Claude-Code-side
+  // compaction / clear / restart — events the plugin cannot observe
+  // (#190 discussion). The absolute-TTL re-injection (see
+  // enrichment-dedup.ts) bounds worst-case staleness to one window.
+  memoryDedupWindowMs: optionalNumber('LARK_MEMORY_DEDUP_WINDOW_MS', 30 * 60 * 1000),
   // #113 — autonomous profile distillation (Stage 2: Episodes → Profile).
   //
   // OFF by default. Operator opts in by setting LARK_PROFILE_DISTILL_ENABLED=true.

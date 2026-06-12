@@ -275,6 +275,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 | `LARK_MIN_SEARCH_SCORE` | `0.3` | Minimum similarity score for memory search results |
 | `LARK_MAX_SEARCH_RESULTS` | `2` | Maximum number of memory search results to inject |
 | `LARK_INACTIVITY_HOURS` | `3` | Hours of inactivity before buffer flush to episodic memory |
+| `LARK_MEMORY_DEDUP_WINDOW_MS` | `1800000` (30 min) | Hot-thread dedup window for memory_context injection (v1.3.0+, #189). Within the window, blocks whose content is unchanged since their last injection into the same chat/thread are suppressed — profiles render a small "unchanged" stub, episodes/skills are omitted. `0` disables dedup (inject everything every turn, pre-v1.3.0 behavior). |
 
 ### Optional -- Identity / privacy (v0.9.0+)
 
