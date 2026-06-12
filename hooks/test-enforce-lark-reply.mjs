@@ -4,7 +4,7 @@
 // asserting expected exit codes and audit log status.
 
 import { spawnSync } from 'node:child_process';
-import { writeFileSync, mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, readFileSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1853,6 +1853,24 @@ console.log('\n[S8] stop_hook_active loop-break skips the stats write (accepted 
   const r = runHook({ transcriptPath: path, sessionId: 'sess-s8', stopHookActive: true, extraEnv: { LARK_SESSION_STATS_PATH: file } });
   assertEq(r.exitCode, 0, 'loop-break still exits 0');
   assertEq(existsSync(file), false, 'no stats write on the loop-break path');
+}
+
+console.log('\n[S10] day-old orphaned tmp files are swept; fresh ones untouched');
+{
+  const file = join(tmp, 'stats-s10.json');
+  const oldTmp = `${file}.tmp-99991`;
+  const freshTmp = `${file}.tmp-99992`;
+  writeFileSync(oldTmp, '{}');
+  writeFileSync(freshTmp, '{}');
+  const dayAgo = new Date(Date.now() - 25 * 3_600_000);
+  utimesSync(oldTmp, dayAgo, dayAgo);
+  const path = writeTranscript('stats-sweep', [
+    makeAssistantWithUsage({ input_tokens: 3, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }),
+  ]);
+  runHook({ transcriptPath: path, sessionId: 'sess-s10', extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  assertEq(existsSync(oldTmp), false, '25h-old orphan tmp deleted');
+  assertEq(existsSync(freshTmp), true, 'fresh tmp (possible live writer) untouched');
+  assertEq(readStats(file)?.sessions?.['sess-s10']?.context_tokens, 3, 'stats written normally');
 }
 
 console.log('\n[S9] zeroed usage entry falls back to the previous valid measurement');

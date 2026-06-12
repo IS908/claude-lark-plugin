@@ -436,4 +436,22 @@ function readyHarness(tokens = 900_000): Harness {
   if (sent.length !== 1) fail('exactly one send despite the overlap');
 }
 
+// 24. Re-arm floor ratchets DOWN after a second, deeper compact —
+//     stale high floors must not suppress nudges on fresh regrowth
+//     (round-2 review finding 1)
+{
+  testNum++;
+  const h = readyHarness(1_200_000);
+  await h.monitor.tick(); // rung 1 at 1.2M
+  h.clock.add(30 * 60_000);
+  h.setStats(statsWith(800_000, -1000, h.clock.now()));
+  if ((await h.monitor.tick()) !== 'episode-closed') fail('first compact closes (floor 1M)');
+  h.clock.add(30 * 60_000);
+  h.setStats(statsWith(500_000, -1000, h.clock.now())); // second, deeper compact
+  if ((await h.monitor.tick()) !== 'rearm-floor') fail('still floored while shrinking');
+  h.clock.add(30 * 60_000);
+  h.setStats(statsWith(700_000, -1000, h.clock.now())); // ≥ 500k×1.25=625k, but < old 1M floor
+  if ((await h.monitor.tick()) !== 'nudged') fail('floor must ratchet to 25% above the LOWEST observed level, not stay at 1M');
+}
+
 console.error(`session-nudge smoke: all ${testNum} cases passed`);

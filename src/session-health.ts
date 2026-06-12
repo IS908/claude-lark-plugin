@@ -75,7 +75,11 @@ export interface SessionHealthDeps {
   readStats: () => SessionStatsFile | null;
   /** Sends the owner DM. Rejections are caught and retried after a backoff. */
   sendOwnerNudge: (text: string) => Promise<void>;
-  /** True when no conversation chain is in flight (queue depth 0). */
+  /**
+   * Best-effort "nothing in flight" signal (the index.ts wiring uses
+   * queue depth 0 AND no pending IM ack reactions). NOT an invariant —
+   * a long Claude turn can outlive every available signal.
+   */
   isQuiet: () => boolean;
   now?: () => number;
   log?: (msg: string) => void;
@@ -269,7 +273,27 @@ export class SessionHealthMonitor {
     // firing a spurious cross-session close or honoring a foreign
     // floor (round-1 review finding 2).
     if (this.episodeSessionId !== null && heaviest.sessionId !== this.episodeSessionId) {
+      // KNOWN LIMITATION (round-2 review finding 2, accepted): episode
+      // state is single-slot. Two concurrently-heavy sessions whose
+      // "heaviest" rank alternates reset each other, laundering
+      // exhaustion/floors — worst case a bounded drumbeat (15-min
+      // attempt backoff + idle/quiet gates still apply), not spam. A
+      // per-session episode map would fix it; not worth the state for
+      // an owner-facing reminder in a one-megasession deployment.
       this.resetEpisode();
+    }
+
+    // Ratchet a live re-arm floor DOWN as the same session shrinks
+    // further (round-2 review finding 1): after "nudge at 1.2M →
+    // compact to 800k (floor 1M) → second compact to 100k", a stale 1M
+    // floor would suppress nudges across the whole [threshold, 1M]
+    // band on fresh regrowth. The floor's contract is "25% above the
+    // lowest level the operator compacted to", so track that level.
+    if (this.nudgeCount === 0 && this.rearmFloorTokens > 0) {
+      this.rearmFloorTokens = Math.min(
+        this.rearmFloorTokens,
+        Math.max(this.cfg.tokenThreshold, Math.round(heaviest.tokens * EPISODE_REARM_GROWTH_RATIO)),
+      );
     }
 
     // Close-on-drop: a fresh measurement at ≤70% of the last-nudged
