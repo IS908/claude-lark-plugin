@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.4.0] - 2026-06-12
+
+### Added
+- **Session-health nudge — the semi-automatic resolution of #190.** The original issue wanted the plugin to inject `/compact`/`/clear` into the Claude Code main loop at idle boundaries; the feasibility verification (see #190 discussion) established that **no programmatic trigger exists** (hooks observe only — `PreCompact` cannot initiate; the Skill tool excludes built-ins; the Agent SDK has no compaction API; parallel session resume is unsafe) and that the session is shared with the operator's own terminal work, vetoing autonomous clears outright. This release ships the issue's state machine with the actuator swapped to the operator:
+  - **Measurement** (Stop hook): `hooks/enforce-lark-reply.mjs` now records each session's exact current context size — the transcript's last main-loop assistant `usage` (`input + cache_read + cache_creation`; sidechain/subagent entries skipped) — into a sidecar `session-stats.json`, keyed per `session_id` (several sessions share the hook: bot megasession + dev sessions). Pruned at 48 h / 32 entries; atomic tmp+rename; wrapped in its own try/catch so stats failures can never influence the hook's verdict (measured ~0.9 M tokens on the reference deployment — exact, no estimation).
+  - **Nudge** (plugin): new `SessionHealthMonitor` (`src/session-health.ts`, 60 s unref'd tick) sends the OWNER one Feishu DM when ALL of: heaviest recent session > `LARK_SESSION_NUDGE_TOKEN_THRESHOLD` (default 400 k), channel inbound-idle > `LARK_SESSION_NUDGE_IDLE_MS` (default 30 min, reset by every forwarded message), queue quiet (`MessageQueue.pending === 0`), cooldown elapsed (`LARK_SESSION_NUDGE_COOLDOWN_MS`, default 6 h). DM failure applies a 15 min retry backoff without consuming the cooldown. Off by default (`LARK_SESSION_NUDGE_ENABLED=true` + `LARK_OWNER_OPEN_ID` required). The DM suggests typing `/compact` (or `/clear`) **now, at the idle boundary** — instead of fullness-driven auto-compaction firing mid-burst.
+  - **Prevention** (`mcpServerInstructions`): the host session is now told to delegate heavy multi-step channel tasks to subagents — subagent transcripts stay out of main-loop history, attacking the dominant share of accumulation at the source.
+
+### Implementation
+- `src/session-health.ts` (new): `SessionHealthMonitor` (injectable clock/deps, gating order disabled → no-stats → below-threshold → not-idle → busy → cooldown → retry-wait), `heaviestRecentSession` (per-session map scan, rejects stale/future/malformed entries), `readStatsFile` (fail-quiet).
+- `hooks/enforce-lark-reply.mjs`: `writeSessionStats` called right after transcript load so every early-exit path still records; `hooks/test-enforce-lark-reply.mjs` gains a default tmp `LARK_SESSION_STATS_PATH` for ALL spawns (keeps the suite out of the real sidecar) + 6 new cases (S1–S6: exact sum, no-usage no-file, corruption recovery, sidechain skip, unwritable-path verdict isolation, prune semantics).
+- `src/queue.ts`: `get pending()` — in-flight chain count for the quiet gate. `src/channel.ts`: `getQueueDepth()`. `src/index.ts`: monitor wiring; `noteInbound()` piggybacks on the existing message handler (covers IM / doc-comment / reaction / cronjob injection with zero channel changes); nudge DM intentionally NOT registered in `BotMessageTracker` (reactions on operator-facing plumbing should not reach Claude).
+- `scripts/session-nudge-smoke.ts` (new, wired into `scripts/test.sh`): 12 cases — disable switch, stats gating, threshold, startup idle guard, `noteInbound` reset, busy gate, happy path + cooldown, cooldown re-arm, stale-stats rejection, send-failure backoff cycle, heaviest-selection robustness (stale/future/garbage entries), start/stop idempotence.
+
+### Migration
+- Fully opt-in: default behavior is unchanged (`LARK_SESSION_NUDGE_ENABLED` defaults to false; the Stop hook's stats write is passive and fail-quiet).
+- No new Feishu scopes (owner DM uses the existing `im:message` send permission, same as scheduler owner notices).
+- Deferred to upstream: a programmatic compact trigger (feature request to Claude Code — hook return value or SDK API) would allow replacing the DM with direct action; #190's snapshot/restore design stays parked until then.
+
 ## [1.3.1] - 2026-06-12
 
 ### Fixed

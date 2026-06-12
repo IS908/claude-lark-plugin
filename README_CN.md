@@ -258,6 +258,18 @@ node -e "console.log(require('./package.json').version)"
 | `LARK_INACTIVITY_HOURS` | `3` | 自动蒸馏触发的静默时长（小时） |
 | `LARK_MEMORY_DEDUP_WINDOW_MS` | `1800000`（30 分钟） | 热线程 memory_context 注入去重窗口（v1.3.0+，#189）。窗口内，同一会话/线程中内容未变的记忆块不再重复注入——profile 渲染为小型 "unchanged" 占位块，episode/skill 直接省略。设为 `0`（或负数）关闭去重（恢复 v1.3.0 之前每轮全量注入的行为）。上限 24 小时（超出自动收紧） |
 
+### 可选 -- 会话健康（v1.4.0+，#190）
+
+Stop hook 在每次会话停止时把当前上下文的精确大小（取自 transcript 最后一条 `usage`）写入旁路统计文件。当最重的近期会话超过阈值、且通道空闲安静时，owner 会收到一条限频飞书 DM，建议在终端执行 `/compact`——让压缩发生在空闲边界而不是消息突发中途。Claude Code 没有可编程的 `/compact` 触发器（见 #190），所以执行者是人。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `LARK_SESSION_NUDGE_ENABLED` | `false` | 总开关。需要同时设置 `LARK_OWNER_OPEN_ID`（DM 接收人） |
+| `LARK_SESSION_NUDGE_TOKEN_THRESHOLD` | `400000` | 触发提醒的上下文 token 阈值 |
+| `LARK_SESSION_NUDGE_IDLE_MS` | `1800000`（30 分钟） | 通道需空闲此时长才会提醒 |
+| `LARK_SESSION_NUDGE_COOLDOWN_MS` | `21600000`（6 小时） | 两次提醒的最小间隔 |
+| `LARK_SESSION_STATS_PATH` | `~/.claude/channels/lark/session-stats.json` | 旁路统计文件路径（Stop hook 写、插件读） |
+
 ### 可选 -- 身份 / 隐私（v0.9.0+）
 
 | 变量 | 默认值 | 说明 |

@@ -213,6 +213,23 @@ export const appConfig = {
   // (#190 discussion). The absolute-TTL re-injection (see
   // enrichment-dedup.ts) bounds worst-case staleness to one window.
   memoryDedupWindowMs: dedupWindowMs(),
+  // #190 — session-health nudge (semi-automatic /compact reminder).
+  //
+  // OFF by default. There is NO programmatic /compact trigger in Claude
+  // Code (verified in the #190 discussion), so this is the actuator-
+  // swapped version of that issue's state machine: the Stop hook writes
+  // per-session context sizes to sessionStatsPath; when the heaviest
+  // recent session exceeds the token threshold AND the channel has been
+  // inbound-idle for idleMs AND the queue is quiet, the OWNER gets one
+  // rate-limited Feishu DM suggesting they type /compact in the
+  // terminal at this idle boundary. Requires LARK_OWNER_OPEN_ID.
+  sessionNudgeEnabled: (process.env.LARK_SESSION_NUDGE_ENABLED ?? '').toLowerCase() === 'true',
+  sessionNudgeTokenThreshold: optionalNumber('LARK_SESSION_NUDGE_TOKEN_THRESHOLD', 400_000),
+  sessionNudgeIdleMs: optionalNumber('LARK_SESSION_NUDGE_IDLE_MS', 30 * 60 * 1000),
+  sessionNudgeCooldownMs: optionalNumber('LARK_SESSION_NUDGE_COOLDOWN_MS', 6 * 60 * 60 * 1000),
+  sessionStatsPath:
+    process.env.LARK_SESSION_STATS_PATH ||
+    path.join(os.homedir(), '.claude', 'channels', 'lark', 'session-stats.json'),
   // #113 — autonomous profile distillation (Stage 2: Episodes → Profile).
   //
   // OFF by default. Operator opts in by setting LARK_PROFILE_DISTILL_ENABLED=true.

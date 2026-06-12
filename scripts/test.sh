@@ -127,6 +127,10 @@ echo "=== Enrichment dedup (hot-thread injection) unit checks ==="
 npx tsx scripts/enrichment-dedup-smoke.ts
 
 echo ""
+echo "=== Session-health nudge unit checks ==="
+npx tsx scripts/session-nudge-smoke.ts
+
+echo ""
 echo "=== Reaction event whitelist + identity unit checks ==="
 npx tsx scripts/reaction-event-smoke.ts
 

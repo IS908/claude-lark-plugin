@@ -13,6 +13,15 @@ export class MessageQueue {
     return `${chatId}::${threadId || '_'}`;
   }
 
+  /**
+   * Number of conversation chains currently in flight. Resolved chains
+   * self-delete in enqueue's finally, so 0 ⇒ nothing is processing —
+   * the #190 session-health monitor's "quiet" gate.
+   */
+  get pending(): number {
+    return this.chains.size;
+  }
+
   enqueue(
     chatId: string,
     threadId: string | undefined,

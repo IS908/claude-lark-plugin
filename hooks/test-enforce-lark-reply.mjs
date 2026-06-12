@@ -63,15 +63,25 @@ function readAuditTail(linesFromEnd = 1) {
   return all.slice(-linesFromEnd).join('\n');
 }
 
-function runHook({ transcriptPath, stopHookActive = false }) {
+// #190 — like TEST_AUDIT_LOG: every spawn defaults the session-stats
+// sidecar into the tmp dir so the suite never touches the user's real
+// ~/.claude/channels/lark/session-stats.json. Cases override via extraEnv.
+const TEST_STATS_FILE = join(tmp, 'session-stats.json');
+
+function runHook({ transcriptPath, stopHookActive = false, sessionId = 'test-session', extraEnv = {} }) {
   const stdin = JSON.stringify({
-    session_id: 'test-session',
+    session_id: sessionId,
     stop_hook_active: stopHookActive,
     transcript_path: transcriptPath,
     cwd: process.cwd(),
   });
   // Round 2 fix #2 — keep tests out of the user's real audit log.
-  const env = { ...process.env, LARK_HOOK_AUDIT_LOG: TEST_AUDIT_LOG };
+  const env = {
+    ...process.env,
+    LARK_HOOK_AUDIT_LOG: TEST_AUDIT_LOG,
+    LARK_SESSION_STATS_PATH: TEST_STATS_FILE,
+    ...extraEnv,
+  };
   const result = spawnSync('node', [HOOK], { input: stdin, encoding: 'utf-8', env });
   return {
     exitCode: result.status,
@@ -1691,6 +1701,113 @@ console.log('\n[63] errored reply_doc_comment + [LARK_DEFER] sentinel → defers
   ]);
   const r = runHook({ transcriptPath: path });
   assertEq(r.exitCode, 0, '[LARK_DEFER] satisfies even after errored reply_doc_comment');
+}
+
+// --- Session-stats sidecar (#190) ---
+
+function makeAssistantWithUsage(usage, extra = {}) {
+  return {
+    type: 'assistant',
+    ...extra,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'ok' }],
+      usage,
+    },
+  };
+}
+
+function readStats(file = TEST_STATS_FILE) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+console.log('\n[S1] assistant usage present → stats file records exact context size');
+{
+  const path = writeTranscript('stats-basic', [
+    makeAssistantWithUsage({ input_tokens: 1, cache_read_input_tokens: 891_874, cache_creation_input_tokens: 565, output_tokens: 10 }),
+  ]);
+  const file = join(tmp, 'stats-s1.json');
+  const r = runHook({ transcriptPath: path, sessionId: 'sess-s1', extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  assertEq(r.exitCode, 0, 'non-lark transcript still exits 0');
+  const stats = readStats(file);
+  assertEq(stats?.sessions?.['sess-s1']?.context_tokens, 892_440, 'context_tokens = input + cache_read + cache_creation');
+  assertEq(typeof stats?.sessions?.['sess-s1']?.ts, 'string', 'ts recorded');
+}
+
+console.log('\n[S2] no usage in transcript → no stats file');
+{
+  const path = writeTranscript('stats-nousage', [
+    makeUserMsg('plain message'),
+    makeAssistantText('no usage field here'),
+  ]);
+  const file = join(tmp, 'stats-s2.json');
+  runHook({ transcriptPath: path, sessionId: 'sess-s2', extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  assertEq(existsSync(file), false, 'stats file not created without usage');
+}
+
+console.log('\n[S3] corrupted existing stats file → overwritten cleanly');
+{
+  const file = join(tmp, 'stats-s3.json');
+  writeFileSync(file, '{not json!!');
+  const path = writeTranscript('stats-corrupt', [
+    makeAssistantWithUsage({ input_tokens: 5, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 }),
+  ]);
+  const r = runHook({ transcriptPath: path, sessionId: 'sess-s3', extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  assertEq(r.exitCode, 0, 'corrupted stats file never affects exit code');
+  assertEq(readStats(file)?.sessions?.['sess-s3']?.context_tokens, 105, 'fresh stats written over corruption');
+}
+
+console.log('\n[S4] sidechain usage after main entry is ignored');
+{
+  const path = writeTranscript('stats-sidechain', [
+    makeAssistantWithUsage({ input_tokens: 10, cache_read_input_tokens: 200, cache_creation_input_tokens: 0 }),
+    makeAssistantWithUsage({ input_tokens: 999_999, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, { isSidechain: true }),
+  ]);
+  const file = join(tmp, 'stats-s4.json');
+  runHook({ transcriptPath: path, sessionId: 'sess-s4', extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  assertEq(readStats(file)?.sessions?.['sess-s4']?.context_tokens, 210, 'main-loop usage wins over later sidechain entry');
+}
+
+console.log('\n[S5] stats write failure never affects the verdict (path under a file)');
+{
+  const blocker = join(tmp, 'stats-blocker');
+  writeFileSync(blocker, 'i am a file, not a directory');
+  const userContent =
+    '<channel source="plugin:lark:lark" chat_id="oc_test" message_id="om_s5" user="kk" chat_type="group">\nNeed answer\n</channel>';
+  const path = writeTranscript('stats-unwritable', [
+    makeUserMsg(userContent),
+    makeAssistantWithUsage({ input_tokens: 1, cache_read_input_tokens: 50, cache_creation_input_tokens: 0 }),
+  ]);
+  const r = runHook({
+    transcriptPath: path,
+    sessionId: 'sess-s5',
+    extraEnv: { LARK_SESSION_STATS_PATH: join(blocker, 'nested', 'stats.json') },
+  });
+  assertEq(r.exitCode, 2, 'unanswered lark message still blocks (exit 2) despite stats failure');
+}
+
+console.log('\n[S6] pruning: stale entries dropped, fresh foreign entries kept');
+{
+  const file = join(tmp, 'stats-s6.json');
+  const now = Date.now();
+  writeFileSync(file, JSON.stringify({
+    sessions: {
+      'sess-stale': { context_tokens: 999, ts: new Date(now - 49 * 3_600_000).toISOString() },
+      'sess-fresh-other': { context_tokens: 777, ts: new Date(now - 3_600_000).toISOString() },
+    },
+  }));
+  const path = writeTranscript('stats-prune', [
+    makeAssistantWithUsage({ input_tokens: 2, cache_read_input_tokens: 8, cache_creation_input_tokens: 0 }),
+  ]);
+  runHook({ transcriptPath: path, sessionId: 'sess-s6', extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  const stats = readStats(file);
+  assertEq(stats?.sessions?.['sess-stale'], undefined, '49h-old entry pruned');
+  assertEq(stats?.sessions?.['sess-fresh-other']?.context_tokens, 777, 'fresh foreign session preserved');
+  assertEq(stats?.sessions?.['sess-s6']?.context_tokens, 10, 'current session recorded');
 }
 
 // --- Summary ---
