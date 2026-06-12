@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.4.0] - 2026-06-12
+## [1.3.2] - 2026-06-12
 
 ### Added
 - **Session-health nudge — the semi-automatic resolution of #190.** The original issue wanted the plugin to inject `/compact`/`/clear` into the Claude Code main loop at idle boundaries; the feasibility verification (see #190 discussion) established that **no programmatic trigger exists** (hooks observe only — `PreCompact` cannot initiate; the Skill tool excludes built-ins; the Agent SDK has no compaction API; parallel session resume is unsafe) and that the session is shared with the operator's own terminal work, vetoing autonomous clears outright. This release ships the issue's state machine with the actuator swapped to the operator:

@@ -1,5 +1,5 @@
 /**
- * Session-health nudge smoke test (v1.4.0, #190).
+ * Session-health nudge smoke test (v1.3.2, #190).
  *
  * Verifies the semi-automatic /compact reminder: gating order
  * (enabled → stats → close-on-drop → threshold → rearm-floor →
@@ -70,7 +70,7 @@ function makeHarness(over: Partial<{ enabled: boolean; tokenThreshold: number; i
       enabled: over.enabled ?? true,
       tokenThreshold: over.tokenThreshold ?? 400_000,
       idleMs: over.idleMs ?? 30 * 60_000,
-      // Ladder BASE (v1.4.0): undelayed schedule 0 / +2h / +6h / +14h.
+      // Ladder BASE (v1.3.2): undelayed schedule 0 / +2h / +6h / +14h.
       cooldownMs: over.cooldownMs ?? 2 * HOUR,
     },
     deps,

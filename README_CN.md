@@ -258,7 +258,7 @@ node -e "console.log(require('./package.json').version)"
 | `LARK_INACTIVITY_HOURS` | `3` | 自动蒸馏触发的静默时长（小时） |
 | `LARK_MEMORY_DEDUP_WINDOW_MS` | `1800000`（30 分钟） | 热线程 memory_context 注入去重窗口（v1.3.0+，#189）。窗口内，同一会话/线程中内容未变的记忆块不再重复注入——profile 渲染为小型 "unchanged" 占位块，episode/skill 直接省略。设为 `0`（或负数）关闭去重（恢复 v1.3.0 之前每轮全量注入的行为）。上限 24 小时（超出自动收紧） |
 
-### 可选 -- 会话健康（v1.4.0+，#190）
+### 可选 -- 会话健康（v1.3.2+，#190）
 
 Stop hook 在每次会话停止时把当前上下文的精确大小（取自 transcript 最后一条 `usage`）写入旁路统计文件。当最重的近期会话超过阈值、且通道空闲安静时，owner 会收到一条限频飞书 DM，建议在终端执行 `/compact`——让压缩发生在空闲边界而不是消息突发中途。Claude Code 没有可编程的 `/compact` 触发器（见 #190），所以执行者是人。
 

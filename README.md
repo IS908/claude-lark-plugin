@@ -277,7 +277,7 @@ On every incoming message, the plugin injects relevant memory context in this or
 | `LARK_INACTIVITY_HOURS` | `3` | Hours of inactivity before buffer flush to episodic memory |
 | `LARK_MEMORY_DEDUP_WINDOW_MS` | `1800000` (30 min) | Hot-thread dedup window for memory_context injection (v1.3.0+, #189). Within the window, blocks whose content is unchanged since their last injection into the same chat/thread are suppressed — profiles render a small "unchanged" stub, episodes/skills are omitted. `0` (or negative) disables dedup (inject everything every turn, pre-v1.3.0 behavior). Clamped to a 24 h maximum. |
 
-### Optional -- Session health (v1.4.0+, #190)
+### Optional -- Session health (v1.3.2+, #190)
 
 The Stop hook records each Claude Code session's exact context size (from the transcript's last `usage` entry) to a sidecar stats file. When the heaviest recent session exceeds the threshold while the channel is idle and quiet, the owner gets one rate-limited Feishu DM suggesting `/compact` in the terminal — compaction at an idle boundary instead of mid-burst. There is no programmatic `/compact` in Claude Code (see #190), so the operator is the actuator.
 
