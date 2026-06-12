@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import fs from 'node:fs/promises';
-import { unlinkSync } from 'node:fs';
+import { unlinkSync, readFileSync } from 'node:fs';
 import { getProcessStartTime, buildLockToken, parseLockToken } from './lock.js';
 import path from 'node:path';
 import os from 'node:os';
@@ -238,8 +238,22 @@ async function main() {
   }
 
   // 2. Create MCP server
+  // v1.3.1: server-info version is read from package.json instead of a
+  // hardcoded literal — the literal sat at "1.2.0" through the v1.3.0
+  // release because nothing reminded anyone to bump it (4th version
+  // field after package.json / plugin.json / marketplace.json). The
+  // relative URL resolves correctly from both src/ (tsx) and dist/
+  // (tsc build): ../package.json is the repo root either way.
+  const pkgVersion: string = (() => {
+    try {
+      const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
+      return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
+    } catch {
+      return '0.0.0'; // never block startup on a metadata read
+    }
+  })();
   const server = new McpServer(
-    { name: 'claude-lark-plugin', version: '1.2.0' },
+    { name: 'claude-lark-plugin', version: pkgVersion },
     {
       capabilities: {
         logging: {},

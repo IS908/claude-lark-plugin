@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.1] - 2026-06-12
+
+### Fixed
+- **Plugin manifest versions missed in the v1.3.0 release** (#191 follow-up). `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` stayed at `1.2.0` while `package.json` moved to `1.3.0`. The `plugin.json` version keys the Claude Code runtime cache path (`~/.claude/plugins/cache/claude-lark-plugin/lark/<version>/`), so the original v1.3.0 tag would have installed as 1.2.0. The interim fix re-pointed the published v1.3.0 tag — bad practice for anyone who had already fetched it. **v1.3.1 supersedes v1.3.0 as the canonical release; update straight to v1.3.1.**
+- **MCP server-info version was hardcoded and stale** — `src/index.ts` advertised `version: '1.2.0'` to the MCP host through the v1.3.0 release because the literal was a fourth, undocumented version field nobody bumped. Now read from `package.json` at startup (`readFileSync` + fallback `0.0.0`, never blocks startup; the relative path resolves from both `src/` under tsx and `dist/` under tsc), eliminating this drift class entirely.
+
+### Migration
+- Release checklist now: bump `package.json` (+ lockfile via `npm install --package-lock-only`), `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` — verify with `grep -rn '"version"' package.json .claude-plugin/*.json` against the CHANGELOG heading. The MCP server-info version self-syncs from package.json as of this release.
+- No functional changes to the v1.3.0 dedup feature; all 18 smoke cases unchanged.
+
 ## [1.3.0] - 2026-06-12
 
 ### Added
