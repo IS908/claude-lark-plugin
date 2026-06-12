@@ -13,6 +13,18 @@ export class MessageQueue {
     return `${chatId}::${threadId || '_'}`;
   }
 
+  /**
+   * Number of conversation chains currently in flight. Resolved chains
+   * self-delete in enqueue's finally. NOTE: a chain resolves when its
+   * handler returns — for inbound messages that is when the channel
+   * NOTIFICATION is dispatched, not when Claude's turn finishes. The
+   * #190 "quiet" gate treats this as a best-effort signal, not an
+   * in-flight-turn invariant.
+   */
+  get pending(): number {
+    return this.chains.size;
+  }
+
   enqueue(
     chatId: string,
     threadId: string | undefined,

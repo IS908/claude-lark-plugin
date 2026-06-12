@@ -953,6 +953,11 @@ export class LarkChannel {
     return this.client;
   }
 
+  /** #190: in-flight conversation count for the session-health "quiet" gate. */
+  getQueueDepth(): number {
+    return this.queue.pending;
+  }
+
   getAckReactions(): Map<string, { reactionId: string; addedAt: number }> {
     return this.ackReactions;
   }

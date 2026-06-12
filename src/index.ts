@@ -7,13 +7,14 @@ import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
 import { LarkChannel } from './channel.js';
-import { registerTools, setCronjobOutcomeHandler } from './tools.js';
+import { registerTools, setCronjobOutcomeHandler, sanitizeOutboundText } from './tools.js';
 import { ConversationBuffer } from './memory/buffer.js';
 import { buildFlushPrompt, triggerProfileDistillation } from './memory/distiller.js';
 import { MemoryStore } from './memory/file.js';
 import { IdentitySession, SYSTEM_FLUSH_CALLER } from './identity-session.js';
 import { JobScheduler } from './scheduler.js';
 import { runInboxGcOnce } from './inbox-gc.js';
+import { SessionHealthMonitor, readStatsFile } from './session-health.js';
 import { mcpServerInstructions } from './prompts.js';
 
 const LOCK_FILE = path.join(os.tmpdir(), `claude-lark-${appConfig.appId}.lock`);
@@ -401,8 +402,67 @@ async function main() {
     channel.getLatestMessageTracker()
   );
 
+  // 5.5 Session-health monitor (#190): semi-automatic /compact nudge.
+  // No programmatic compact trigger exists in Claude Code (verified in
+  // the #190 discussion), so when the Stop-hook-measured context size
+  // crosses the threshold during an idle+quiet window, the OWNER gets
+  // one rate-limited DM suggesting they type /compact in the terminal.
+  // The nudge DM is not registered in BotMessageTracker — reactions on
+  // it are intentionally not forwarded to Claude (it's operator-facing
+  // plumbing, not conversation).
+  const sessionHealth = new SessionHealthMonitor(
+    {
+      enabled: appConfig.sessionNudgeEnabled && Boolean(appConfig.ownerOpenId),
+      tokenThreshold: appConfig.sessionNudgeTokenThreshold,
+      idleMs: appConfig.sessionNudgeIdleMs,
+      cooldownMs: appConfig.sessionNudgeCooldownMs,
+    },
+    {
+      readStats: () => readStatsFile(appConfig.sessionStatsPath),
+      // Best-effort quiet signal (round-1 review finding 4): queue depth
+      // covers enqueue→notification-dispatch; pending IM ack reactions
+      // extend coverage to receive→reply for IM turns. Doc-comment and
+      // cron turns are only covered by the idle gate — a sufficiently
+      // long turn can still outlive idleMs, so the nudge timing is
+      // best-effort, not an in-flight invariant.
+      isQuiet: () =>
+        channel.getQueueDepth() === 0 && channel.getAckReactions().size === 0,
+      sendOwnerNudge: async (text) => {
+        // `enabled` already requires ownerOpenId; this guard is for the
+        // type system and belt-and-suspenders against future rewiring.
+        if (!appConfig.ownerOpenId) return;
+        await channel.getClient().im.v1.message.create({
+          params: { receive_id_type: 'open_id' },
+          data: {
+            // Text is server-built (constants + numbers + 8-char session
+            // prefix from the local stats file), but sanitize anyway —
+            // repo convention for ALL outbound msg_type=text (see
+            // scheduler.notifyStaleSkip): a future format change must
+            // not quietly become an @-mention vector in an owner DM.
+            receive_id: appConfig.ownerOpenId,
+            content: JSON.stringify({ text: sanitizeOutboundText(text) }),
+            msg_type: 'text',
+          },
+        });
+      },
+      log: (m) => console.error(m),
+    },
+  );
+  if (appConfig.sessionNudgeEnabled && !appConfig.ownerOpenId) {
+    console.error(
+      '[session-health] LARK_SESSION_NUDGE_ENABLED=true but LARK_OWNER_OPEN_ID is unset — nudge disabled (no DM target).',
+    );
+  }
+
   // 6. Set message handler — forwards Feishu messages to Claude via MCP
   channel.setMessageHandler(async (message) => {
+    // #190: every message forwarded through this handler (IM /
+    // doc-comment / reaction / flush & distill injections) counts as
+    // activity for the idle gate. Prompt-cronjob injections bypass
+    // this handler — they're covered via the scheduler's onActivity
+    // hook below (round-1 review finding 3).
+    sessionHealth.noteInbound();
+
     // Build friendly display: user_xxx or user_xxx · chat_xxx · thread_xxx
     const displayUser = message.senderName || message.senderId;
     const displayParts = [displayUser];
@@ -488,6 +548,11 @@ async function main() {
   // 9. Start Lark WebSocket
   await channel.start();
 
+  // #190: start the session-health tick (no-op unless enabled). Same
+  // 60s cadence as the scheduler; interval is unref'd so it never
+  // holds the process open.
+  sessionHealth.start(60_000);
+
   // 9. Re-arm flush timers from persisted episodes
   await buffer.rearmFromDisk();
 
@@ -501,6 +566,10 @@ async function main() {
     // the tracker — without this, reactions on them silently drop in
     // handleReactionEvent.
     botMessageTracker: channel.getBotMessageTracker(),
+    // #190: prompt-job injections start Claude turns without touching
+    // the message handler — count them as activity so the nudge can't
+    // land mid-cron-turn claiming the channel is idle.
+    onActivity: () => sessionHealth.noteInbound(),
   });
   await scheduler.start();
 

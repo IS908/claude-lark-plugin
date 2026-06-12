@@ -11,14 +11,112 @@
 
 import {
   readFileSync, appendFileSync, mkdirSync, existsSync,
-  statSync, renameSync, openSync, readSync, closeSync,
+  statSync, renameSync, openSync, readSync, closeSync, writeFileSync,
+  readdirSync, unlinkSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, basename } from 'node:path';
 
 const AUDIT_LOG =
   process.env.LARK_HOOK_AUDIT_LOG ||
   join(homedir(), '.claude', 'channels', 'lark', 'hook-audit.log');
+
+// #190: sidecar stats file for the plugin's session-health nudge. The
+// hook is the only component that sees transcript_path, so it is the
+// measurement point: on every Stop it records the session's CURRENT
+// context size — the last assistant entry's `usage` (input +
+// cache_read + cache_creation) is exact, no estimation. The plugin's
+// SessionHealthMonitor reads this file on its tick.
+// Override accepted only for `.json` targets (round-1 security review):
+// the write is truncate-replace (tmp+rename), so an unconstrained
+// override would make every Stop event a file-destruction primitive
+// for whoever controls the env (same exposure class as
+// LARK_HOOK_AUDIT_LOG, but replace beats append as a destructor —
+// narrow it). Content remains structurally inert JSON either way.
+const SESSION_STATS_PATH = (() => {
+  const override = process.env.LARK_SESSION_STATS_PATH;
+  if (override && override.endsWith('.json')) return override;
+  return join(homedir(), '.claude', 'channels', 'lark', 'session-stats.json');
+})();
+// Per-session map: several Claude Code sessions in this project (the
+// bot megasession + the operator's dev sessions) all run this hook;
+// a single last-writer-wins object would let a small dev session mask
+// the heavy one. Pruned by age + count on every write.
+const STATS_MAX_SESSIONS = 32;
+const STATS_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * Best-effort — called inside its own try/catch from main(); MUST
+ * never influence the hook's exit code (#190's "no exceptions to the
+ * fail-safe" rule). Read-modify-write race between two concurrently
+ * stopping sessions can lose one update; the next Stop event of the
+ * losing session rewrites it — acceptable for a cost-monitoring
+ * signal.
+ */
+function writeSessionStats(entries, sessionId) {
+  if (!sessionId || typeof sessionId !== 'string') return;
+  // Last main-loop assistant entry carrying usage. Skip sidechain
+  // (subagent) entries defensively — their usage is the subagent's
+  // context, not this session's.
+  let contextTokens = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (!e || e.type !== 'assistant' || e.isSidechain === true) continue;
+    const u = e.message?.usage;
+    if (!u || typeof u !== 'object') continue;
+    const sum =
+      (Number(u.input_tokens) || 0) +
+      (Number(u.cache_read_input_tokens) || 0) +
+      (Number(u.cache_creation_input_tokens) || 0);
+    // A zeroed usage (aborted/error entry) is not a measurement —
+    // keep scanning for the previous valid one instead of bailing
+    // (round-1 review finding 9).
+    if (sum <= 0) continue;
+    contextTokens = sum;
+    break;
+  }
+  if (contextTokens <= 0) return;
+
+  let stats = { sessions: {} };
+  try {
+    const parsed = JSON.parse(readFileSync(SESSION_STATS_PATH, 'utf-8'));
+    if (parsed && typeof parsed === 'object' && parsed.sessions && typeof parsed.sessions === 'object') {
+      stats = parsed;
+    }
+  } catch { /* first write or corrupted file — start fresh */ }
+
+  const now = Date.now();
+  stats.sessions[sessionId] = { context_tokens: contextTokens, ts: new Date(now).toISOString() };
+
+  // Prune stale entries, then cap count keeping the most recent.
+  const live = Object.entries(stats.sessions).filter(([, v]) => {
+    const ts = Date.parse(v?.ts ?? '');
+    // Reject far-future timestamps too (round-1 security review):
+    // future-dated junk in a pre-existing file would otherwise sort
+    // newest and count-evict real entries.
+    return Number.isFinite(ts) && now - ts <= STATS_MAX_AGE_MS && ts - now <= 60_000;
+  });
+  live.sort((a, b) => Date.parse(b[1].ts) - Date.parse(a[1].ts));
+  stats.sessions = Object.fromEntries(live.slice(0, STATS_MAX_SESSIONS));
+
+  mkdirSync(dirname(SESSION_STATS_PATH), { recursive: true });
+  // Best-effort sweep of orphaned tmp files (a crash between write and
+  // rename leaves `<file>.tmp-<pid>` behind; pids differ per process so
+  // they'd accumulate forever otherwise). Day-old is conservative —
+  // a live writer holds its tmp for milliseconds.
+  try {
+    const dir = dirname(SESSION_STATS_PATH);
+    const prefix = `${basename(SESSION_STATS_PATH)}.tmp-`;
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith(prefix)) continue;
+      const full = join(dir, f);
+      if (Date.now() - statSync(full).mtimeMs > 24 * 60 * 60 * 1000) unlinkSync(full);
+    }
+  } catch { /* sweep is optional */ }
+  const tmp = `${SESSION_STATS_PATH}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(stats));
+  renameSync(tmp, SESSION_STATS_PATH);
+}
 
 // #109 fix: single-rotation cap for the hook audit log. The hook
 // can't import from src/ (it's a standalone mjs invoked by Claude
@@ -905,6 +1003,11 @@ function main() {
 
   // Loop-safety: if Claude Code is already in a forced-continuation cycle,
   // exit 0 to break it. Per Claude Code hooks spec.
+  // (#190 note: this exit intentionally precedes writeSessionStats —
+  // the final Stop of a blocked-then-remediated turn skips the
+  // measurement, leaving the stats one turn stale until the next clean
+  // Stop. Accepted: loop-break must stay the very first check, and the
+  // monitor only needs order-of-magnitude freshness.)
   if (input.stop_hook_active === true) {
     audit('Stop  status=loop-break  reason=stop_hook_active');
     process.exit(0);
@@ -923,6 +1026,14 @@ function main() {
     audit(`Stop  status=fail-safe  reason=transcript-read  err=${String(e).slice(0, 100)}`);
     process.exit(0);
   }
+
+  // #190: record this session's context size BEFORE the obligation
+  // logic — most code paths below exit early (no lark turn, satisfied,
+  // deferred), and the stats must be written on all of them. Own
+  // try/catch: stats failures never influence the hook's verdict.
+  try {
+    writeSessionStats(entries, input.session_id);
+  } catch { /* fail-quiet by design */ }
 
   let turn;
   try {
