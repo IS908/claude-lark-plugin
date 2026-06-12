@@ -7,7 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
 import { LarkChannel } from './channel.js';
-import { registerTools, setCronjobOutcomeHandler } from './tools.js';
+import { registerTools, setCronjobOutcomeHandler, sanitizeOutboundText } from './tools.js';
 import { ConversationBuffer } from './memory/buffer.js';
 import { buildFlushPrompt, triggerProfileDistillation } from './memory/distiller.js';
 import { MemoryStore } from './memory/file.js';
@@ -419,7 +419,14 @@ async function main() {
     },
     {
       readStats: () => readStatsFile(appConfig.sessionStatsPath),
-      isQuiet: () => channel.getQueueDepth() === 0,
+      // Best-effort quiet signal (round-1 review finding 4): queue depth
+      // covers enqueue→notification-dispatch; pending IM ack reactions
+      // extend coverage to receive→reply for IM turns. Doc-comment and
+      // cron turns are only covered by the idle gate — a sufficiently
+      // long turn can still outlive idleMs, so the nudge timing is
+      // best-effort, not an in-flight invariant.
+      isQuiet: () =>
+        channel.getQueueDepth() === 0 && channel.getAckReactions().size === 0,
       sendOwnerNudge: async (text) => {
         // `enabled` already requires ownerOpenId; this guard is for the
         // type system and belt-and-suspenders against future rewiring.
@@ -427,8 +434,13 @@ async function main() {
         await channel.getClient().im.v1.message.create({
           params: { receive_id_type: 'open_id' },
           data: {
+            // Text is server-built (constants + numbers + 8-char session
+            // prefix from the local stats file), but sanitize anyway —
+            // repo convention for ALL outbound msg_type=text (see
+            // scheduler.notifyStaleSkip): a future format change must
+            // not quietly become an @-mention vector in an owner DM.
             receive_id: appConfig.ownerOpenId,
-            content: JSON.stringify({ text }),
+            content: JSON.stringify({ text: sanitizeOutboundText(text) }),
             msg_type: 'text',
           },
         });
@@ -444,8 +456,11 @@ async function main() {
 
   // 6. Set message handler — forwards Feishu messages to Claude via MCP
   channel.setMessageHandler(async (message) => {
-    // #190: every forwarded message (IM / doc-comment / reaction /
-    // cronjob injection) counts as activity for the idle gate.
+    // #190: every message forwarded through this handler (IM /
+    // doc-comment / reaction / flush & distill injections) counts as
+    // activity for the idle gate. Prompt-cronjob injections bypass
+    // this handler — they're covered via the scheduler's onActivity
+    // hook below (round-1 review finding 3).
     sessionHealth.noteInbound();
 
     // Build friendly display: user_xxx or user_xxx · chat_xxx · thread_xxx
@@ -551,6 +566,10 @@ async function main() {
     // the tracker — without this, reactions on them silently drop in
     // handleReactionEvent.
     botMessageTracker: channel.getBotMessageTracker(),
+    // #190: prompt-job injections start Claude turns without touching
+    // the message handler — count them as activity so the nudge can't
+    // land mid-cron-turn claiming the channel is idle.
+    onActivity: () => sessionHealth.noteInbound(),
   });
   await scheduler.start();
 

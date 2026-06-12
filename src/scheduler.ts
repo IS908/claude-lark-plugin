@@ -43,6 +43,16 @@ export interface SchedulerOptions {
    * reaction-on-cronjob-message UX.
    */
   botMessageTracker?: BotMessageTracker;
+  /**
+   * #190 round-1 review: prompt-type jobs inject a Claude turn via
+   * `server.notification` directly — they bypass the channel's
+   * messageHandler, so the session-health monitor's idle gate would
+   * not see them and could nudge "/compact now, you're idle" right
+   * into the middle of a multi-minute cron turn. When present, called
+   * once per prompt-job injection so the monitor counts it as
+   * activity. Optional: legacy callers/tests omit it.
+   */
+  onActivity?: () => void;
 }
 
 // ─── Retry Logic ────────────────────────────────────────────
@@ -157,6 +167,7 @@ export class JobScheduler {
   private client: Lark.Client;
   private identitySession: IdentitySession;
   private botMessageTracker: BotMessageTracker | undefined;
+  private onActivity: (() => void) | undefined;
   private running = false;
   /**
    * Per-job re-entrancy guard (#77, v1.0.29; recycle-aware in v1.0.43).
@@ -211,6 +222,7 @@ export class JobScheduler {
     this.client = opts.client;
     this.identitySession = opts.identitySession;
     this.botMessageTracker = opts.botMessageTracker;
+    this.onActivity = opts.onActivity;
   }
 
   /**
@@ -1032,5 +1044,9 @@ export class JobScheduler {
         },
       },
     });
+
+    // #190: count the injected Claude turn as channel activity for the
+    // session-health idle gate (see SchedulerOptions.onActivity).
+    this.onActivity?.();
   }
 }

@@ -1747,6 +1747,14 @@ console.log('\n[S2] no usage in transcript → no stats file');
   const file = join(tmp, 'stats-s2.json');
   runHook({ transcriptPath: path, sessionId: 'sess-s2', extraEnv: { LARK_SESSION_STATS_PATH: file } });
   assertEq(existsSync(file), false, 'stats file not created without usage');
+
+  // Sidechain-ONLY usage is equally not a measurement of this session.
+  const path2 = writeTranscript('stats-sidechain-only', [
+    makeAssistantWithUsage({ input_tokens: 999, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, { isSidechain: true }),
+  ]);
+  const file2 = join(tmp, 'stats-s2b.json');
+  runHook({ transcriptPath: path2, sessionId: 'sess-s2b', extraEnv: { LARK_SESSION_STATS_PATH: file2 } });
+  assertEq(existsSync(file2), false, 'sidechain-only transcript writes no stats');
 }
 
 console.log('\n[S3] corrupted existing stats file → overwritten cleanly');
@@ -1798,6 +1806,7 @@ console.log('\n[S6] pruning: stale entries dropped, fresh foreign entries kept')
     sessions: {
       'sess-stale': { context_tokens: 999, ts: new Date(now - 49 * 3_600_000).toISOString() },
       'sess-fresh-other': { context_tokens: 777, ts: new Date(now - 3_600_000).toISOString() },
+      'sess-future': { context_tokens: 888, ts: new Date(now + 10 * 60_000).toISOString() },
     },
   }));
   const path = writeTranscript('stats-prune', [
@@ -1806,8 +1815,55 @@ console.log('\n[S6] pruning: stale entries dropped, fresh foreign entries kept')
   runHook({ transcriptPath: path, sessionId: 'sess-s6', extraEnv: { LARK_SESSION_STATS_PATH: file } });
   const stats = readStats(file);
   assertEq(stats?.sessions?.['sess-stale'], undefined, '49h-old entry pruned');
+  assertEq(stats?.sessions?.['sess-future'], undefined, 'far-future entry pruned (clock-skew junk cannot evict real ones)');
   assertEq(stats?.sessions?.['sess-fresh-other']?.context_tokens, 777, 'fresh foreign session preserved');
   assertEq(stats?.sessions?.['sess-s6']?.context_tokens, 10, 'current session recorded');
+}
+
+console.log('\n[S7] count cap: 33rd live entry evicts the oldest, keeps 32');
+{
+  const file = join(tmp, 'stats-s7.json');
+  const now = Date.now();
+  const sessions = {};
+  for (let i = 0; i < 32; i++) {
+    // Ascending ts: sess-00 is the oldest live entry.
+    sessions[`sess-${String(i).padStart(2, '0')}`] = {
+      context_tokens: 1000 + i,
+      ts: new Date(now - (32 - i) * 60_000).toISOString(),
+    };
+  }
+  writeFileSync(file, JSON.stringify({ sessions }));
+  const path = writeTranscript('stats-cap', [
+    makeAssistantWithUsage({ input_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }),
+  ]);
+  runHook({ transcriptPath: path, sessionId: 'sess-s7-new', extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  const stats = readStats(file);
+  const keys = Object.keys(stats?.sessions ?? {});
+  assertEq(keys.length, 32, 'capped at 32 entries');
+  assertEq(stats?.sessions?.['sess-s7-new']?.context_tokens, 5, 'newest entry present');
+  assertEq(stats?.sessions?.['sess-00'], undefined, 'oldest live entry evicted');
+}
+
+console.log('\n[S8] stop_hook_active loop-break skips the stats write (accepted staleness)');
+{
+  const path = writeTranscript('stats-loopbreak', [
+    makeAssistantWithUsage({ input_tokens: 1, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 }),
+  ]);
+  const file = join(tmp, 'stats-s8.json');
+  const r = runHook({ transcriptPath: path, sessionId: 'sess-s8', stopHookActive: true, extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  assertEq(r.exitCode, 0, 'loop-break still exits 0');
+  assertEq(existsSync(file), false, 'no stats write on the loop-break path');
+}
+
+console.log('\n[S9] zeroed usage entry falls back to the previous valid measurement');
+{
+  const path = writeTranscript('stats-zero-usage', [
+    makeAssistantWithUsage({ input_tokens: 10, cache_read_input_tokens: 200, cache_creation_input_tokens: 0 }),
+    makeAssistantWithUsage({ input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }),
+  ]);
+  const file = join(tmp, 'stats-s9.json');
+  runHook({ transcriptPath: path, sessionId: 'sess-s9', extraEnv: { LARK_SESSION_STATS_PATH: file } });
+  assertEq(readStats(file)?.sessions?.['sess-s9']?.context_tokens, 210, 'zeroed trailing usage must not mask the prior valid one');
 }
 
 // --- Summary ---

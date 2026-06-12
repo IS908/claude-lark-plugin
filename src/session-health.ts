@@ -31,8 +31,10 @@
  * - Idle: `noteInbound()` is called from the index.ts message handler
  *   on every forwarded message (IM, doc-comment, reaction), so idle
  *   means "nothing forwarded to Claude for idleMs".
- * - Quiet: `isQuiet()` (queue depth == 0) so the nudge never lands
- *   while a turn is in flight.
+ * - Quiet: `isQuiet()` — best-effort in-flight signal (queue depth +
+ *   pending IM ack reactions, see the index.ts wiring). A long Claude
+ *   turn can outlive both it AND idleMs, so nudge timing is
+ *   best-effort; the idle gate carries most of the weight.
  *
  * All state is in-memory; restart resets idle/cooldown tracking (the
  * monitor then waits a full idleMs before it can nudge — conservative).
@@ -116,8 +118,23 @@ const EPISODE_CLOSE_DROP_RATIO = 0.7;
  * instant re-nudge right after the operator compacted to a level that
  * still sits above the threshold. */
 const EPISODE_REARM_GROWTH_RATIO = 1.25;
-/** A day of ladder silence ⇒ stale episode state; start fresh. */
+/**
+ * An EXHAUSTED episode re-engages after a day of ladder silence (the
+ * operator may simply have missed all four). Deliberately scoped to
+ * the exhausted state only (round-1 review findings 1/8): wiping a
+ * live re-arm floor would re-nudge with zero regrowth right after the
+ * operator compacted, and wiping a mid-ladder episode under a
+ * long-busy channel would convert the 4-per-episode cap into
+ * 4-per-day. Floors and mid-ladder state expire via session identity
+ * change or regrowth instead.
+ */
 const EPISODE_RESET_MS = 24 * 60 * 60 * 1000;
+/**
+ * Defensive floor for the ladder base: a base of 0 (only reachable by
+ * direct construction — the config layer rejects non-positive env
+ * values) would collapse the ladder to retry-backoff spacing.
+ */
+const MIN_BASE_MS = 60_000;
 
 /** Read + parse the sidecar stats file; null on any failure (fail-quiet). */
 export function readStatsFile(path: string): SessionStatsFile | null {
@@ -164,9 +181,21 @@ export class SessionHealthMonitor {
   private lastNudgedTokens = 0;
   /** New episode arms only at tokens ≥ this (set by a drop-close). 0 = no floor. */
   private rearmFloorTokens = 0;
-  /** Last ladder event (nudge OR close) — anchors the 24 h staleness reset. */
+  /**
+   * Session the episode state (ladder, floor, token comparisons)
+   * belongs to. Round-1 review finding 2: the heaviest entry can FLIP
+   * to a different session (the nudged entry ages past 24 h or gets
+   * count-pruned while a dev session sits lower) — comparing the new
+   * session's tokens against another session's `lastNudgedTokens`
+   * would fire a spurious close. Identity mismatch ⇒ start fresh.
+   */
+  private episodeSessionId: string | null = null;
+  /** Last ladder event (nudge OR close) — anchors the exhausted-state re-engage. */
   private lastEpisodeEventAt = 0;
+  /** Re-entrancy guard: setInterval does not await async callbacks. */
+  private ticking = false;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private readonly baseMs: number;
   private readonly now: () => number;
   private readonly log: (msg: string) => void;
   private readonly statsMaxAgeMs: number;
@@ -178,6 +207,7 @@ export class SessionHealthMonitor {
     this.now = deps.now ?? Date.now;
     this.log = deps.log ?? (() => {});
     this.statsMaxAgeMs = cfg.statsMaxAgeMs ?? DEFAULT_STATS_MAX_AGE_MS;
+    this.baseMs = Math.max(cfg.cooldownMs, MIN_BASE_MS);
     // Conservative startup: treat "monitor started" as inbound activity
     // so a fresh process always waits a full idleMs before nudging.
     this.lastInboundAt = this.now();
@@ -188,12 +218,13 @@ export class SessionHealthMonitor {
     this.lastInboundAt = this.now();
   }
 
-  /** Wipe all episode state — used by the 24 h staleness reset. */
+  /** Wipe all episode state. */
   private resetEpisode(): void {
     this.nudgeCount = 0;
     this.nextDueAt = 0;
     this.lastNudgedTokens = 0;
     this.rearmFloorTokens = 0;
+    this.episodeSessionId = null;
   }
 
   /**
@@ -202,13 +233,27 @@ export class SessionHealthMonitor {
    */
   async tick(): Promise<TickOutcome> {
     if (!this.cfg.enabled) return 'disabled';
+    // Single-flight: setInterval fires regardless of a previous tick
+    // still awaiting its send (round-1 review finding 7) — overlapping
+    // evaluations could interleave episode-state writes around the
+    // await. The overlapping tick reports 'busy' and the next regular
+    // tick re-evaluates.
+    if (this.ticking) return 'busy';
+    this.ticking = true;
+    try {
+      return await this.evaluate();
+    } finally {
+      this.ticking = false;
+    }
+  }
 
+  private async evaluate(): Promise<TickOutcome> {
     const now = this.now();
 
-    // A day with no ladder events means the episode context is stale
-    // (bot offline, stats expired, long quiet stretch) — start fresh.
+    // Exhausted-state re-engage after a day of ladder silence — the
+    // ONLY time-based reset (see EPISODE_RESET_MS rationale).
     if (
-      (this.nudgeCount > 0 || this.rearmFloorTokens > 0) &&
+      this.nudgeCount >= MAX_NUDGES_PER_EPISODE &&
       now - this.lastEpisodeEventAt > EPISODE_RESET_MS
     ) {
       this.resetEpisode();
@@ -216,6 +261,16 @@ export class SessionHealthMonitor {
 
     const heaviest = heaviestRecentSession(this.deps.readStats(), now, this.statsMaxAgeMs);
     if (!heaviest) return 'no-stats';
+
+    // Identity switch: ladder, floor, and token comparisons are only
+    // meaningful against the session they were recorded for. When the
+    // heaviest entry flips to a DIFFERENT session (old entry expired /
+    // pruned, or a heavier one appeared), start fresh instead of
+    // firing a spurious cross-session close or honoring a foreign
+    // floor (round-1 review finding 2).
+    if (this.episodeSessionId !== null && heaviest.sessionId !== this.episodeSessionId) {
+      this.resetEpisode();
+    }
 
     // Close-on-drop: a fresh measurement at ≤70% of the last-nudged
     // value (or below threshold) means the operator compacted/cleared.
@@ -232,6 +287,7 @@ export class SessionHealthMonitor {
       );
       this.resetEpisode();
       this.rearmFloorTokens = floor;
+      this.episodeSessionId = heaviest.sessionId; // floor is per-session
       this.lastEpisodeEventAt = now;
       this.log(
         `[session-health] episode closed (tokens dropped to ${heaviest.tokens}); re-arm at ≥${floor}`,
@@ -258,7 +314,7 @@ export class SessionHealthMonitor {
 
     this.lastAttemptAt = now;
     const rung = this.nudgeCount + 1;
-    const nextIntervalMs = this.cfg.cooldownMs * 2 ** this.nudgeCount;
+    const nextIntervalMs = this.baseMs * 2 ** this.nudgeCount;
     const idleMin = Math.round((now - this.lastInboundAt) / 60_000);
     const followUp =
       rung < MAX_NUDGES_PER_EPISODE
@@ -280,6 +336,7 @@ export class SessionHealthMonitor {
       this.nextDueAt = now + nextIntervalMs;
       this.lastNudgedTokens = heaviest.tokens;
       this.rearmFloorTokens = 0;
+      this.episodeSessionId = heaviest.sessionId;
       this.lastEpisodeEventAt = now;
       this.log(
         `[session-health] nudge ${rung}/${MAX_NUDGES_PER_EPISODE} sent ` +

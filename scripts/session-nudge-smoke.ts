@@ -274,6 +274,11 @@ function readyHarness(tokens = 900_000): Harness {
   if ((await h.monitor.tick()) !== 'nudged') fail('late rung 2 fires once');
   h.clock.add(60_000);
   if ((await h.monitor.tick()) !== 'cooldown') fail('rung 3 anchors on the ACTUAL rung-2 send (+4h), no catch-up burst');
+  // Round-2 probe: past the 15-min retry backoff but before the
+  // anchored due time — a timetable-anchored implementation would
+  // double-fire here.
+  h.clock.set(t0 + 7 * HOUR + 20 * 60_000);
+  if ((await h.monitor.tick()) !== 'cooldown') fail('still cooldown at +20min — anchor must be the actual send');
 }
 
 // 15. Drop-close above threshold + re-arm floor: compact from 900k to
@@ -288,9 +293,14 @@ function readyHarness(tokens = 900_000): Harness {
   if ((await h.monitor.tick()) !== 'episode-closed') fail('≥30% drop must close the episode');
   h.clock.add(60_000);
   if ((await h.monitor.tick()) !== 'rearm-floor') fail('post-compact level above threshold must not instantly re-nudge');
+  // Pin the 1.25× multiplier exactly (round-1 review finding 11):
+  // floor = 600k × 1.25 = 750k. 740k must still block; 750k must arm.
   h.clock.add(60_000);
-  h.setStats(statsWith(800_000, -1000, h.clock.now())); // ≥ 750k floor
-  if ((await h.monitor.tick()) !== 'nudged') fail('regrowth past the floor must arm a new episode');
+  h.setStats(statsWith(740_000, -1000, h.clock.now()));
+  if ((await h.monitor.tick()) !== 'rearm-floor') fail('740k < 750k floor must still block');
+  h.clock.add(60_000);
+  h.setStats(statsWith(750_000, -1000, h.clock.now()));
+  if ((await h.monitor.tick()) !== 'nudged') fail('exactly the 750k floor must arm a new episode');
   if (!h.sent[1].includes('[1/4]')) fail('new episode restarts the rung counter');
 }
 
@@ -335,6 +345,95 @@ function readyHarness(tokens = 900_000): Harness {
   h.setStats(statsWith(900_000, -1000, h.clock.now()));
   if ((await h.monitor.tick()) !== 'nudged') fail('stale episode state must auto-reset after 24h of silence');
   if (h.sent.length !== 5) fail('fresh episode after auto-reset');
+}
+
+// 19. Constructor floors a zero/negative ladder base to 60s (config
+//     rejects non-positive env values; this guards direct construction)
+{
+  testNum++;
+  const h = makeHarness({ cooldownMs: 0 });
+  h.clock.add(31 * 60_000);
+  h.setStats(statsWith(900_000, -1000, h.clock.now()));
+  if ((await h.monitor.tick()) !== 'nudged') fail('rung 1 fires normally');
+  h.clock.add(30_000); // 30s < 60s floored base
+  if ((await h.monitor.tick()) !== 'cooldown') fail('zero base must floor to 60s, not collapse the ladder');
+}
+
+// 20. Heaviest-session identity switch resets the episode — no
+//     spurious cross-session close, fresh ladder for the new session
+{
+  testNum++;
+  const h = readyHarness(900_000); // sess-heavy
+  await h.monitor.tick(); // rung 1 for sess-heavy
+  h.clock.add(20 * 60_000);
+  // sess-heavy's entry vanishes (expired/pruned); a different session
+  // at 500k becomes heaviest. 500k ≤ 0.7×900k would have fired a
+  // spurious close under identity-blind comparison.
+  h.setStats(statsWith(500_000, -1000, h.clock.now(), 'sess-other'));
+  const outcome = await h.monitor.tick();
+  if (outcome === 'episode-closed') fail('cross-session drop must NOT close the episode');
+  if (outcome !== 'nudged') fail(`new heaviest session gets a fresh evaluation, got ${outcome}`);
+  if (!h.sent[1].includes('[1/4]')) fail('fresh ladder for the new session');
+}
+
+// 21. A live re-arm floor is NOT wiped by the passage of 24h — only
+//     regrowth (or identity switch) clears it (round-1 finding 1)
+{
+  testNum++;
+  const h = readyHarness(900_000);
+  await h.monitor.tick(); // rung 1
+  h.clock.add(30 * 60_000);
+  h.setStats(statsWith(600_000, -1000, h.clock.now()));
+  if ((await h.monitor.tick()) !== 'episode-closed') fail('drop closes');
+  h.clock.add(25 * HOUR); // a day later, still hovering at 600k
+  h.setStats(statsWith(600_000, -1000, h.clock.now()));
+  if ((await h.monitor.tick()) !== 'rearm-floor') fail('floor must survive 24h — no zero-regrowth re-nudge');
+}
+
+// 22. Mid-ladder state is NOT wiped by 24h either — a long-blocked
+//     rung fires with its ladder position intact (round-1 finding 8)
+{
+  testNum++;
+  const h = readyHarness(900_000);
+  const t0 = h.clock.now();
+  await h.monitor.tick(); // rung 1
+  h.clock.set(t0 + 2 * HOUR + 60_000);
+  await h.monitor.tick(); // rung 2
+  h.clock.add(25 * HOUR); // ladder silent >24h but NOT exhausted
+  h.setStats(statsWith(900_000, -1000, h.clock.now()));
+  if ((await h.monitor.tick()) !== 'nudged') fail('overdue rung fires after the long gap');
+  if (!h.sent[2].includes('[3/4]')) fail('ladder position preserved — mid-ladder must not time-reset to [1/4]');
+}
+
+// 23. Single-flight: a tick overlapping an in-flight send returns busy
+//     and corrupts nothing
+{
+  testNum++;
+  const clock = makeClock();
+  let release: () => void = () => {};
+  const sent: string[] = [];
+  let stats: SessionStatsFile | null = null;
+  const monitor = new SessionHealthMonitor(
+    { enabled: true, tokenThreshold: 400_000, idleMs: 30 * 60_000, cooldownMs: 2 * HOUR },
+    {
+      readStats: () => stats,
+      isQuiet: () => true,
+      sendOwnerNudge: (text) =>
+        new Promise<void>((resolve) => {
+          sent.push(text);
+          release = resolve;
+        }),
+      now: clock.now,
+    },
+  );
+  clock.add(31 * 60_000);
+  stats = statsWith(900_000, -1000, clock.now());
+  const first = monitor.tick(); // parks on the un-resolved send
+  const second = await monitor.tick();
+  if (second !== 'busy') fail(`overlapping tick must report busy, got ${second}`);
+  release();
+  if ((await first) !== 'nudged') fail('original tick completes normally');
+  if (sent.length !== 1) fail('exactly one send despite the overlap');
 }
 
 console.error(`session-nudge smoke: all ${testNum} cases passed`);

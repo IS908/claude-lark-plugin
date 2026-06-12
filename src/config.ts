@@ -232,10 +232,13 @@ export const appConfig = {
   // session-health.ts Episode model). A flat short cooldown would
   // drumbeat the owner forever; a flat long one risks every reminder
   // landing in the same asleep window.
+  // Round-1 review finding 5: positive-only — a zero/negative threshold
+  // makes every session "heavy", zero idle disables that gate, and a
+  // zero base collapses the ladder to retry-backoff spacing.
   sessionNudgeEnabled: (process.env.LARK_SESSION_NUDGE_ENABLED ?? '').toLowerCase() === 'true',
-  sessionNudgeTokenThreshold: optionalNumber('LARK_SESSION_NUDGE_TOKEN_THRESHOLD', 400_000),
-  sessionNudgeIdleMs: optionalNumber('LARK_SESSION_NUDGE_IDLE_MS', 30 * 60 * 1000),
-  sessionNudgeCooldownMs: optionalNumber('LARK_SESSION_NUDGE_COOLDOWN_MS', 2 * 60 * 60 * 1000),
+  sessionNudgeTokenThreshold: optionalPositiveNumber('LARK_SESSION_NUDGE_TOKEN_THRESHOLD', 400_000),
+  sessionNudgeIdleMs: optionalPositiveNumber('LARK_SESSION_NUDGE_IDLE_MS', 30 * 60 * 1000),
+  sessionNudgeCooldownMs: optionalPositiveNumber('LARK_SESSION_NUDGE_COOLDOWN_MS', 2 * 60 * 60 * 1000),
   sessionStatsPath:
     process.env.LARK_SESSION_STATS_PATH ||
     path.join(os.homedir(), '.claude', 'channels', 'lark', 'session-stats.json'),

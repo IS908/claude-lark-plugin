@@ -267,7 +267,7 @@ Stop hook 在每次会话停止时把当前上下文的精确大小（取自 tra
 | `LARK_SESSION_NUDGE_ENABLED` | `false` | 总开关。需要同时设置 `LARK_OWNER_OPEN_ID`（DM 接收人） |
 | `LARK_SESSION_NUDGE_TOKEN_THRESHOLD` | `400000` | 触发提醒的上下文 token 阈值 |
 | `LARK_SESSION_NUDGE_IDLE_MS` | `1800000`（30 分钟） | 通道需空闲此时长才会提醒 |
-| `LARK_SESSION_NUDGE_COOLDOWN_MS` | `7200000`（2 小时） | 指数退避阶梯的基数：第 n 条提醒未响应后，下一条在 `基数 × 2^(n-1)` 之后——默认值下累计节奏为 0 / +2h / +6h / +14h，每个 episode 最多 4 条。下次测量值下降 ≥30%（或低于阈值）时 episode 关闭；重新增长 ≥25% 时重新武装；阶梯静默 24 小时后自动重置 |
+| `LARK_SESSION_NUDGE_COOLDOWN_MS` | `7200000`（2 小时） | 指数退避阶梯的基数：第 n 条提醒未响应后，下一条在 `基数 × 2^(n-1)` 之后——默认值下累计节奏为 0 / +2h / +6h / +14h，每个 episode 最多 4 条。下次测量值下降 ≥30%（或低于阈值）时 episode 关闭；重新增长 ≥25% 时重新武装；已耗尽的 episode 在静默 24 小时后重新提醒 |
 | `LARK_SESSION_STATS_PATH` | `~/.claude/channels/lark/session-stats.json` | 旁路统计文件路径（Stop hook 写、插件读） |
 
 ### 可选 -- 身份 / 隐私（v0.9.0+）

@@ -286,7 +286,7 @@ The Stop hook records each Claude Code session's exact context size (from the tr
 | `LARK_SESSION_NUDGE_ENABLED` | `false` | Master switch. Requires `LARK_OWNER_OPEN_ID` (the DM target). |
 | `LARK_SESSION_NUDGE_TOKEN_THRESHOLD` | `400000` | Context-token level that arms the nudge. |
 | `LARK_SESSION_NUDGE_IDLE_MS` | `1800000` (30 min) | Channel must be inbound-idle this long before a nudge. |
-| `LARK_SESSION_NUDGE_COOLDOWN_MS` | `7200000` (2 h) | BASE interval of the exponential reminder ladder: after the n-th unanswered nudge the next is due `base × 2^(n-1)` later — 0 / +2 h / +6 h / +14 h cumulative at the default — capped at 4 nudges per episode. The episode closes when the next measurement drops ≥30% (or below threshold), re-arms on ≥25% regrowth, and auto-resets after 24 h of silence. |
+| `LARK_SESSION_NUDGE_COOLDOWN_MS` | `7200000` (2 h) | BASE interval of the exponential reminder ladder: after the n-th unanswered nudge the next is due `base × 2^(n-1)` later — 0 / +2 h / +6 h / +14 h cumulative at the default — capped at 4 nudges per episode. The episode closes when the next measurement drops ≥30% (or below threshold), re-arms on ≥25% regrowth; an exhausted episode re-engages after 24 h of silence. |
 | `LARK_SESSION_STATS_PATH` | `~/.claude/channels/lark/session-stats.json` | Sidecar stats file shared by the Stop hook (writer) and the plugin (reader). |
 
 ### Optional -- Identity / privacy (v0.9.0+)
