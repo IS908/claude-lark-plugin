@@ -220,13 +220,22 @@ export const appConfig = {
   // swapped version of that issue's state machine: the Stop hook writes
   // per-session context sizes to sessionStatsPath; when the heaviest
   // recent session exceeds the token threshold AND the channel has been
-  // inbound-idle for idleMs AND the queue is quiet, the OWNER gets one
-  // rate-limited Feishu DM suggesting they type /compact in the
-  // terminal at this idle boundary. Requires LARK_OWNER_OPEN_ID.
+  // inbound-idle for idleMs AND the queue is quiet, the OWNER gets a
+  // Feishu DM suggesting they type /compact in the terminal at this
+  // idle boundary. Requires LARK_OWNER_OPEN_ID.
+  //
+  // cooldownMs is the BASE of an exponential-backoff ladder, not a flat
+  // interval: after the n-th unanswered nudge the next is due
+  // base × 2^(n-1) later — 0 / +2h / +6h / +14h cumulative with the 2h
+  // default — capped at 4 nudges per episode, with close/re-arm
+  // detection via the next Stop event's measurement (see
+  // session-health.ts Episode model). A flat short cooldown would
+  // drumbeat the owner forever; a flat long one risks every reminder
+  // landing in the same asleep window.
   sessionNudgeEnabled: (process.env.LARK_SESSION_NUDGE_ENABLED ?? '').toLowerCase() === 'true',
   sessionNudgeTokenThreshold: optionalNumber('LARK_SESSION_NUDGE_TOKEN_THRESHOLD', 400_000),
   sessionNudgeIdleMs: optionalNumber('LARK_SESSION_NUDGE_IDLE_MS', 30 * 60 * 1000),
-  sessionNudgeCooldownMs: optionalNumber('LARK_SESSION_NUDGE_COOLDOWN_MS', 6 * 60 * 60 * 1000),
+  sessionNudgeCooldownMs: optionalNumber('LARK_SESSION_NUDGE_COOLDOWN_MS', 2 * 60 * 60 * 1000),
   sessionStatsPath:
     process.env.LARK_SESSION_STATS_PATH ||
     path.join(os.homedir(), '.claude', 'channels', 'lark', 'session-stats.json'),
