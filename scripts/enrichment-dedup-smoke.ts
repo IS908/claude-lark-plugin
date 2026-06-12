@@ -192,10 +192,15 @@ function episodeBlock(id: string, body = `episode body ${id}`): DedupBlock {
   ]);
   if (parts.length !== 1) fail('suppressed profile must emit a stub part');
   if (!parts[0].startsWith('<memory_context type="profile"')) fail(`stub must be envelope-wrapped: ${parts[0]}`);
-  if (!parts[0].includes('unchanged')) fail('stub label must carry the unchanged tag');
+  // Exact attribute assertion (round-2 review finding 4): the body
+  // constant itself contains the word "unchanged", so a substring
+  // check on the whole part would pass even with label composition
+  // deleted.
+  if (!parts[0].includes('label="self:ou_a · unchanged"')) fail(`stub label must carry the unchanged tag: ${parts[0]}`);
   if (parts[0].includes('likes Python')) fail('stub must NOT contain the full profile body');
   if (!parts[0].includes(UNCHANGED_STUB_BODY)) fail('stub body missing');
   if (stats.stubCount !== 1 || stats.suppressedCount !== 1) fail('stats wrong for stub');
+  if (stats.stubBytes !== Buffer.byteLength(parts[0], 'utf-8')) fail('stubBytes must equal emitted stub part bytes');
 }
 
 // 12. renderEnrichmentParts — suppressed episode/skill (no stub flag)
@@ -208,6 +213,7 @@ function episodeBlock(id: string, body = `episode body ${id}`): DedupBlock {
   if (parts.length !== 0) fail('suppressed episode must be omitted, not stubbed');
   if (stats.suppressedCount !== 1 || stats.stubCount !== 0) fail('stats wrong for omit');
   if (stats.suppressedBytes <= 0) fail('suppressedBytes must count the omitted body');
+  if (stats.stubBytes !== 0) fail('no stub emitted means zero stubBytes');
 }
 
 // 13. renderEnrichmentParts — stub body survives a hostile label
@@ -237,6 +243,74 @@ function episodeBlock(id: string, body = `episode body ${id}`): DedupBlock {
   if (parts.length !== 2) fail(`expected stub + episode, got ${parts.length}`);
   if (!parts[0].includes('type="profile"')) fail('stub must keep first position');
   if (!parts[1].includes('type="chat_episode"')) fail('episode must follow');
+}
+
+// 15. invalidateScope — forward-failure recovery: dropping the scope
+//     makes the next turn re-inject (and only the dropped scope)
+{
+  testNum++;
+  const clock = makeClock();
+  const dedup = new EnrichmentDedup(WINDOW, 100, clock.now);
+  dedup.filter('chat1', 'th1', [profileBlock('ou_a')]);
+  dedup.filter('chat2', undefined, [profileBlock('ou_a')]);
+  dedup.invalidateScope('chat1', 'th1');
+  const after = dedup.filter('chat1', 'th1', [profileBlock('ou_a')]);
+  if (!after[0].inject) fail('invalidated scope must re-inject');
+  const untouched = dedup.filter('chat2', undefined, [profileBlock('ou_a')]);
+  if (untouched[0].inject) fail('invalidation must not leak into other scopes');
+  // Invalidating a scope that doesn't exist must be a no-op, not a throw.
+  dedup.invalidateScope('chat-never-seen', 'th-x');
+}
+
+// 16. Negative windowMs behaves like 0 (disabled) — a misconfigured
+//     env value must never suppress anything
+{
+  testNum++;
+  const dedup = new EnrichmentDedup(-5);
+  if (dedup.enabled) fail('negative window must report disabled');
+  dedup.filter('chat1', undefined, [profileBlock('ou_a')]);
+  const second = dedup.filter('chat1', undefined, [profileBlock('ou_a')]);
+  if (!second[0].inject) fail('disabled (negative window) must inject everything');
+}
+
+// 17. Inner-cap eviction prefers idle keys over suppressed-but-live
+//     ones: a suppressed hit refreshes the entry's insertion position
+//     (round-2 review finding 2), so the profile entry — suppressed
+//     every turn — must survive episode-key churn past the cap.
+{
+  testNum++;
+  const clock = makeClock();
+  const dedup = new EnrichmentDedup(WINDOW, 100, clock.now, 3); // maxKeysPerScope=3
+  dedup.filter('chat1', undefined, [profileBlock('ou_a'), episodeBlock('e1.md'), episodeBlock('e2.md')]);
+  clock.set(100);
+  // Profile suppressed (refreshes position past e1/e2); e3 inserts at
+  // cap → evicts the now-oldest key, e1 — NOT the profile.
+  const round2 = dedup.filter('chat1', undefined, [profileBlock('ou_a'), episodeBlock('e3.md')]);
+  if (round2[0].inject) fail('profile must still be suppressed at cap churn');
+  if (!round2[1].inject) fail('new episode must inject');
+  clock.set(200);
+  const round3 = dedup.filter('chat1', undefined, [
+    profileBlock('ou_a'),
+    episodeBlock('e1.md'),
+    episodeBlock('e2.md'),
+  ]);
+  if (round3[0].inject) fail('profile entry must have survived inner-cap eviction');
+  if (!round3[1].inject) fail('e1 must have been the evicted key (re-inject)');
+}
+
+// 18. Exact window boundary: an entry aged EXACTLY windowMs must
+//     re-inject. The lazy prune (`>=`) and the freshness check (`<`)
+//     jointly guarantee this — the prune runs first and shadows the
+//     freshness operator at the boundary, so this case pins the
+//     OBSERVABLE contract (boundary ⇒ re-inject), not a single line.
+{
+  testNum++;
+  const clock = makeClock();
+  const dedup = new EnrichmentDedup(WINDOW, 100, clock.now);
+  dedup.filter('chat1', undefined, [profileBlock('ou_a')]);
+  clock.set(WINDOW); // age === windowMs exactly
+  const atBoundary = dedup.filter('chat1', undefined, [profileBlock('ou_a')]);
+  if (!atBoundary[0].inject) fail('entry aged exactly windowMs must re-inject');
 }
 
 console.error(`enrichment-dedup smoke: all ${testNum} cases passed`);

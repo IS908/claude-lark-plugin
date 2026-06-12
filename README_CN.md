@@ -256,7 +256,7 @@ node -e "console.log(require('./package.json').version)"
 | `LARK_MIN_SEARCH_SCORE` | `0.3` | 最低相关度分数 |
 | `LARK_MAX_SEARCH_RESULTS` | `2` | 每次查询返回的最大情景数 |
 | `LARK_INACTIVITY_HOURS` | `3` | 自动蒸馏触发的静默时长（小时） |
-| `LARK_MEMORY_DEDUP_WINDOW_MS` | `1800000`（30 分钟） | 热线程 memory_context 注入去重窗口（v1.3.0+，#189）。窗口内，同一会话/线程中内容未变的记忆块不再重复注入——profile 渲染为小型 "unchanged" 占位块，episode/skill 直接省略。设为 `0` 关闭去重（恢复 v1.3.0 之前每轮全量注入的行为） |
+| `LARK_MEMORY_DEDUP_WINDOW_MS` | `1800000`（30 分钟） | 热线程 memory_context 注入去重窗口（v1.3.0+，#189）。窗口内，同一会话/线程中内容未变的记忆块不再重复注入——profile 渲染为小型 "unchanged" 占位块，episode/skill 直接省略。设为 `0`（或负数）关闭去重（恢复 v1.3.0 之前每轮全量注入的行为）。上限 24 小时（超出自动收紧） |
 
 ### 可选 -- 身份 / 隐私（v0.9.0+）
 

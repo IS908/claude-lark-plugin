@@ -209,7 +209,16 @@ export function resolveMentionPlaceholders(
   });
 }
 
-type MessageHandler = (message: LarkMessage) => Promise<void>;
+/**
+ * Forwards an inbound message to Claude. Return contract (#189 round-2
+ * review): resolving with `false` signals "delivery failed but was
+ * handled" (the index.ts handler logs transport errors instead of
+ * throwing — pre-existing behavior kept so the doc-comment / reaction /
+ * flush-injection call sites are unaffected). `void`/`true` = delivered.
+ * The IM path uses the `false` signal to invalidate its enrichment-dedup
+ * scope; other call sites may ignore the return value.
+ */
+type MessageHandler = (message: LarkMessage) => Promise<void | boolean>;
 
 /**
  * Per-message metadata kept alongside the tracked id (#80).
@@ -1466,14 +1475,33 @@ export class LarkChannel {
         timestamp: new Date().toISOString(),
       });
 
-      // Build memory-enriched context
-      const enrichedText = await this.enrichWithMemory(larkMessage);
+      // Build memory-enriched context and forward. #189: if the
+      // enriched text fails to reach Claude AFTER enrichWithMemory
+      // recorded this turn's blocks as injected (forward error, or no
+      // handler registered), drop the dedup scope — otherwise the next
+      // turn would suppress blocks the model has never seen, with a
+      // stub pointing at a history copy that doesn't exist. Rethrow so
+      // the queue's error logging stays unchanged.
+      try {
+        const enrichedText = await this.enrichWithMemory(larkMessage);
+        const enrichedMessage = { ...larkMessage, text: enrichedText };
 
-      // Forward to handler with enriched context
-      const enrichedMessage = { ...larkMessage, text: enrichedText };
-
-      if (this.messageHandler) {
-        await this.messageHandler(enrichedMessage);
+        if (this.messageHandler) {
+          const delivered = await this.messageHandler(enrichedMessage);
+          if (delivered === false) {
+            // Handler swallowed a transport error and signaled
+            // non-delivery (round-2 review: the index.ts handler
+            // catches notification failures and returns normally, so
+            // the catch below never sees them). Same recovery as a
+            // thrown forward error.
+            this.enrichmentDedup.invalidateScope(chatId, threadId);
+          }
+        } else {
+          this.enrichmentDedup.invalidateScope(chatId, threadId);
+        }
+      } catch (err) {
+        this.enrichmentDedup.invalidateScope(chatId, threadId);
+        throw err;
       }
     });
   }
@@ -1531,9 +1559,15 @@ export class LarkChannel {
 
     // 2. Mentioned user profiles (hot injection)
     // Caller is the sender, not the mentioned user, so only the public tier is loaded.
+    // Dedupe by open_id (round-2 review finding 3): "@X @X look" would
+    // otherwise collect two identical blocks — the second one hits the
+    // just-recorded dedup entry and renders a same-turn "unchanged"
+    // stub pointing at content two blocks above.
     if (msg.mentions?.length) {
+      const seenMentionIds = new Set<string>();
       for (const mention of msg.mentions) {
-        if (mention.id && mention.id !== msg.senderId) {
+        if (mention.id && mention.id !== msg.senderId && !seenMentionIds.has(mention.id)) {
+          seenMentionIds.add(mention.id);
           const mentionProfile = await this.memoryStore
             .getProfile(mention.id, msg.senderId)
             .catch(() => null);
@@ -1664,7 +1698,8 @@ export class LarkChannel {
       debugLog(
         `[enrich-dedup] chat=${msg.chatId} thread=${msg.threadId ?? '-'} ` +
           `injected=${stats.injectedCount}(${stats.injectedBytes}B) ` +
-          `suppressed=${stats.suppressedCount}(${stats.suppressedBytes}B) stubs=${stats.stubCount}`,
+          `suppressed=${stats.suppressedCount}(${stats.suppressedBytes}B) ` +
+          `stubs=${stats.stubCount}(${stats.stubBytes}B)`,
       );
     }
 

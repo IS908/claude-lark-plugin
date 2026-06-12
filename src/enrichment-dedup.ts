@@ -69,10 +69,19 @@ export interface DedupDecision {
 
 export interface RenderStats {
   injectedCount: number;
+  /** Body bytes of injected blocks (envelope overhead excluded). */
   injectedBytes: number;
   suppressedCount: number;
+  /** Body bytes that would have been injected without dedup. */
   suppressedBytes: number;
   stubCount: number;
+  /**
+   * Bytes of the emitted stub parts (envelope included) — the real
+   * cost paid on the suppressed path. Net saving per turn is
+   * `suppressedBytes - stubBytes`; reporting both keeps the
+   * measurement honest (round-2 review finding 6).
+   */
+  stubBytes: number;
 }
 
 interface Entry {
@@ -97,8 +106,10 @@ export const UNCHANGED_LABEL_TAG = 'unchanged';
 /**
  * Outer-scope LRU cap. Each scope is one (chatId, threadId) conversation;
  * 2000 covers any realistic deployment (cf. IdentitySession's 5000 cap
- * for the same key shape) while bounding a pathological thread-id flood
- * to ~2000 × a handful of small entries.
+ * over the same conversation population — different key shape: dedup
+ * matches MessageQueue's `::` keys, IdentitySession uses `#`) while
+ * bounding a pathological thread-id flood to ~2000 × a handful of
+ * small entries.
  */
 const DEFAULT_MAX_SCOPES = 2000;
 
@@ -120,11 +131,43 @@ export class EnrichmentDedup {
     private readonly maxScopes: number = DEFAULT_MAX_SCOPES,
     /** Injectable clock for tests. */
     private readonly now: () => number = Date.now,
+    /** Injectable inner cap for tests (round-2 review finding 5). */
+    private readonly maxKeysPerScope: number = MAX_KEYS_PER_SCOPE,
   ) {}
 
   /** windowMs <= 0 disables dedup entirely (pre-#189 behavior). */
   get enabled(): boolean {
     return this.windowMs > 0;
+  }
+
+  /**
+   * Same key shape as MessageQueue (`chatId::threadId`, empty/undefined
+   * threadId collapsed to `_`) — round-2 review finding 7: the queue is
+   * what serializes turns per conversation, so the dedup scope must
+   * partition IDENTICALLY or two queue-concurrent conversations could
+   * share one scope (the only construction where a wrong suppress is
+   * structurally possible). The earlier `chatId#threadId` shape aliased
+   * `("a#b", undefined)` with `("a", "b")`; `::` matches the queue and
+   * `#`-free Feishu id charsets make even that alias unreachable today.
+   */
+  private scopeKeyOf(chatId: string, threadId: string | undefined): string {
+    return `${chatId}::${threadId || '_'}`;
+  }
+
+  /**
+   * Drop all dedup state for one (chatId, threadId) scope so the next
+   * inbound re-injects everything.
+   *
+   * Called when a turn's enriched message FAILED to reach Claude after
+   * `filter()` already recorded its blocks as injected (forward error,
+   * missing handler). Without this, the next turn would suppress
+   * blocks the model has never actually seen — a stub pointing at a
+   * history copy that doesn't exist. Over-invalidation (dropping
+   * entries from earlier successful turns too) is safe: it costs one
+   * re-injection, never correctness.
+   */
+  invalidateScope(chatId: string, threadId: string | undefined): void {
+    this.scopes.delete(this.scopeKeyOf(chatId, threadId));
   }
 
   /**
@@ -142,7 +185,7 @@ export class EnrichmentDedup {
       return blocks.map(block => ({ block, inject: true }));
     }
 
-    const scopeKey = threadId ? `${chatId}#${threadId}` : chatId;
+    const scopeKey = this.scopeKeyOf(chatId, threadId);
     const now = this.now();
 
     let scope = this.scopes.get(scopeKey);
@@ -167,19 +210,31 @@ export class EnrichmentDedup {
 
     const decisions: DedupDecision[] = [];
     for (const block of blocks) {
-      const hash = createHash('sha256').update(block.body).digest('hex').slice(0, 16);
+      // 128-bit truncation: collision-resistance headroom against an
+      // adversarially-crafted second preimage (block bodies are
+      // user-derived content). 64 bits would already require ~2^64
+      // work for a targeted match, but the extra 16 bytes per entry
+      // are free at this cache's scale.
+      const hash = createHash('sha256').update(block.body).digest('hex').slice(0, 32);
       const prev = scope.get(block.dedupKey);
-      const fresh = prev !== undefined && prev.hash === hash && now - prev.at < this.windowMs;
 
-      if (fresh) {
+      if (prev !== undefined && prev.hash === hash && now - prev.at < this.windowMs) {
         decisions.push({ block, inject: false });
-        // Do NOT refresh `at` — absolute TTL (see module doc).
+        // Do NOT refresh `at` — absolute TTL (see module doc). DO
+        // refresh the entry's insertion position (round-2 review
+        // finding 2): without this, the profile entry — pushed first
+        // every turn, suppressed for the whole window — stays the
+        // insertion-oldest while episode/skill keys churn in behind
+        // it, so the inner-cap backstop would evict the highest-value
+        // entry first. Position refresh and TTL are orthogonal.
+        scope.delete(block.dedupKey);
+        scope.set(block.dedupKey, prev);
         continue;
       }
 
       // Inject path: record the injection. Backstop the inner cap by
       // evicting the oldest entry (insertion order) when full.
-      if (scope.size >= MAX_KEYS_PER_SCOPE && !scope.has(block.dedupKey)) {
+      if (scope.size >= this.maxKeysPerScope && !scope.has(block.dedupKey)) {
         const oldest = scope.keys().next().value;
         if (oldest !== undefined) scope.delete(oldest);
       }
@@ -212,6 +267,7 @@ export function renderEnrichmentParts(decisions: DedupDecision[]): {
     suppressedCount: 0,
     suppressedBytes: 0,
     stubCount: 0,
+    stubBytes: 0,
   };
 
   for (const { block, inject } of decisions) {
@@ -227,8 +283,10 @@ export function renderEnrichmentParts(decisions: DedupDecision[]): {
 
     if (block.stubOnSuppress) {
       const stubLabel = block.label ? `${block.label} · ${UNCHANGED_LABEL_TAG}` : UNCHANGED_LABEL_TAG;
-      parts.push(wrapEnrichmentSection(block.kind, stubLabel, UNCHANGED_STUB_BODY));
+      const stub = wrapEnrichmentSection(block.kind, stubLabel, UNCHANGED_STUB_BODY);
+      parts.push(stub);
       stats.stubCount++;
+      stats.stubBytes += Buffer.byteLength(stub, 'utf-8');
     }
   }
 

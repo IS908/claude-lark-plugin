@@ -60,6 +60,30 @@ function optionalNumber(key: string, fallback: number): number {
 }
 
 /**
+ * #189 round-2 review finding 9/10: the dedup window needs an upper
+ * clamp because the absolute-TTL re-injection is the ONLY recovery
+ * from Claude-Code-side compaction / clear (events the plugin cannot
+ * observe) — an unbounded window (`9e15`) would leave stubs pointing
+ * at vanished history forever. And a value that resolves to <= 0
+ * (explicit `0`, negative, or `" "` which `Number()` coerces to 0)
+ * disables dedup — that's documented behavior, but deserves a stderr
+ * breadcrumb so an accidental misconfiguration isn't silent.
+ */
+function dedupWindowMs(): number {
+  const KEY = 'LARK_MEMORY_DEDUP_WINDOW_MS';
+  const MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const n = optionalNumber(KEY, 30 * 60 * 1000);
+  if (n > MAX_WINDOW_MS) {
+    console.error(`[config] ${KEY}=${n} exceeds the 24h maximum — clamped to ${MAX_WINDOW_MS}.`);
+    return MAX_WINDOW_MS;
+  }
+  if (n <= 0 && process.env[KEY] !== undefined) {
+    console.error(`[config] ${KEY} resolves to ${n} — enrichment dedup disabled (pre-v1.3.0 inject-every-turn behavior).`);
+  }
+  return n;
+}
+
+/**
  * Strictly positive numeric env (#109 R1-followup). Reject 0 / negatives
  * as well as NaN, because for the sizing knobs (`LARK_LOG_MAX_BYTES`,
  * `LARK_*_CACHE_SIZE`, `LARK_*_TTL_HOURS`, `LARK_EPISODE_RETENTION_DAYS`,
@@ -188,7 +212,7 @@ export const appConfig = {
   // compaction / clear / restart — events the plugin cannot observe
   // (#190 discussion). The absolute-TTL re-injection (see
   // enrichment-dedup.ts) bounds worst-case staleness to one window.
-  memoryDedupWindowMs: optionalNumber('LARK_MEMORY_DEDUP_WINDOW_MS', 30 * 60 * 1000),
+  memoryDedupWindowMs: dedupWindowMs(),
   // #113 — autonomous profile distillation (Stage 2: Episodes → Profile).
   //
   // OFF by default. Operator opts in by setting LARK_PROFILE_DISTILL_ENABLED=true.
