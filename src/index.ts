@@ -438,8 +438,15 @@ async function main() {
           },
         },
       });
+      return true;
     } catch (err) {
       console.error('[channel] Failed to deliver inbound to Claude:', err);
+      // #189 round-2 review: signal non-delivery instead of throwing so
+      // existing call sites keep their behavior, while the IM path can
+      // invalidate its enrichment-dedup scope (the model never saw this
+      // turn's injected blocks — suppressing them next turn would point
+      // a stub at history that doesn't exist).
+      return false;
     }
   });
 

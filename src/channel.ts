@@ -3,13 +3,14 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { appConfig } from './config.js';
-import { enrichmentPrompt, wrapEnrichmentSection } from './prompts.js';
+import { enrichmentPrompt } from './prompts.js';
 import { MessageQueue } from './queue.js';
 import { LARK_ID_REGEX } from './tools.js';
 import { TTLCache } from './ttl-cache.js';
 import { appendWithRotationSync } from './log-rotation.js';
 import { withFeishuRetry } from './feishu-retry.js';
 import { MemoryStore } from './memory/file.js';
+import { EnrichmentDedup, renderEnrichmentParts, type DedupBlock } from './enrichment-dedup.js';
 import type { ConversationBuffer } from './memory/buffer.js';
 import type { IdentitySession } from './identity-session.js';
 import { TERMINAL_CHAT_ID, DOC_CHAT_ID_PREFIX } from './identity-session.js';
@@ -208,7 +209,16 @@ export function resolveMentionPlaceholders(
   });
 }
 
-type MessageHandler = (message: LarkMessage) => Promise<void>;
+/**
+ * Forwards an inbound message to Claude. Return contract (#189 round-2
+ * review): resolving with `false` signals "delivery failed but was
+ * handled" (the index.ts handler logs transport errors instead of
+ * throwing — pre-existing behavior kept so the doc-comment / reaction /
+ * flush-injection call sites are unaffected). `void`/`true` = delivered.
+ * The IM path uses the `false` signal to invalidate its enrichment-dedup
+ * scope; other call sites may ignore the return value.
+ */
+type MessageHandler = (message: LarkMessage) => Promise<void | boolean>;
 
 /**
  * Per-message metadata kept alongside the tracked id (#80).
@@ -791,6 +801,11 @@ export class LarkChannel {
   private memoryStore: MemoryStore | null = null;
   private conversationBuffer: ConversationBuffer | null = null;
   private identitySession: IdentitySession | null = null;
+  /**
+   * #189: per-(chatId, threadId) content-hash dedup of memory_context
+   * blocks. In-memory only — restart ⇒ full re-injection (intended).
+   */
+  private enrichmentDedup = new EnrichmentDedup(appConfig.memoryDedupWindowMs);
   /**
    * Tracks pending ack reactions (the MeMeMe emoji bot adds on receive to
    * signal "I'm processing this"). Keyed by inbound `message_id`; value
@@ -1460,14 +1475,33 @@ export class LarkChannel {
         timestamp: new Date().toISOString(),
       });
 
-      // Build memory-enriched context
-      const enrichedText = await this.enrichWithMemory(larkMessage);
+      // Build memory-enriched context and forward. #189: if the
+      // enriched text fails to reach Claude AFTER enrichWithMemory
+      // recorded this turn's blocks as injected (forward error, or no
+      // handler registered), drop the dedup scope — otherwise the next
+      // turn would suppress blocks the model has never seen, with a
+      // stub pointing at a history copy that doesn't exist. Rethrow so
+      // the queue's error logging stays unchanged.
+      try {
+        const enrichedText = await this.enrichWithMemory(larkMessage);
+        const enrichedMessage = { ...larkMessage, text: enrichedText };
 
-      // Forward to handler with enriched context
-      const enrichedMessage = { ...larkMessage, text: enrichedText };
-
-      if (this.messageHandler) {
-        await this.messageHandler(enrichedMessage);
+        if (this.messageHandler) {
+          const delivered = await this.messageHandler(enrichedMessage);
+          if (delivered === false) {
+            // Handler swallowed a transport error and signaled
+            // non-delivery (round-2 review: the index.ts handler
+            // catches notification failures and returns normally, so
+            // the catch below never sees them). Same recovery as a
+            // thrown forward error.
+            this.enrichmentDedup.invalidateScope(chatId, threadId);
+          }
+        } else {
+          this.enrichmentDedup.invalidateScope(chatId, threadId);
+        }
+      } catch (err) {
+        this.enrichmentDedup.invalidateScope(chatId, threadId);
+        throw err;
       }
     });
   }
@@ -1475,7 +1509,12 @@ export class LarkChannel {
   private async enrichWithMemory(msg: LarkMessage): Promise<string> {
     if (!this.memoryStore) return msg.text;
 
-    const parts: string[] = [];
+    // #189: candidate blocks are collected first, then run through the
+    // content-hash dedup filter, and only the surviving blocks get
+    // envelope-wrapped (in `renderEnrichmentParts`). `dedupKey` carries
+    // each block's stable identity — volatile label parts (search
+    // score, date tag) must stay out of it.
+    const blocks: DedupBlock[] = [];
 
     // Build search query — enhance short messages with recent buffer context
     let searchQuery = msg.text;
@@ -1488,35 +1527,58 @@ export class LarkChannel {
     }
 
     // Every enrichment section below is wrapped in a <memory_context>
-    // envelope (#114). The envelope marks the content as DATA so Claude
-    // does not execute imperatives buried inside stored profiles /
-    // episodes / skill descriptions / mentioned-user profiles — those
-    // are all derived from user input and the episode path is in a
-    // self-reinforcing loop (user msg → distill → episode → enrichment
-    // → Claude). The preamble at the top of `enrichmentPrompt` tells
-    // Claude how to read these blocks.
+    // envelope (#114) inside `renderEnrichmentParts` — including #189's
+    // "unchanged" stubs, so the DATA-vs-INSTRUCTIONS trust boundary
+    // applies uniformly on the suppressed path too. The envelope marks
+    // the content as DATA so Claude does not execute imperatives buried
+    // inside stored profiles / episodes / skill descriptions /
+    // mentioned-user profiles — those are all derived from user input
+    // and the episode path is in a self-reinforcing loop (user msg →
+    // distill → episode → enrichment → Claude). The preamble at the top
+    // of `enrichmentPrompt` tells Claude how to read these blocks.
 
-    // 1. User profile (hot injection — always loaded)
+    // 1. User profile (hot injection — always loaded; the load must
+    //    happen even on a hot thread because dedup needs the content
+    //    hash to detect mid-thread profile changes)
     // The caller is the sender themselves, so they see both public and private tiers.
     const profile = await this.memoryStore
       .getProfile(msg.senderId, msg.senderId)
       .catch(() => null);
     if (profile) {
-      parts.push(wrapEnrichmentSection('profile', `self:${msg.senderId}`, profile));
+      blocks.push({
+        kind: 'profile',
+        label: `self:${msg.senderId}`,
+        body: profile,
+        // Owner id in the key: in a group thread, user B's first
+        // message within the window still injects B's profile even
+        // though A's was just suppressed (#189 discussion, point 3).
+        dedupKey: `profile:${msg.senderId}`,
+        stubOnSuppress: true,
+      });
     }
 
     // 2. Mentioned user profiles (hot injection)
     // Caller is the sender, not the mentioned user, so only the public tier is loaded.
+    // Dedupe by open_id (round-2 review finding 3): "@X @X look" would
+    // otherwise collect two identical blocks — the second one hits the
+    // just-recorded dedup entry and renders a same-turn "unchanged"
+    // stub pointing at content two blocks above.
     if (msg.mentions?.length) {
+      const seenMentionIds = new Set<string>();
       for (const mention of msg.mentions) {
-        if (mention.id && mention.id !== msg.senderId) {
+        if (mention.id && mention.id !== msg.senderId && !seenMentionIds.has(mention.id)) {
+          seenMentionIds.add(mention.id);
           const mentionProfile = await this.memoryStore
             .getProfile(mention.id, msg.senderId)
             .catch(() => null);
           if (mentionProfile) {
-            parts.push(
-              wrapEnrichmentSection('mentioned_profile', `${mention.name} (${mention.id})`, mentionProfile),
-            );
+            blocks.push({
+              kind: 'mentioned_profile',
+              label: `${mention.name} (${mention.id})`,
+              body: mentionProfile,
+              dedupKey: `mentioned_profile:${mention.id}`,
+              stubOnSuppress: true,
+            });
           }
         }
       }
@@ -1545,7 +1607,16 @@ export class LarkChannel {
       const filtered = threadEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
       for (const ep of filtered) {
         const dateTag = ep.timestamp.slice(0, 10);
-        parts.push(wrapEnrichmentSection('thread_episode', `${scoreTag(ep.score)}${dateTag}`, capEp(ep.content)));
+        blocks.push({
+          kind: 'thread_episode',
+          label: `${scoreTag(ep.score)}${dateTag}`,
+          // Hash the capped body — what would actually be injected.
+          body: capEp(ep.content),
+          // ep.id is the episode filename (timestamp-based, stable);
+          // the kind prefix disambiguates a same-named file in the
+          // chat-level episode directory.
+          dedupKey: `thread_episode:${ep.id}`,
+        });
       }
     }
 
@@ -1556,7 +1627,12 @@ export class LarkChannel {
     const filteredChat = chatEps.filter(ep => ep.score === undefined || ep.score >= appConfig.minSearchScore);
     for (const ep of filteredChat) {
       const dateTag = ep.timestamp.slice(0, 10);
-      parts.push(wrapEnrichmentSection('chat_episode', `${scoreTag(ep.score)}${dateTag}`, capEp(ep.content)));
+      blocks.push({
+        kind: 'chat_episode',
+        label: `${scoreTag(ep.score)}${dateTag}`,
+        body: capEp(ep.content),
+        dedupKey: `chat_episode:${ep.id}`,
+      });
     }
 
     // 5. Skills (cold injection — inject name + sanitized description + path)
@@ -1596,12 +1672,34 @@ export class LarkChannel {
       if (skill.migrated) bodyLines.push(MIGRATED_MARKER);
       bodyLines.push(safeDesc);
       bodyLines.push(`→ ${skillPath}`);
-      parts.push(
-        wrapEnrichmentSection(
-          'skill',
-          `${skill.name}${skillScoreTag}${migratedTag}`,
-          bodyLines.join('\n'),
-        ),
+      blocks.push({
+        kind: 'skill',
+        label: `${skill.name}${skillScoreTag}${migratedTag}`,
+        body: bodyLines.join('\n'),
+        // Slug (not display name) so the key matches the on-disk
+        // identity used by save_skill ownership (#189: same-slug skill
+        // re-matching every turn is the dominant skill-block waste —
+        // dedup replaces the intent-classification heuristic from the
+        // original strawman).
+        dedupKey: `skill:${skill.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      });
+    }
+
+    // #189: dedup + wrap. Blocks unchanged within the window are
+    // suppressed (profile kinds render as a stub, episode/skill kinds
+    // are omitted — absence of search hits is their normal case).
+    const decisions = this.enrichmentDedup.filter(msg.chatId, msg.threadId, blocks);
+    const { parts, stats } = renderEnrichmentParts(decisions);
+
+    // #189 measurement hook: one debug line per enriched turn so the
+    // dedup's cost/benefit is observable per deployment before anyone
+    // tunes LARK_MEMORY_DEDUP_WINDOW_MS.
+    if (this.enrichmentDedup.enabled && blocks.length > 0) {
+      debugLog(
+        `[enrich-dedup] chat=${msg.chatId} thread=${msg.threadId ?? '-'} ` +
+          `injected=${stats.injectedCount}(${stats.injectedBytes}B) ` +
+          `suppressed=${stats.suppressedCount}(${stats.suppressedBytes}B) ` +
+          `stubs=${stats.stubCount}(${stats.stubBytes}B)`,
       );
     }
 
@@ -1613,6 +1711,10 @@ export class LarkChannel {
     // by some user — so a quoted-reply attack would bypass #114's
     // fix when the sender has no other stored memory. Now: enter the
     // wrap path whenever EITHER stored parts OR parentContent exists.
+    // (#189 note: parts can also be empty because every block was
+    // suppressed with no stub — e.g. sender has no profile and only
+    // episode hits. The bare return is then identical to a no-hit
+    // turn today, which is the correct degenerate case.)
     if (parts.length === 0 && !msg.parentContent) return msg.text;
 
     return enrichmentPrompt(
