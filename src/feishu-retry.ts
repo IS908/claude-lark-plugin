@@ -45,6 +45,25 @@ export const PERMANENT_TARGET_CODES = new Set<number>([
   190005,
 ]);
 
+/**
+ * Feishu API error codes that are PERMANENT-by-classification: identical
+ * request → identical rejection, so a retry can only waste the budget
+ * (~7s hot-path wall-clock for 3 attempts). Single source of truth for
+ * `isRetryableError`'s fail-fast check; mirrors the equivalent set in
+ * `IS908/codex-lark-plugin` so the two channel plugins agree on what
+ * "non-retryable" means (#202).
+ *
+ * - 230001   — parameter error (request shape rejected; retry can't fix)
+ * - 99991668 — invalid file_key / resource not found (file gone or never
+ *              existed; download_attachment etc. burned 3 retries pre-fix)
+ * - 99991672 — permission denied (auth/scope, not transient)
+ */
+const PERMANENT_FEISHU_CODES = new Set<number>([
+  230001,
+  99991668,
+  99991672,
+]);
+
 /** Extract a numeric Feishu API code from a thrown error, or null. */
 export function getFeishuApiCode(err: any): number | null {
   const code = err?.response?.data?.code ?? err?.data?.code;
@@ -63,7 +82,8 @@ export function getFeishuApiMsg(err: any): string {
  *
  *   - Network errors (ENOTFOUND etc.) → retry
  *   - HTTP 429/5xx → retry
- *   - Feishu 99991672 (perm denied) / 230001 (param error) → NO retry
+ *   - Feishu PERMANENT_FEISHU_CODES (230001 param / 99991668 invalid
+ *     file_key / 99991672 perm denied) → NO retry (#202)
  *   - Feishu 99990000–99999999 generic 9999-class → retry (covers
  *     rate-limit 99991663 / 99991400 / etc.)
  *   - Message containing 'timeout' / 'enotfound' / 'econnreset' → retry
@@ -85,8 +105,8 @@ export function isRetryableError(err: any): boolean {
   // it differently from a numeric typecheck — tighten regardless.)
   const apiCode = err?.response?.data?.code ?? err?.data?.code;
   if (apiCode != null) {
-    // Known non-retryable Feishu codes
-    if (apiCode === 99991672 || apiCode === 230001) return false;
+    // Known non-retryable Feishu codes — see PERMANENT_FEISHU_CODES doc (#202)
+    if (PERMANENT_FEISHU_CODES.has(apiCode)) return false;
     // Other Feishu codes starting with 9999 are usually transient
     if (apiCode >= 99990000 && apiCode < 100000000) return true;
   }
